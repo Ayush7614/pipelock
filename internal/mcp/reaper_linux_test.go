@@ -101,6 +101,36 @@ func TestReaper_AdoptedZombieDrained_DirectChildPreserved(t *testing.T) {
 	close(reaperDone)
 }
 
+func TestReaper_ProtectedDirectPIDRegistry(t *testing.T) {
+	const pid = 424242
+
+	unregister := registerProtectedDirectPID(pid)
+	if !isProtectedDirectPID(pid) {
+		t.Fatal("direct PID was not registered as protected")
+	}
+
+	unregister()
+	if isProtectedDirectPID(pid) {
+		t.Fatal("direct PID remained protected after unregister")
+	}
+
+	unregister()
+	if isProtectedDirectPID(pid) {
+		t.Fatal("second unregister call restored protected PID")
+	}
+
+	unregisterFirst := registerProtectedDirectPID(pid)
+	unregisterSecond := registerProtectedDirectPID(pid)
+	unregisterFirst()
+	if !isProtectedDirectPID(pid) {
+		t.Fatal("first unregister cleared overlapping same-PID registration")
+	}
+	unregisterSecond()
+	if isProtectedDirectPID(pid) {
+		t.Fatal("direct PID remained protected after all overlapping registrations were unregistered")
+	}
+}
+
 // waitForCondition polls cond every 25 ms until it returns true or the
 // deadline passes. Returns the final value of cond().
 func waitForCondition(t *testing.T, timeout time.Duration, cond func() bool) bool {
