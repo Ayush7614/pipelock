@@ -27,7 +27,11 @@ var safePassthroughKeys = []string{
 // injecting code before the agent process starts.
 // IsDangerousEnvKey returns true if the key could subvert sandbox containment.
 func IsDangerousEnvKey(key string) bool {
-	return dangerousEnvKeys[key]
+	if dangerousEnvKeys[key] {
+		return true
+	}
+	upper := strings.ToUpper(key)
+	return strings.HasSuffix(upper, "_PROXY")
 }
 
 var dangerousEnvKeys = map[string]bool{
@@ -117,7 +121,7 @@ func SyntheticEnv(sandboxDir, workspace string, extraEnv []string) ([]string, er
 	// Validate against dangerous keys that could subvert containment.
 	for _, entry := range extraEnv {
 		key, _, _ := strings.Cut(entry, "=")
-		if dangerousEnvKeys[key] {
+		if IsDangerousEnvKey(key) {
 			return nil, fmt.Errorf("sandbox: env key %q is blocked (could subvert containment)", key)
 		}
 		env = append(env, entry)

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -992,6 +993,15 @@ signed action receipts for MCP decisions.`,
 						return err
 					}
 				}
+
+				closeBridge, bridgeErr := setupMCPSandboxBridge(
+					ctx, runtime.GOOS, cfg, ks, auditLogger, mcpMetrics, receiptEmitter, envEmitter,
+					cmd.ErrOrStderr(), &launchCfg, startMCPSandboxBridge,
+				)
+				if bridgeErr != nil {
+					return bridgeErr
+				}
+				defer closeBridge()
 
 				sandboxCmd, sErr := sandbox.PrepareSandboxCmd(launchCfg)
 				if sErr != nil {
