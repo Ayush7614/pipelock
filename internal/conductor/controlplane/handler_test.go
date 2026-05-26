@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -66,6 +67,308 @@ func TestHandlerPublishesAndServesLatestBundle(t *testing.T) {
 	}
 }
 
+func TestHandlerPublishesAndServesEmergencyControls(t *testing.T) {
+	msg, killResolver := signedRemoteKillMessageWithResolver(t, "kill-handler", 3, conductor.KillSwitchActive, testNow)
+	auth, rollbackResolver := signedRollbackAuthorizationWithResolver(t, "rollback-handler", 4, testNow)
+	handler := newTestHandlerWithEmergencyKeys(t, killResolver, rollbackResolver)
+	body, err := json.Marshal(publishRemoteKillRequest{Message: msg})
+	if err != nil {
+		t.Fatalf("Marshal(remote kill): %v", err)
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(string(body)))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("publish remote kill status=%d body=%s, want 201", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RemoteKillPath, strings.NewReader(string(body)))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("duplicate remote kill status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, RemoteKillPath, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("latest remote kill status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	var gotKill conductor.RemoteKillMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &gotKill); err != nil {
+		t.Fatalf("decode remote kill: %v", err)
+	}
+	if gotKill.MessageID != msg.MessageID {
+		t.Fatalf("remote kill message_id=%q, want %q", gotKill.MessageID, msg.MessageID)
+	}
+
+	body, err = json.Marshal(publishRollbackAuthorizationRequest{Authorization: auth})
+	if err != nil {
+		t.Fatalf("Marshal(rollback): %v", err)
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(string(body)))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("publish rollback status=%d body=%s, want 201", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, RollbackAuthorizationsPath, strings.NewReader(string(body)))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("duplicate rollback status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		RollbackAuthorizationsPath+"?current_bundle_id=bundle-current&current_version=42&target_bundle_id=bundle-target&target_version=41", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("latest rollback status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	var gotRollback conductor.RollbackAuthorization
+	if err := json.Unmarshal(w.Body.Bytes(), &gotRollback); err != nil {
+		t.Fatalf("decode rollback: %v", err)
+	}
+	if gotRollback.AuthorizationID != auth.AuthorizationID {
+		t.Fatalf("rollback authorization_id=%q, want %q", gotRollback.AuthorizationID, auth.AuthorizationID)
+	}
+}
+
+func TestHandlerRejectsOverlongEmergencyValidity(t *testing.T) {
+	msg, killResolver := signedRemoteKillMessageWithTTL(t, "kill-long", 3, conductor.KillSwitchActive, testNow, DefaultRemoteKillMaxValidity+time.Minute)
+	auth, rollbackResolver := signedRollbackAuthorizationWithTTL(t, "rollback-long", 4, testNow, DefaultRollbackMaxValidity+time.Minute)
+	handler := newTestHandlerWithEmergencyKeys(t, killResolver, rollbackResolver)
+
+	body, err := json.Marshal(publishRemoteKillRequest{Message: msg})
+	if err != nil {
+		t.Fatalf("Marshal(remote kill): %v", err)
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(string(body)))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("publish overlong remote kill status=%d body=%s, want 422", w.Code, w.Body.String())
+	}
+
+	body, err = json.Marshal(publishRollbackAuthorizationRequest{Authorization: auth})
+	if err != nil {
+		t.Fatalf("Marshal(rollback): %v", err)
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(string(body)))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("publish overlong rollback status=%d body=%s, want 422", w.Code, w.Body.String())
+	}
+}
+
+func TestHandlerEmergencyControlErrors(t *testing.T) {
+	msg, killResolver := signedRemoteKillMessageWithResolver(t, "kill-errors", 3, conductor.KillSwitchActive, testNow)
+	auth, rollbackResolver := signedRollbackAuthorizationWithResolver(t, "rollback-errors", 4, testNow)
+	handler := newTestHandlerWithEmergencyKeys(t, killResolver, rollbackResolver)
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPatch, RemoteKillPath, nil))
+	if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") == "" {
+		t.Fatalf("remote kill wrong method status=%d allow=%q, want 405 with Allow", w.Code, w.Header().Get("Allow"))
+	}
+
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPatch, RollbackAuthorizationsPath, nil))
+	if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") == "" {
+		t.Fatalf("rollback wrong method status=%d allow=%q, want 405 with Allow", w.Code, w.Header().Get("Allow"))
+	}
+
+	body, err := json.Marshal(publishRemoteKillRequest{Message: msg})
+	if err != nil {
+		t.Fatalf("Marshal(remote kill): %v", err)
+	}
+	remoteBody := string(body)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(remoteBody)))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("remote kill unauthorized status=%d body=%s, want 403", w.Code, w.Body.String())
+	}
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(`{"message":{},"extra":true}`))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("remote kill strict JSON status=%d body=%s, want 400", w.Code, w.Body.String())
+	}
+
+	noKeys := newTestHandler(t, mustStore(t), nil)
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(remoteBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	noKeys.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("remote kill no keys status=%d body=%s, want 501", w.Code, w.Body.String())
+	}
+
+	missingStore, err := NewHandler(HandlerOptions{
+		Store:              mustStore(t),
+		Capabilities:       DefaultCapabilities("conductor-test"),
+		Now:                func() time.Time { return testNow },
+		FollowerIdentity:   func(*http.Request) (FollowerIdentity, error) { return defaultFollowerIdentity(), nil },
+		AuthorizePublisher: func(*http.Request) error { return nil },
+		AuditSink:          discardAuditSink{},
+		AuditKeys:          rejectingAuditKeyResolver,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler(missing store): %v", err)
+	}
+	w = httptest.NewRecorder()
+	missingStore.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, RemoteKillPath, nil))
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("remote kill missing store status=%d body=%s, want 501", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(remoteBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	missingStore.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("remote kill publish missing store status=%d body=%s, want 501", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	missingStore.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		RollbackAuthorizationsPath+"?current_bundle_id=bundle-current&current_version=42&target_bundle_id=bundle-target&target_version=41", nil))
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("rollback missing store status=%d body=%s, want 501", w.Code, w.Body.String())
+	}
+
+	badSig := newTestHandlerWithEmergencyKeys(t, func(string) (conductor.SignatureKey, error) {
+		return conductor.SignatureKey{}, conductor.ErrSignatureVerification
+	})
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(remoteBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	badSig.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("remote kill bad signature status=%d body=%s, want 422", w.Code, w.Body.String())
+	}
+
+	noMatch := defaultFollowerIdentity()
+	noMatch.InstanceID = "pl-prod-2"
+	identityMiss := newTestHandlerWithOptions(t, mustStore(t), func(*http.Request) (FollowerIdentity, error) {
+		return noMatch, nil
+	}, killResolver)
+	w = httptest.NewRecorder()
+	identityMiss.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, RemoteKillPath, nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("remote kill miss status=%d body=%s, want 204", w.Code, w.Body.String())
+	}
+
+	identityErr := newTestHandlerWithOptions(t, mustStore(t), func(*http.Request) (FollowerIdentity, error) {
+		return FollowerIdentity{}, ErrFollowerRequired
+	}, killResolver)
+	w = httptest.NewRecorder()
+	identityErr.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, RemoteKillPath, nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("remote kill identity error status=%d body=%s, want 401", w.Code, w.Body.String())
+	}
+
+	body, err = json.Marshal(publishRollbackAuthorizationRequest{Authorization: auth})
+	if err != nil {
+		t.Fatalf("Marshal(rollback): %v", err)
+	}
+	rollbackBody := string(body)
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(rollbackBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("rollback unauthorized status=%d body=%s, want 403", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(rollbackBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	missingStore.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("rollback publish missing store status=%d body=%s, want 501", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(rollbackBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	noKeys.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("rollback no keys status=%d body=%s, want 501", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(rollbackBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	badSig.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("rollback bad signature status=%d body=%s, want 422", w.Code, w.Body.String())
+	}
+
+	smallBody := newTestHandlerWithEmergencyKeys(t, killResolver, rollbackResolver)
+	smallBody.maxRequestBody = 1
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(`{"message":{}}`))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	smallBody.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("remote kill too large status=%d body=%s, want 413", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(`{"authorization":{}}`))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	smallBody.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("rollback too large status=%d body=%s, want 413", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, RollbackAuthorizationsPath+"?current_version=x", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("rollback bad query status=%d body=%s, want 400", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		RollbackAuthorizationsPath+"?current_bundle_id=bundle-current&current_version=42&target_bundle_id=bundle-target&target_version=41", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("rollback miss status=%d body=%s, want 204", w.Code, w.Body.String())
+	}
+
+	failing := newTestHandlerWithEmergencyKeys(t, killResolver, rollbackResolver)
+	failing.emergencyControls = failingEmergencyStore{}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPut, RemoteKillPath, strings.NewReader(remoteBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	failing.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("remote kill store error status=%d body=%s, want 500", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	failing.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, RemoteKillPath, nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("remote kill latest store error status=%d body=%s, want 500", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, RollbackAuthorizationsPath, strings.NewReader(rollbackBody))
+	req.Header.Set("X-Pipelock-Admin", "ok")
+	w = httptest.NewRecorder()
+	failing.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("rollback store error status=%d body=%s, want 500", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	failing.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		RollbackAuthorizationsPath+"?current_bundle_id=bundle-current&current_version=42&target_bundle_id=bundle-target&target_version=41", nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("rollback latest store error status=%d body=%s, want 500", w.Code, w.Body.String())
+	}
+}
+
 func TestIfNoneMatchMatches(t *testing.T) {
 	etag := `"abc123"`
 	tests := []struct {
@@ -86,6 +389,26 @@ func TestIfNoneMatchMatches(t *testing.T) {
 				t.Fatalf("ifNoneMatchMatches(%q, %q) = %v, want %v", tt.raw, etag, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStatusHelpersCoverClasses(t *testing.T) {
+	tests := map[int]string{
+		101: "1xx",
+		302: "3xx",
+		700: "unknown",
+	}
+	for status, want := range tests {
+		if got := statusClass(status); got != want {
+			t.Fatalf("statusClass(%d) = %q, want %q", status, got, want)
+		}
+	}
+	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+	if _, err := rec.Write([]byte("ok")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if rec.status != http.StatusOK {
+		t.Fatalf("recorder status = %d, want 200", rec.status)
 	}
 }
 
@@ -159,6 +482,30 @@ func TestHandlerHealthAndReady(t *testing.T) {
 	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, HealthzPath, nil))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("main healthz status = %d body=%s, want 404", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	probes.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, HealthPath, nil))
+	if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("health wrong method status=%d allow=%q, want 405 GET", w.Code, w.Header().Get("Allow"))
+	}
+
+	w = httptest.NewRecorder()
+	probes.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, MetricsPath, nil))
+	if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("metrics wrong method status=%d allow=%q, want 405 GET", w.Code, w.Header().Get("Allow"))
+	}
+
+	w = httptest.NewRecorder()
+	probes.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, MetricsPath, nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("metrics without registry status=%d body=%s, want 404", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	probes.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/missing", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("probe missing path status=%d body=%s, want 404", w.Code, w.Body.String())
 	}
 }
 
@@ -309,6 +656,28 @@ func TestHandlerMethodChecks(t *testing.T) {
 
 func newTestHandler(t *testing.T, store BundleStore, identity FollowerIdentityResolver) *Handler {
 	t.Helper()
+	return newTestHandlerWithOptions(t, store, identity, nil)
+}
+
+func newTestHandlerWithEmergencyKeys(t *testing.T, resolvers ...conductor.SignatureKeyResolver) *Handler {
+	t.Helper()
+	resolver := func(keyID string) (conductor.SignatureKey, error) {
+		for _, resolve := range resolvers {
+			if resolve == nil {
+				continue
+			}
+			key, err := resolve(keyID)
+			if err == nil {
+				return key, nil
+			}
+		}
+		return conductor.SignatureKey{}, conductor.ErrSignatureVerification
+	}
+	return newTestHandlerWithOptions(t, mustStore(t), nil, resolver)
+}
+
+func newTestHandlerWithOptions(t *testing.T, store BundleStore, identity FollowerIdentityResolver, emergencyKeys conductor.SignatureKeyResolver) *Handler {
+	t.Helper()
 	if identity == nil {
 		identity = func(*http.Request) (FollowerIdentity, error) {
 			return FollowerIdentity{
@@ -336,6 +705,14 @@ func newTestHandler(t *testing.T, store BundleStore, identity FollowerIdentityRe
 		},
 		AuditSink: discardAuditSink{},
 		AuditKeys: rejectingAuditKeyResolver,
+		AuthorizeAdmin: func(r *http.Request) error {
+			if r.Header.Get("X-Pipelock-Admin") != "ok" {
+				return ErrPublisherForbidden
+			}
+			return nil
+		},
+		EmergencyControls: mustEmergencyStore(t),
+		EmergencyKeys:     emergencyKeys,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
@@ -350,4 +727,31 @@ func mustStore(t *testing.T) *FileBundleStore {
 		t.Fatalf("OpenFileBundleStore() error = %v", err)
 	}
 	return store
+}
+
+func mustEmergencyStore(t *testing.T) *FileEmergencyStore {
+	t.Helper()
+	store, err := OpenFileEmergencyStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFileEmergencyStore() error = %v", err)
+	}
+	return store
+}
+
+type failingEmergencyStore struct{}
+
+func (failingEmergencyStore) PublishRemoteKill(context.Context, conductor.RemoteKillMessage, time.Time) (StoredRemoteKill, bool, error) {
+	return StoredRemoteKill{}, false, errors.New("emergency store failed")
+}
+
+func (failingEmergencyStore) LatestRemoteKill(context.Context, FollowerIdentity, time.Time) (StoredRemoteKill, error) {
+	return StoredRemoteKill{}, errors.New("emergency store failed")
+}
+
+func (failingEmergencyStore) PublishRollbackAuthorization(context.Context, conductor.RollbackAuthorization, time.Time) (StoredRollbackAuthorization, bool, error) {
+	return StoredRollbackAuthorization{}, false, errors.New("emergency store failed")
+}
+
+func (failingEmergencyStore) LatestRollbackAuthorization(context.Context, FollowerIdentity, RollbackLookup, time.Time) (StoredRollbackAuthorization, error) {
+	return StoredRollbackAuthorization{}, errors.New("emergency store failed")
 }

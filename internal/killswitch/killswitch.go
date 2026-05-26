@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package killswitch implements an emergency deny-all controller for Pipelock.
-// Four activation sources (config, API, SIGUSR1, sentinel file) are OR-composed:
+// Five activation sources (config, API, Conductor remote kill, SIGUSR1, sentinel
+// file) are OR-composed:
 // any one being active engages the kill switch and denies all requests.
 package killswitch
 
@@ -29,15 +30,17 @@ const EnvAPIToken = config.EnvKillSwitchAPIToken
 type Decision struct {
 	Active         bool
 	Message        string
-	Source         string // "config", "api", "signal", "sentinel"
+	Source         string // "config", "api", "conductor_remote", "signal", "sentinel"
 	IsNotification bool   // MCP only: true if the message has no "id" field
 }
 
-// Controller manages the kill switch state across four activation sources.
+// Controller manages the kill switch state across five activation sources.
 type Controller struct {
 	cfg          atomic.Pointer[runtime]
 	api          atomic.Bool
 	sigusr1      atomic.Bool
+	conductor    atomic.Bool
+	conductorMsg atomic.Value
 	separatePort atomic.Bool // true when API runs on a dedicated port (no main-port exemption)
 }
 
@@ -101,7 +104,7 @@ func buildRuntime(cfg *config.Config) *runtime {
 }
 
 // IsActive returns true if the kill switch is currently active from any source.
-// It checks the four activation sources without applying any endpoint or IP
+// It checks all activation sources without applying any endpoint or IP
 // exemptions. Use this for non-HTTP callers (e.g. the Scan API handler) that
 // perform their own exemption logic.
 func (c *Controller) IsActive() bool {
@@ -128,7 +131,7 @@ func (c *Controller) IsActiveForIP(clientIP string) Decision {
 
 // IsActiveHTTP checks whether the kill switch should deny an HTTP request.
 // Checks exemptions (health/metrics/API endpoints, allowlisted IPs) before
-// computing the active state from the four sources.
+// computing the active state from all sources.
 func (c *Controller) IsActiveHTTP(r *http.Request) Decision {
 	rt := c.cfg.Load()
 
@@ -177,7 +180,7 @@ func (c *Controller) IsActiveHTTP(r *http.Request) Decision {
 
 // IsActiveMCP checks whether the kill switch should deny an MCP message.
 // MCP has no health/metrics endpoints and no IP-based allowlisting, so this
-// only checks the four activation sources. It also detects whether the
+// only checks the activation sources. It also detects whether the
 // message is a notification (no "id" field) for the caller to decide
 // whether to drop silently or send a JSON-RPC error.
 func (c *Controller) IsActiveMCP(msg []byte) Decision {
@@ -238,6 +241,12 @@ func (c *Controller) SetAPI(active bool) {
 	c.api.Store(active)
 }
 
+// SetConductorRemote sets the Conductor remote-kill activation source.
+func (c *Controller) SetConductorRemote(active bool, message string) {
+	c.conductorMsg.Store(message)
+	c.conductor.Store(active)
+}
+
 // SetSeparateAPIPort marks whether the kill switch API runs on a separate
 // listener. When true, IsActiveHTTP skips the /api/v1/* exemption on the
 // main port — the agent cannot reach the API to deactivate its own kill switch.
@@ -249,9 +258,10 @@ func (c *Controller) SetSeparateAPIPort(sep bool) {
 func (c *Controller) Sources() map[string]bool {
 	rt := c.cfg.Load()
 	sources := map[string]bool{
-		"config": rt.cfgEnabled,
-		"api":    c.api.Load(),
-		"signal": c.sigusr1.Load(),
+		"config":           rt.cfgEnabled,
+		"api":              c.api.Load(),
+		"signal":           c.sigusr1.Load(),
+		"conductor_remote": c.conductor.Load(),
 	}
 	if rt.sentinelFile != "" {
 		_, err := os.Stat(rt.sentinelFile)
@@ -262,14 +272,21 @@ func (c *Controller) Sources() map[string]bool {
 	return sources
 }
 
-// computeDecision evaluates the four activation sources in priority order.
+// computeDecision evaluates activation sources in priority order.
 func (c *Controller) computeDecision(rt *runtime) Decision {
-	// Priority: config > api > signal > sentinel.
+	// Priority: config > api > conductor_remote > signal > sentinel.
 	if rt.cfgEnabled {
 		return Decision{Active: true, Message: rt.message, Source: "config"}
 	}
 	if c.api.Load() {
 		return Decision{Active: true, Message: rt.message, Source: "api"}
+	}
+	if c.conductor.Load() {
+		msg, _ := c.conductorMsg.Load().(string)
+		if msg == "" {
+			msg = rt.message
+		}
+		return Decision{Active: true, Message: msg, Source: "conductor_remote"}
 	}
 	if c.sigusr1.Load() {
 		return Decision{Active: true, Message: rt.message, Source: "signal"}
