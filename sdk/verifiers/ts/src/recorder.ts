@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { Receipt, RecorderEntry } from "./types.js";
-import { RuntimeError, parseJSON } from "./util.js";
+import { RuntimeError, parseJSON, rejectDuplicateKeys } from "./util.js";
 
 const actionReceiptType = "action_receipt";
 
@@ -13,6 +13,7 @@ export function readEntries(file: string): RecorderEntry[] {
     const line = lines[i]?.trim() ?? "";
     if (line === "") continue;
     const entry = parseJSON<RecorderEntry>(line, `line ${i + 1}`);
+    rejectDuplicateKeys(line);
     if (entry.v !== 1 && entry.v !== 2) {
       throw new RuntimeError(
         `line ${i + 1}: unsupported entry version ${String(entry.v)} (accepted: 1, 2)`,

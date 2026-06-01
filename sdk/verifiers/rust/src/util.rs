@@ -34,12 +34,164 @@ pub fn sha256_hex(data: &[u8]) -> String {
 pub fn parse_json_file(path: &Path) -> Result<Value> {
     let text = fs::read_to_string(path)
         .map_err(|err| VerifierError::Runtime(format!("read {}: {err}", path.display())))?;
-    serde_json::from_str(&text)
-        .map_err(|err| VerifierError::Runtime(format!("malformed JSON: {err}")))
+    parse_json_text(&text, "malformed JSON")
 }
 
 pub fn parse_json_line(text: &str, label: &str) -> Result<Value> {
-    serde_json::from_str(text).map_err(|err| VerifierError::Runtime(format!("{label}: {err}")))
+    parse_json_text(text, label)
+}
+
+pub fn parse_json_text(text: &str, label: &str) -> Result<Value> {
+    use serde::Deserialize;
+    let mut de = serde_json::Deserializer::from_str(text);
+    // Keep normal parsing aligned with reject_duplicate_keys: serde_json's
+    // built-in recursion limit rejects one level earlier than the shared
+    // verifier boundary, so parse with it disabled after the explicit scanner
+    // has enforced the 128-level cap.
+    de.disable_recursion_limit();
+    let value = Value::deserialize(&mut de)
+        .map_err(|err| VerifierError::Runtime(format!("{label}: {err}")))?;
+    de.end()
+        .map_err(|err| VerifierError::Runtime(format!("{label}: {err}")))?;
+    Ok(value)
+}
+
+/// reject_duplicate_keys returns an Invalid error if text contains a duplicate
+/// object key at any nesting depth. serde_json keeps the last value for a
+/// duplicate key, so {"verdict":"allow","verdict":"block"} deserializes as
+/// "block" with no error — a parser-differential smuggling vector where a
+/// display or log layer reading the first occurrence sees a value different
+/// from the one the signature was verified against. The verify path rejects
+/// such input before signature verification. Implemented as a recursive serde
+/// Visitor so it reuses serde_json's tokenizer rather than a hand parser.
+pub fn reject_duplicate_keys(text: &str) -> Result<()> {
+    use serde::de::DeserializeSeed;
+    let mut de = serde_json::Deserializer::from_str(text);
+    // serde_json's built-in recursion limit rejects one level earlier than the
+    // Go/TypeScript/Python verifier cap. Disable it and enforce the shared
+    // receipt-nesting bound explicitly in NoDupSeed so all four allow exactly
+    // 128 nested JSON arrays/objects and reject the 129th.
+    de.disable_recursion_limit();
+    match (NoDupSeed { depth: 0 }).deserialize(&mut de) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(VerifierError::Invalid(err.to_string())),
+    }
+}
+
+const MAX_NESTING_DEPTH: usize = 128;
+
+/// NoDup deserializes any JSON value purely to assert there are no duplicate
+/// object keys; it carries no data.
+struct NoDupSeed {
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, SeqAccess, Visitor};
+        use std::collections::HashSet;
+        use std::fmt;
+
+        struct NoDupVisitor {
+            depth: usize,
+        }
+
+        impl<'de> Visitor<'de> for NoDupVisitor {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                if self.depth >= MAX_NESTING_DEPTH {
+                    return Err(de::Error::custom(format!(
+                        "JSON nesting exceeds maximum depth {MAX_NESTING_DEPTH}"
+                    )));
+                }
+                let mut seen: HashSet<String> = HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(de::Error::custom(format!("duplicate object key: {key}")));
+                    }
+                    map.next_value_seed(NoDupSeed {
+                        depth: self.depth + 1,
+                    })?;
+                }
+                Ok(())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if self.depth >= MAX_NESTING_DEPTH {
+                    return Err(de::Error::custom(format!(
+                        "JSON nesting exceeds maximum depth {MAX_NESTING_DEPTH}"
+                    )));
+                }
+                while seq
+                    .next_element_seed(NoDupSeed {
+                        depth: self.depth + 1,
+                    })?
+                    .is_some()
+                {}
+                Ok(())
+            }
+
+            fn visit_bool<E>(self, _v: bool) -> std::result::Result<(), E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_i64<E>(self, _v: i64) -> std::result::Result<(), E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_u64<E>(self, _v: u64) -> std::result::Result<(), E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_f64<E>(self, _v: f64) -> std::result::Result<(), E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_str<E>(self, _v: &str) -> std::result::Result<(), E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<(), E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_any(NoDupVisitor { depth: self.depth })
+    }
 }
 
 pub fn decode_hex(
