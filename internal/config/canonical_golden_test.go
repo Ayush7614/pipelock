@@ -138,10 +138,18 @@ const (
 	// hash), which is the admission-grade contract.
 	// Re-bumped for the Twilio + Mailgun DLP pattern boundary tightening
 	// (defaults.go DLP set): SK[a-f0-9]{32} -> \bSK[a-f0-9]{32}\b and
-	// key-[a-zA-Z0-9]{32} -> \bkey-[a-zA-Z0-9]{32}\b. Word boundaries close
-	// the short-prefix false-positive surface on opaque digests / longer IDs
-	// while still matching the documented 34/36-char key formats.
-	goldenHashDefaults = "bb20f80925589ce948a423024197dce46307d967c831b134c3b1251c2fce199c"
+	// key-[a-zA-Z0-9]{32} -> \bkey-[a-zA-Z0-9]{32}\b.
+	// Re-bumped for the secret-pattern expansion (defaults.go DLP set,
+	// 48 -> 62): added DB connection-string patterns (postgres/mysql/mongodb/
+	// redis with embedded creds), the remaining GitLab token families
+	// (gldt-/glrt-/glcbt-/glptt-/gloas-/glsoat-/grouped service tokens), and
+	// cloud SA key patterns (GCP private_key_id, Azure storage account key,
+	// Azure SAS signature). The GCP service_account marker is core DLP, not a
+	// default pattern.
+	// Re-bumped again: the "Private Key Header" pattern now also matches PGP
+	// armor and the trailing BLOCK keyword, aligning DLP detection with the
+	// ssh-private-key redaction class.
+	goldenHashDefaults = "52a2300320f93c54c5304770196e95fad6e79663d96826f0e812aedcd5cc9822"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -212,10 +220,10 @@ const (
 	// Bumped for fetch_proxy.monitoring.query_entropy_exclusions: see the
 	// goldenHashDefaults note above.
 	// Re-bumped for the file_sentry max_file_bytes field: see goldenHashDefaults note.
-	// Re-bumped for the Twilio + Mailgun DLP boundary tightening: see
-	// goldenHashDefaults note above. The rich fixture inherits the default DLP
-	// pattern set, so the hash shifts in lockstep.
-	goldenHashRichConfig = "e84f39a304665d618b12a653c2216afe94cb67e7e0adbce1d377e09d8db46ce0"
+	// Re-bumped for the Twilio + Mailgun DLP boundary tightening and again for
+	// the secret-pattern expansion: see goldenHashDefaults note above. The rich
+	// fixture inherits the default DLP pattern set, so the hash shifts in lockstep.
+	goldenHashRichConfig = "67fed6b23291883c5b63ceb0c63726b8579e79d13d3171f549144426f0feb925"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It
