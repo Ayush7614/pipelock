@@ -351,6 +351,19 @@ TypeScript, and Rust implementations validate the same canonical conformance
 vectors; the Python companion continues to cover the v1 chain surface noted
 above.
 
+## Exporting the signer key
+
+On a Pipelock host, export the verifier key from the configured
+flight-recorder signing key:
+
+```bash
+pipelock signing pubkey --config /etc/pipelock/pipelock.yaml --out /etc/pipelock/keys/flight-recorder-signing.key.pub
+pipelock verify-receipt receipt.json --key /etc/pipelock/keys/flight-recorder-signing.key.pub
+```
+
+The exported file is public key material only. Do not hand verifiers the private
+file named by `flight_recorder.signing_key_path`.
+
 ## See also
 
 - [Flight recorder guide](flight-recorder.md) for configuring evidence logging
