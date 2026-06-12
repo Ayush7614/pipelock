@@ -114,6 +114,11 @@ type Server struct {
 	conductorAudit      conductorRunner
 	conductorRemoteKill conductorRunner
 	conductorBundle     conductorRunner
+	// conductorRollback holds *policysync.RollbackPoller in the enterprise build.
+	// It polls the leader for a signed rollback authorization matching the
+	// follower's active->prior bundle pair and drives the existing apply boundary
+	// (with AllowRollback) to restore the prior bundle.
+	conductorRollback conductorRunner
 	// conductorStale holds *applycache.StaleEnforcer in the enterprise build.
 	// It engages the kill switch's conductor_stale source when the active
 	// policy bundle ages past its grace window, failing closed.
@@ -370,6 +375,10 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		s.cleanup()
 		return nil, err
 	}
+	if err := s.initConductorRollbackPoller(cfg, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
 	if err := s.initConductorStaleEnforcer(cfg, ks, opts.Stderr); err != nil {
 		s.cleanup()
 		return nil, err
@@ -531,6 +540,10 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		return nil, fmt.Errorf("flight_recorder.require_receipts is enabled but no healthy signed receipt emitter is active: set flight_recorder.enabled, flight_recorder.dir, and flight_recorder.signing_key_path (run 'pipelock init'), fix any receipt-chain resume error, or disable require_receipts")
 	}
 	if err := s.initConductorProducer(cfg, m, recPrivKey, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+	if err := s.initConductorEnrollment(cfg, recPrivKey, opts.Stderr); err != nil {
 		s.cleanup()
 		return nil, err
 	}

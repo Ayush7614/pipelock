@@ -319,3 +319,11 @@ func (f fakeStore) Latest(context.Context, FollowerIdentity, time.Time) (Publish
 	}
 	return f.latest, nil
 }
+
+func (f fakeStore) BundleByIDVersion(context.Context, string, uint64) (PublishedBundle, error) {
+	return PublishedBundle{}, ErrBundleNotFound
+}
+
+func (f fakeStore) ApplyRollbackHead(context.Context, conductor.RollbackAuthorization, time.Time) error {
+	return nil
+}

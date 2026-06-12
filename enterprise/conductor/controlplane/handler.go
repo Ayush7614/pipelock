@@ -5,6 +5,7 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,6 +122,14 @@ type Handler struct {
 	rollbackMaxTTL    time.Duration
 	metrics           *metrics.Metrics
 	logger            *slog.Logger
+}
+
+type rollbackAuthorizationEnumerator interface {
+	RollbackAuthorizations(context.Context) ([]StoredRollbackAuthorization, error)
+}
+
+type rollbackHeadReconciler interface {
+	ReconcileRollbackHeads(context.Context, []StoredRollbackAuthorization, time.Time) error
 }
 
 type publishPolicyBundleRequest struct {
@@ -275,6 +284,9 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		}
 	}
 	auditQuerier, _ := opts.AuditSink.(AuditBatchQuerier)
+	if err := reconcileRollbackHeads(opts.Store, opts.EmergencyControls, now()); err != nil {
+		return nil, err
+	}
 	return &Handler{
 		store:               opts.Store,
 		capabilities:        capabilities,
@@ -298,6 +310,25 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		metrics:             opts.Metrics,
 		logger:              opts.Logger,
 	}, nil
+}
+
+func reconcileRollbackHeads(store BundleStore, emergencyControls EmergencyStore, now time.Time) error {
+	if emergencyControls == nil {
+		return nil
+	}
+	lister, ok := emergencyControls.(rollbackAuthorizationEnumerator)
+	if !ok {
+		return nil
+	}
+	reconciler, ok := store.(rollbackHeadReconciler)
+	if !ok {
+		return nil
+	}
+	records, err := lister.RollbackAuthorizations(context.Background())
+	if err != nil {
+		return err
+	}
+	return reconciler.ReconcileRollbackHeads(context.Background(), records, now)
 }
 
 func DefaultCapabilities(conductorID string) conductor.CapabilitiesResponse {
@@ -592,12 +623,18 @@ func (h *Handler) handleLatestPolicyBundle(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusUnauthorized, ErrFollowerRequired)
 		return
 	}
-	record, err := h.store.Latest(r.Context(), identity, h.now())
+	now := h.now()
+	record, err := h.store.Latest(r.Context(), identity, now)
 	if err != nil {
 		if errors.Is(err, ErrBundleNotFound) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		writeStoreError(w, err)
+		return
+	}
+	record, err = h.applyRollbackCeiling(r, identity, record, now)
+	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
@@ -609,6 +646,41 @@ func (h *Handler) handleLatestPolicyBundle(w http.ResponseWriter, r *http.Reques
 	}
 	w.Header().Set("ETag", etag)
 	writeJSON(w, http.StatusOK, record.Bundle)
+}
+
+func (h *Handler) applyRollbackCeiling(r *http.Request, identity FollowerIdentity, latest PublishedBundle, now time.Time) (PublishedBundle, error) {
+	if h.emergencyControls == nil {
+		return latest, nil
+	}
+	rollback, ok, err := h.emergencyControls.ActiveRollbackForFollower(r.Context(), identity, now)
+	if err != nil {
+		return PublishedBundle{}, err
+	}
+	if !ok {
+		return latest, nil
+	}
+	auth := rollback.Authorization
+	if latest.Bundle.Version > auth.CurrentVersion {
+		return latest, nil
+	}
+	current, err := h.store.BundleByIDVersion(r.Context(), auth.CurrentBundleID, auth.CurrentVersion)
+	if err != nil {
+		if errors.Is(err, ErrBundleNotFound) {
+			return PublishedBundle{}, fmt.Errorf("active rollback current unavailable: %w", err)
+		}
+		return PublishedBundle{}, err
+	}
+	target, err := h.store.BundleByIDVersion(r.Context(), auth.TargetBundleID, auth.TargetVersion)
+	if err != nil {
+		if errors.Is(err, ErrBundleNotFound) {
+			return PublishedBundle{}, fmt.Errorf("active rollback target unavailable: %w", err)
+		}
+		return PublishedBundle{}, err
+	}
+	if current.StreamKey != latest.StreamKey || target.StreamKey != latest.StreamKey {
+		return latest, nil
+	}
+	return target, nil
 }
 
 func (h *Handler) handleRemoteKill(w http.ResponseWriter, r *http.Request) {
@@ -737,8 +809,16 @@ func (h *Handler) handlePublishRollbackAuthorization(w http.ResponseWriter, r *h
 		writeStoreError(w, err)
 		return
 	}
+	if _, err := h.store.BundleByIDVersion(r.Context(), req.Authorization.TargetBundleID, req.Authorization.TargetVersion); err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	record, created, err := h.emergencyControls.PublishRollbackAuthorization(r.Context(), req.Authorization, now)
 	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if err := h.store.ApplyRollbackHead(r.Context(), req.Authorization, now); err != nil {
 		writeStoreError(w, err)
 		return
 	}
@@ -866,6 +946,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrBundleConflict), errors.Is(err, ErrUnsupportedRollback), errors.Is(err, ErrEmergencyConflict), errors.Is(err, ErrEmergencyStaleCounter):
 		writeError(w, http.StatusConflict, err)
+	case errors.Is(err, ErrBundleNotFound):
+		writeError(w, http.StatusNotFound, err)
 	case errors.Is(err, conductor.ErrPayloadTooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, err)
 	case errors.Is(err, conductor.ErrUnsupportedSchemaVersion), errors.Is(err, conductor.ErrInvalidHash),

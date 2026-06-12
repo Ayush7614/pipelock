@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,6 @@ import (
 
 const (
 	emergencyStateFileName    = "emergency-controls.json"
-	emergencyStateFileMode    = 0o600
 	maxEmergencyStateJSONSize = conductor.MaxConfigYAMLBytes * 2
 )
 
@@ -57,6 +57,7 @@ type EmergencyStore interface {
 	LatestRemoteKill(ctx context.Context, follower FollowerIdentity, now time.Time) (StoredRemoteKill, error)
 	PublishRollbackAuthorization(ctx context.Context, auth conductor.RollbackAuthorization, now time.Time) (StoredRollbackAuthorization, bool, error)
 	LatestRollbackAuthorization(ctx context.Context, follower FollowerIdentity, lookup RollbackLookup, now time.Time) (StoredRollbackAuthorization, error)
+	ActiveRollbackForFollower(ctx context.Context, follower FollowerIdentity, now time.Time) (StoredRollbackAuthorization, bool, error)
 }
 
 type FileEmergencyStore struct {
@@ -252,9 +253,6 @@ func (s *FileEmergencyStore) LatestRollbackAuthorization(_ context.Context, foll
 		if auth.OrgID != follower.OrgID || auth.FleetID != follower.FleetID {
 			continue
 		}
-		if !auth.Audience.Matches(follower.InstanceID, follower.Labels) {
-			continue
-		}
 		if best.AuthorizationHash == "" || newerRollback(record, best) {
 			best = record
 		}
@@ -263,6 +261,39 @@ func (s *FileEmergencyStore) LatestRollbackAuthorization(_ context.Context, foll
 		return StoredRollbackAuthorization{}, ErrEmergencyNotFound
 	}
 	return best, nil
+}
+
+func (s *FileEmergencyStore) ActiveRollbackForFollower(_ context.Context, follower FollowerIdentity, now time.Time) (StoredRollbackAuthorization, bool, error) {
+	if s == nil {
+		return StoredRollbackAuthorization{}, false, ErrEmergencyStoreRequired
+	}
+	if err := follower.Validate(); err != nil {
+		return StoredRollbackAuthorization{}, false, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var best StoredRollbackAuthorization
+	for _, record := range s.rollbacks {
+		auth := record.Authorization
+		if err := auth.ValidateAtTime(now); err != nil {
+			continue
+		}
+		if auth.OrgID != follower.OrgID || auth.FleetID != follower.FleetID {
+			continue
+		}
+		if best.AuthorizationHash == "" || newerRollback(record, best) {
+			best = record
+		}
+	}
+	if best.AuthorizationHash == "" {
+		return StoredRollbackAuthorization{}, false, nil
+	}
+	return best, true, nil
 }
 
 func (l RollbackLookup) Validate() error {
@@ -320,6 +351,15 @@ func (s *FileEmergencyStore) load() error {
 	return nil
 }
 
+func (s *FileEmergencyStore) RollbackAuthorizations(_ context.Context) ([]StoredRollbackAuthorization, error) {
+	if s == nil {
+		return nil, ErrEmergencyStoreRequired
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clone(s.rollbacks), nil
+}
+
 func (s *FileEmergencyStore) writeLocked() error {
 	return writeEmergencyState(s.statePath, emergencyStateRecord{
 		RemoteKills: s.remoteKills,
@@ -372,7 +412,7 @@ func writeEmergencyState(path string, record emergencyStateRecord) error {
 		return fmt.Errorf("conductor emergency store marshal state: %w", err)
 	}
 	data = append(data, '\n')
-	return durableWrite(path, data, emergencyStateFileMode)
+	return durableWrite(path, data)
 }
 
 func validateStoredRemoteKill(record StoredRemoteKill) error {
