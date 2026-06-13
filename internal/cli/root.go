@@ -143,6 +143,8 @@ Quick start:
 		clisigning.VerifyReceiptCmd(),
 		clisigning.TranscriptRootCmd(),
 		clisigning.SigningSubtreeCmd(),
+		// Explain a URL verdict with per-scanner remediation.
+		explainCmd(),
 		// Binary install helper for sidecar init containers.
 		installCmd(),
 		// Version
