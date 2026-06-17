@@ -443,6 +443,167 @@ func TestBuildSkipSet_Boost(t *testing.T) {
 	})
 }
 
+// TestCheckCmd_InertSuppressAdvisory verifies that the check command surfaces
+// an advisory when a suppress entry matches no active pattern.
+func TestCheckCmd_InertSuppressAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "pipelock.yaml")
+	yaml := "mode: balanced\nsuppress:\n  - rule: Nonexistent Pattern\n    path: '*'\n    reason: test\n"
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := &cobra.Command{Use: "pipelock"}
+	root.AddCommand(CheckCmd())
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"check", "--config", cfgFile})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "ADVISORY") {
+		t.Errorf("expected ADVISORY in check output for inert suppress; got: %s", output)
+	}
+	if !strings.Contains(output, "Nonexistent Pattern") {
+		t.Errorf("expected pattern name in advisory; got: %s", output)
+	}
+}
+
+// TestCheckCmd_FlightRecorderInertAdvisory verifies that the check command
+// surfaces an advisory when flight_recorder is enabled but dir is unset.
+func TestCheckCmd_FlightRecorderInertAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "pipelock.yaml")
+	yaml := "mode: balanced\nflight_recorder:\n  enabled: true\n"
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := &cobra.Command{Use: "pipelock"}
+	root.AddCommand(CheckCmd())
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"check", "--config", cfgFile})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "flight_recorder") {
+		t.Errorf("expected flight_recorder advisory; got: %s", output)
+	}
+}
+
+// TestDoctorCmd_FlightRecorderInert verifies that the doctor command warns
+// when flight_recorder is enabled but dir is unset.
+func TestDoctorCmd_FlightRecorderInert(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.FlightRecorder.Enabled = true
+	cfg.FlightRecorder.Dir = ""
+
+	report := buildDoctorReport(cfg, "test")
+	var found bool
+	for _, check := range report.Checks {
+		if check.Name == "flight_recorder" && check.Status == doctorStatusWarn {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected a warn flight_recorder check in the doctor report")
+	}
+}
+
+// TestCheckDoctorFlightRecorder_AllBranches exercises every status branch of
+// checkDoctorFlightRecorder: disabled (info), enabled-but-no-dir (warn),
+// enabled-with-dir (ok), and configured-but-unusable (fail).
+func TestCheckDoctorFlightRecorder_AllBranches(t *testing.T) {
+	dir := t.TempDir()
+	missingDir := filepath.Join(t.TempDir(), "missing")
+	tests := []struct {
+		name    string
+		enabled bool
+		dir     string
+		want    string
+		reach   bool
+		enforce bool
+	}{
+		{name: "disabled", enabled: false, dir: "", want: doctorStatusInfo},
+		{name: "enabled_no_dir", enabled: true, dir: "", want: doctorStatusWarn},
+		{name: "enabled_with_dir", enabled: true, dir: dir, want: doctorStatusOK, reach: true, enforce: true},
+		{name: "enabled_missing_dir", enabled: true, dir: missingDir, want: doctorStatusFail},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.FlightRecorder.Enabled = tc.enabled
+			cfg.FlightRecorder.Dir = tc.dir
+			got := checkDoctorFlightRecorder(cfg)
+			if got.Name != "flight_recorder" {
+				t.Errorf("Name = %q, want flight_recorder", got.Name)
+			}
+			if got.Status != tc.want {
+				t.Errorf("Status = %q, want %q", got.Status, tc.want)
+			}
+			if got.Reachable != tc.reach {
+				t.Errorf("Reachable = %v, want %v", got.Reachable, tc.reach)
+			}
+			if got.Enforcing != tc.enforce {
+				t.Errorf("Enforcing = %v, want %v", got.Enforcing, tc.enforce)
+			}
+		})
+	}
+}
+
+func TestFlightRecorderAccessDetail(t *testing.T) {
+	tests := []struct {
+		name       string
+		readable   bool
+		writable   bool
+		wantDetail string
+		wantNext   string
+	}{
+		{
+			name:       "neither_readable_nor_writable",
+			wantDetail: "not readable or writable",
+			wantNext:   "read/write/execute",
+		},
+		{
+			name:       "not_readable",
+			readable:   false,
+			writable:   true,
+			wantDetail: "not readable",
+			wantNext:   "read/execute",
+		},
+		{
+			name:       "not_writable",
+			readable:   true,
+			writable:   false,
+			wantDetail: "not writable",
+			wantNext:   "write/execute",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			detail, next := flightRecorderAccessDetail(tc.readable, tc.writable)
+			if !strings.Contains(detail, tc.wantDetail) {
+				t.Fatalf("detail = %q, want substring %q", detail, tc.wantDetail)
+			}
+			if !strings.Contains(next, tc.wantNext) {
+				t.Fatalf("next = %q, want substring %q", next, tc.wantNext)
+			}
+		})
+	}
+}
+
 func TestConnectThroughProxy_BadAddress(t *testing.T) {
 	_, err := connectThroughProxy("http://127.0.0.1:1", "example.com:443")
 	if err == nil {

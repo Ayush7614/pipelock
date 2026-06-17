@@ -151,6 +151,7 @@ func buildDoctorReport(cfg *config.Config, cfgLabel string) doctorReport {
 		checkDoctorMCPBinaryIntegrity(cfg),
 		checkDoctorMCPToolProvenance(cfg),
 		checkDoctorFileSentry(cfg),
+		checkDoctorFlightRecorder(cfg),
 		checkDoctorLicense(cfg),
 		checkDoctorSentry(cfg),
 		checkDoctorDeploymentBoundary(cfg),
@@ -605,6 +606,66 @@ func checkDoctorFileSentry(cfg *config.Config) doctorReportCheck {
 	return check
 }
 
+func checkDoctorFlightRecorder(cfg *config.Config) doctorReportCheck {
+	if !cfg.FlightRecorder.Enabled {
+		return doctorReportCheck{
+			Name:    "flight_recorder",
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled",
+			Next:    "enable flight_recorder to emit signed decision receipts",
+		}
+	}
+	if cfg.FlightRecorder.Dir == "" {
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Detail:     "flight_recorder is enabled but dir is unset; no receipts will be written",
+			Next:       "set flight_recorder.dir to a writable directory so receipts are persisted",
+		}
+	}
+	readable := pathReadable(cfg.FlightRecorder.Dir)
+	writable := pathWritableDir(cfg.FlightRecorder.Dir)
+	if !readable || !writable {
+		detail, next := flightRecorderAccessDetail(readable, writable)
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Reachable:  readable,
+			Enforcing:  false,
+			Detail:     detail,
+			Next:       next,
+		}
+	}
+	return doctorReportCheck{
+		Name:       "flight_recorder",
+		Surface:    doctorSurfaceConfig,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "flight_recorder is enabled with a configured directory",
+	}
+}
+
+func flightRecorderAccessDetail(readable, writable bool) (detail, next string) {
+	switch {
+	case !readable && !writable:
+		return "flight_recorder.dir is configured but is not readable or writable; receipts will not persist reliably",
+			"create the directory and grant the pipelock service user read/write/execute access"
+	case !readable:
+		return "flight_recorder.dir is configured but is not readable; existing receipts cannot be inspected reliably",
+			"grant the pipelock service user read/execute access to flight_recorder.dir"
+	default:
+		return "flight_recorder.dir is configured but is not writable; new receipts will not persist",
+			"grant the pipelock service user write/execute access to flight_recorder.dir"
+	}
+}
+
 func checkDoctorSentry(cfg *config.Config) doctorReportCheck {
 	dsnConfigured := cfg.Sentry.DSN != "" || os.Getenv("SENTRY_DSN") != ""
 	if !cfg.Sentry.IsEnabled() {
@@ -687,6 +748,21 @@ func pathReadable(path string) bool {
 		return false
 	}
 	return openReadable(path)
+}
+
+func pathWritableDir(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	probe, err := os.CreateTemp(filepath.Clean(path), ".pipelock-doctor-writability-*") //nolint:gosec // doctor checks operator-visible config paths from local configuration.
+	if err != nil {
+		return false
+	}
+	probePath := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(probePath)
+	return true
 }
 
 func openReadable(path string) bool {
