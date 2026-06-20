@@ -129,7 +129,10 @@ func (s *Server) ApplyConductorPolicyBundle(bundle conductor.PolicyBundle, opts 
 		Resolver:     opts.Resolver,
 		LocalVersion: cliutil.Version,
 		LoadConfig:   config.Load,
-		Reload:       s.Reload,
+		Reload: func(newCfg *config.Config) error {
+			preserveConductorBundleLocalRuntimeState(cfg, newCfg)
+			return s.Reload(newCfg)
+		},
 		// Close the in-flight apply window: teardownConductor sets conductorDown
 		// without taking conductorApplyMu (that would deadlock the poller's own
 		// apply -> reload -> teardown path), so a bundle already past the
@@ -142,6 +145,10 @@ func (s *Server) ApplyConductorPolicyBundle(bundle conductor.PolicyBundle, opts 
 		Rollback:      opts.Rollback,
 		AllowRollback: opts.AllowRollback,
 	})
+}
+
+func preserveConductorBundleLocalRuntimeState(oldCfg, newCfg *config.Config) {
+	config.PreserveConductorBundleLocalRuntimeState(newCfg, oldCfg)
 }
 
 func buildConductorAuditTransport(cfg *config.Config, m *metrics.Metrics) (*auditbatcher.Queue, *auditbatcher.Transport, error) {
