@@ -536,6 +536,36 @@ func waitForPortOrCommandExitResult(addr string, cmdErr <-chan error, stderr fmt
 	}
 }
 
+func doMCPPostWithStartupRetry(t *testing.T, addr string, body string, cmdErr <-chan error, stderr fmt.Stringer) *http.Response {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var lastErr error
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+"/", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("new mcp request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			return resp
+		}
+		lastErr = err
+
+		select {
+		case <-ctx.Done():
+			t.Fatalf("mcp listener POST: %v\nstderr:\n%s", lastErr, stderr.String())
+		case err := <-cmdErr:
+			t.Fatalf("RunCmd exited before MCP listener accepted POST: %v\nlast POST error: %v\nstderr:\n%s", err, lastErr, stderr.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // doGet issues a context-aware GET and fails the test on error.
 func doGet(t *testing.T, client *http.Client, url string) *http.Response {
 	t.Helper()
@@ -785,16 +815,9 @@ logging:
 			t.Fatalf("reverse proxy status = %d, want 200", reverseResp.StatusCode)
 		}
 
-		mcpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://"+mcpAddr+"/",
-			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"prompt":"use `+secret+` to deploy"}}}`))
-		if err != nil {
-			t.Fatalf("new mcp request: %v", err)
-		}
-		mcpReq.Header.Set("Content-Type", "application/json")
-		mcpResp, err := http.DefaultClient.Do(mcpReq)
-		if err != nil {
-			t.Fatalf("mcp listener POST: %v", err)
-		}
+		mcpResp := doMCPPostWithStartupRetry(t, mcpAddr,
+			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"prompt":"use `+secret+` to deploy"}}}`,
+			cmdErr, &stderr)
 		_ = mcpResp.Body.Close()
 		if mcpResp.StatusCode != http.StatusOK {
 			t.Fatalf("mcp listener status = %d, want 200", mcpResp.StatusCode)
@@ -891,16 +914,9 @@ logging:
 			return err
 		}
 
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://"+mcpAddr+"/",
-			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}`))
-		if err != nil {
-			t.Fatalf("new mcp request: %v", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("mcp listener POST: %v", err)
-		}
+		resp := doMCPPostWithStartupRetry(t, mcpAddr,
+			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}`,
+			cmdErr, &stderr)
 		defer func() {
 			if err := resp.Body.Close(); err != nil {
 				t.Errorf("close mcp response body: %v", err)

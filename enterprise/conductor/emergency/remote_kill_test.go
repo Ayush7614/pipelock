@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,17 @@ type captureKillSwitch struct {
 func (c *captureKillSwitch) SetConductorRemote(active bool, message string) {
 	c.active = active
 	c.message = message
+}
+
+type blockingKillSwitch struct {
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingKillSwitch) SetConductorRemote(bool, string) {
+	b.once.Do(func() { close(b.reached) })
+	<-b.release
 }
 
 func TestRemoteKillApplier(t *testing.T) {
@@ -248,25 +260,36 @@ func TestRemoteKillApplierInactiveClearsSource(t *testing.T) {
 }
 
 func TestRemoteKillApplierRestoresPersistedState(t *testing.T) {
+	msg, resolver := signedRemoteKill(t, 12, conductor.KillSwitchActive)
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	if err := writeRemoteKillState(statePath, remoteKillState{
-		LastCounter:     12,
-		LastMessageHash: strings.Repeat("a", 64),
-		State:           conductor.KillSwitchActive,
-		Reason:          "persisted emergency stop",
-		AppliedAt:       testNow.Add(-time.Minute),
-	}); err != nil {
-		t.Fatalf("writeRemoteKillState: %v", err)
+	// Apply persists the signed message alongside the decision.
+	if err := (&RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   resolver,
+		KillSwitch: &captureKillSwitch{},
+		StatePath:  statePath,
+		Now:        func() time.Time { return testNow },
+	}).Apply(msg); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
+	// A fresh applier (simulating restart) must re-verify the persisted decision
+	// against the trust roster, not blindly trust the on-disk state.
 	ks := &captureKillSwitch{}
 	applier := &RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   resolver,
 		KillSwitch: ks,
 		StatePath:  statePath,
+		Now:        func() time.Time { return testNow },
 	}
 	if err := applier.RestorePersistedState(); err != nil {
 		t.Fatalf("RestorePersistedState() error = %v", err)
 	}
-	if !ks.active || ks.message != "persisted emergency stop" {
+	if !ks.active || ks.message != msg.Reason {
 		t.Fatalf("kill switch = active=%v message=%q, want restored active", ks.active, ks.message)
 	}
 }
@@ -372,6 +395,82 @@ func TestRemoteKillApplierRejectsStaleCounter(t *testing.T) {
 	}
 }
 
+func TestRemoteKillApplierSerializesCounterCheckAcrossInstances(t *testing.T) {
+	lowMsg, lowResolver := signedRemoteKill(t, 11, conductor.KillSwitchActive)
+	highMsg, highResolver := signedRemoteKill(t, 12, conductor.KillSwitchInactive)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	if err := ResetRemoteKillReplayState(statePath, 10, conductor.KillSwitchActive, "operator floor", testNow); err != nil {
+		t.Fatalf("ResetRemoteKillReplayState: %v", err)
+	}
+
+	blockingKS := &blockingKillSwitch{
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	lowApplier := &RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   lowResolver,
+		KillSwitch: blockingKS,
+		StatePath:  statePath,
+		Now:        func() time.Time { return testNow },
+	}
+	highApplier := &RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   highResolver,
+		KillSwitch: &captureKillSwitch{},
+		StatePath:  statePath,
+		Now:        func() time.Time { return testNow.Add(time.Second) },
+	}
+
+	lowErr := make(chan error, 1)
+	go func() {
+		lowErr <- lowApplier.Apply(lowMsg)
+	}()
+	select {
+	case <-blockingKS.reached:
+	case <-time.After(time.Second):
+		t.Fatal("lower-counter Apply did not reach kill switch")
+	}
+
+	highErr := make(chan error, 1)
+	go func() {
+		highErr <- highApplier.Apply(highMsg)
+	}()
+	select {
+	case err := <-highErr:
+		close(blockingKS.release)
+		if lowApplyErr := <-lowErr; lowApplyErr != nil {
+			t.Fatalf("lower-counter Apply error after early higher-counter completion = %v", lowApplyErr)
+		}
+		if err != nil {
+			t.Fatalf("higher-counter Apply returned early with error: %v", err)
+		}
+		t.Fatal("higher-counter Apply completed while lower-counter Apply held the replay-state critical section")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(blockingKS.release)
+	if err := <-lowErr; err != nil {
+		t.Fatalf("lower-counter Apply error = %v", err)
+	}
+	if err := <-highErr; err != nil {
+		t.Fatalf("higher-counter Apply error = %v", err)
+	}
+
+	state, err := readDurableRemoteKillState(statePath)
+	if err != nil {
+		t.Fatalf("readDurableRemoteKillState: %v", err)
+	}
+	if state.LastCounter != highMsg.Counter || state.State != highMsg.State || state.Reason != highMsg.Reason {
+		t.Fatalf("state after concurrent appliers = counter=%d state=%q reason=%q, want counter=%d state=%q reason=%q",
+			state.LastCounter, state.State, state.Reason, highMsg.Counter, highMsg.State, highMsg.Reason)
+	}
+}
+
 func TestRemoteKillApplierRejectsReplayAfterPrimaryStateDeletion(t *testing.T) {
 	oldMsg, resolver := signedRemoteKill(t, 9, conductor.KillSwitchActive)
 	newMsg, newResolver := signedRemoteKill(t, 11, conductor.KillSwitchInactive)
@@ -453,25 +552,37 @@ func TestRemoteKillApplierRejectsReplayAfterPrimaryAndSecondaryDeletion(t *testi
 }
 
 func TestRemoteKillRestoreUsesAnchorAfterPrimaryStateDeletion(t *testing.T) {
+	msg, resolver := signedRemoteKill(t, 12, conductor.KillSwitchActive)
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	if err := writeRemoteKillState(statePath, remoteKillState{
-		LastCounter:     12,
-		LastMessageHash: strings.Repeat("a", 64),
-		State:           conductor.KillSwitchActive,
-		Reason:          "persisted emergency stop",
-		AppliedAt:       testNow.Add(-time.Minute),
-	}); err != nil {
-		t.Fatalf("writeRemoteKillState: %v", err)
+	if err := (&RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   resolver,
+		KillSwitch: &captureKillSwitch{},
+		StatePath:  statePath,
+		Now:        func() time.Time { return testNow },
+	}).Apply(msg); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
 	if err := os.Remove(statePath); err != nil {
 		t.Fatalf("Remove(primary state): %v", err)
 	}
 	ks := &captureKillSwitch{}
-	applier := &RemoteKillApplier{KillSwitch: ks, StatePath: statePath}
+	applier := &RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   resolver,
+		KillSwitch: ks,
+		StatePath:  statePath,
+		Now:        func() time.Time { return testNow },
+	}
+	// Anchor recovery must still re-verify the signed message, not blindly trust it.
 	if err := applier.RestorePersistedState(); err != nil {
 		t.Fatalf("RestorePersistedState(anchor only) error = %v", err)
 	}
-	if !ks.active || ks.message != "persisted emergency stop" {
+	if !ks.active || ks.message != msg.Reason {
 		t.Fatalf("kill switch = active=%v message=%q, want restored active", ks.active, ks.message)
 	}
 }
@@ -487,6 +598,17 @@ func TestResetRemoteKillReplayState(t *testing.T) {
 	}
 	if state.LastCounter != 21 || state.State != conductor.KillSwitchInactive || state.Reason != "operator reset after restore" {
 		t.Fatalf("state = %+v, want reset counter/state/reason", state)
+	}
+	err = (&RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		KillSwitch: &captureKillSwitch{},
+		StatePath:  statePath,
+		Now:        func() time.Time { return testNow },
+	}).RestorePersistedState()
+	if err == nil || !strings.Contains(err.Error(), "not backed by a signed message") {
+		t.Fatalf("RestorePersistedState(unsigned reset) error = %v, want signed-message rejection", err)
 	}
 	if err := ResetRemoteKillReplayState(filepath.Join(t.TempDir(), "bad.json"), 0, conductor.KillSwitchInactive, "", testNow); err == nil {
 		t.Fatal("counter 0 reset must fail")
@@ -537,6 +659,138 @@ func TestRemoteKillApplierBackfillsLegacyStateOnDuplicateHash(t *testing.T) {
 	if state.State != msg.State || state.Reason != msg.Reason || state.LastMessageHash != hash {
 		t.Fatalf("backfilled state = %+v, want state/reason/hash from verified message", state)
 	}
+}
+
+// TestRemoteKillApplier_RejectsForgedPersistedStateOnRestore is the G6 red-team
+// regression. An attacker with write access to the follower replay-state dir can
+// craft a persisted decision (the Context/Digest binding is non-secret and
+// deterministic) that lifts an operator kill or pins one for DoS. On restart the
+// follower must NOT honor a persisted decision that is not backed by a
+// re-verifiable signed Conductor message; it must fail closed and require an
+// explicit operator reset-replay-state.
+func TestRemoteKillApplier_RejectsForgedPersistedStateOnRestore(t *testing.T) {
+	_, resolver := signedRemoteKill(t, 9, conductor.KillSwitchActive)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	// Attacker forges an "inactive" decision (kill lifted) with a valid binding
+	// but no signed message. writeRemoteKillState computes the (non-secret)
+	// Context/Digest exactly as a PVC-write attacker could.
+	if err := writeRemoteKillState(statePath, remoteKillState{
+		LastCounter:     12,
+		LastMessageHash: "forged-by-attacker",
+		State:           conductor.KillSwitchInactive,
+		Reason:          "attacker lifted the kill",
+		AppliedAt:       testNow,
+	}); err != nil {
+		t.Fatalf("writeRemoteKillState(forged): %v", err)
+	}
+	ks := &captureKillSwitch{active: true, message: "real operator kill"}
+	applier := &RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   resolver,
+		KillSwitch: ks,
+		StatePath:  statePath,
+		Now:        func() time.Time { return testNow },
+	}
+	err := applier.RestorePersistedState()
+	if err == nil {
+		t.Fatal("RestorePersistedState() accepted a forged (unsigned) persisted decision; want fail-closed rejection")
+	}
+	if ks.message == "attacker lifted the kill" {
+		t.Fatalf("forged decision was applied to the kill switch: active=%v message=%q", ks.active, ks.message)
+	}
+}
+
+// TestRemoteKillApplier_RejectsTamperedPersistedDecisionOnRestore covers the
+// harder G6 variants: a persisted decision whose on-disk fields were tampered
+// away from the signed message, a signed kill bound to a different follower, and
+// a signed message with a broken signature. All must fail closed on restore.
+func TestRemoteKillApplier_RejectsTamperedPersistedDecisionOnRestore(t *testing.T) {
+	seed := func(t *testing.T) (string, conductor.SignatureKeyResolver) {
+		t.Helper()
+		msg, resolver := signedRemoteKill(t, 9, conductor.KillSwitchActive)
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		if err := (&RemoteKillApplier{
+			OrgID: "org-main", FleetID: "prod", InstanceID: "pl-prod-1",
+			Resolver: resolver, KillSwitch: &captureKillSwitch{}, StatePath: statePath,
+			Now: func() time.Time { return testNow },
+		}).Apply(msg); err != nil {
+			t.Fatalf("seed Apply: %v", err)
+		}
+		return statePath, resolver
+	}
+	rewrite := func(t *testing.T, statePath string, mutate func(*remoteKillState)) {
+		t.Helper()
+		st, err := readDurableRemoteKillState(statePath)
+		if err != nil {
+			t.Fatalf("read seed state: %v", err)
+		}
+		mutate(&st)
+		if err := writeRemoteKillState(statePath, st); err != nil {
+			t.Fatalf("rewrite state: %v", err)
+		}
+	}
+	applier := func(statePath, instanceID string, resolver conductor.SignatureKeyResolver, ks *captureKillSwitch) *RemoteKillApplier {
+		return &RemoteKillApplier{
+			OrgID: "org-main", FleetID: "prod", InstanceID: instanceID,
+			Resolver: resolver, KillSwitch: ks, StatePath: statePath,
+			Now: func() time.Time { return testNow },
+		}
+	}
+
+	t.Run("state flipped to inactive without re-signing", func(t *testing.T) {
+		statePath, resolver := seed(t)
+		rewrite(t, statePath, func(s *remoteKillState) {
+			s.State = conductor.KillSwitchInactive
+			s.Reason = "attacker lifted the kill"
+		})
+		ks := &captureKillSwitch{active: true, message: "real operator kill"}
+		if err := applier(statePath, "pl-prod-1", resolver, ks).RestorePersistedState(); err == nil {
+			t.Fatal("accepted a decision that does not match its signed message")
+		}
+		if ks.message == "attacker lifted the kill" {
+			t.Fatalf("forged decision applied: active=%v message=%q", ks.active, ks.message)
+		}
+	})
+
+	t.Run("signed kill bound to a different follower", func(t *testing.T) {
+		statePath, resolver := seed(t)
+		ks := &captureKillSwitch{}
+		if err := applier(statePath, "pl-prod-OTHER", resolver, ks).RestorePersistedState(); err == nil {
+			t.Fatal("accepted a kill bound to a different follower's audience")
+		}
+	})
+
+	t.Run("broken signature on the persisted message", func(t *testing.T) {
+		statePath, resolver := seed(t)
+		rewrite(t, statePath, func(s *remoteKillState) {
+			var msg conductor.RemoteKillMessage
+			if err := json.Unmarshal(s.SignedMessage, &msg); err != nil {
+				t.Fatalf("unmarshal signed message: %v", err)
+			}
+			for i := range msg.Signatures {
+				msg.Signatures[i].Signature = conductor.SignaturePrefixEd25519 + strings.Repeat("00", ed25519.SignatureSize)
+			}
+			b, err := json.Marshal(msg)
+			if err != nil {
+				t.Fatalf("remarshal tampered message: %v", err)
+			}
+			s.SignedMessage = b
+		})
+		ks := &captureKillSwitch{active: true}
+		if err := applier(statePath, "pl-prod-1", resolver, ks).RestorePersistedState(); err == nil {
+			t.Fatal("accepted a persisted message with an invalid signature")
+		}
+	})
+
+	t.Run("resolver missing cannot apply a persisted decision", func(t *testing.T) {
+		statePath, _ := seed(t)
+		ks := &captureKillSwitch{}
+		if err := applier(statePath, "pl-prod-1", nil, ks).RestorePersistedState(); err == nil {
+			t.Fatal("applied a persisted decision with no resolver to verify it")
+		}
+	})
 }
 
 func signedRemoteKill(t *testing.T, counter uint64, state conductor.KillSwitchState) (conductor.RemoteKillMessage, conductor.SignatureKeyResolver) {
