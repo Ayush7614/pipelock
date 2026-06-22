@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	testCtrlTarget = "127.0.0.1:54321"
-	testRunNonce   = "run-abc"
-	testManHash    = "deadbeef"
+	testCtrlTarget  = "127.0.0.1:54321"
+	testProxyTarget = "127.0.0.1:8888"
+	testRunNonce    = "run-abc"
+	testManHash     = "deadbeef"
 )
 
 // blockedDirectProbes returns one blocked probe for every direct-egress target
@@ -37,6 +38,20 @@ func blockedDirectProbes() []playground.ProbeResult {
 	return probes
 }
 
+func blockedLocalProbes() []playground.ProbeResult {
+	targets := playground.LocalEscapeTargets()
+	probes := make([]playground.ProbeResult, 0, len(targets))
+	for _, target := range targets {
+		probes = append(probes, playground.ProbeResult{
+			Target:  target,
+			Open:    false,
+			Blocked: true,
+			Detail:  "blocked/unavailable",
+		})
+	}
+	return probes
+}
+
 // validWitness returns a fully-enforced, unsigned witness for the happy path.
 func validWitness() playground.HostContainmentWitness {
 	return playground.HostContainmentWitness{
@@ -47,7 +62,10 @@ func validWitness() playground.HostContainmentWitness {
 		ControlTarget:        testCtrlTarget,
 		ControlOperatorProbe: playground.ProbeResult{Target: testCtrlTarget, Open: true, Blocked: false, Detail: "connected"},
 		ControlAgentProbe:    playground.ProbeResult{Target: testCtrlTarget, Open: false, Blocked: true, Detail: "blocked: timeout"},
+		ProxyTarget:          testProxyTarget,
+		ProxyAgentProbe:      playground.ProbeResult{Target: testProxyTarget, Open: true, Blocked: false, Detail: "connected"},
 		AgentProbes:          blockedDirectProbes(),
+		LocalAgentProbes:     blockedLocalProbes(),
 		ProbedAt:             time.Unix(1_700_000_000, 0).UTC(),
 	}
 }
@@ -249,6 +267,14 @@ func TestHostContainmentWitness_Enforced(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "empty local escape suite cannot pass vacuously",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.LocalAgentProbes = nil
+				return w
+			},
+			want: false,
+		},
+		{
 			name: "missing direct-egress suite target",
 			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
 				w.AgentProbes = w.AgentProbes[:len(w.AgentProbes)-1]
@@ -260,6 +286,94 @@ func TestHostContainmentWitness_Enforced(t *testing.T) {
 			name: "substituted direct-egress suite target",
 			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
 				w.AgentProbes[0].Target = "127.0.0.1:1"
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "local escape surface open",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.LocalAgentProbes[0].Open = true
+				w.LocalAgentProbes[0].Blocked = false
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "substituted local escape suite target",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.LocalAgentProbes[0].Target = "unix:/tmp/not-the-fly-api.sock"
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "proxy unreachable for agent (port mismatch with nft rule)",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ProxyAgentProbe.Open = false
+				w.ProxyAgentProbe.Blocked = true
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "empty proxy target",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ProxyTarget = ""
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "proxy target collides with blocked control target",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ProxyTarget = testCtrlTarget
+				w.ProxyAgentProbe.Target = testCtrlTarget
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "proxy probe target mismatch",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ProxyAgentProbe.Target = "127.0.0.1:7777"
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "proxy contradictory open and blocked",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ProxyAgentProbe.Open = true
+				w.ProxyAgentProbe.Blocked = true
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "operator control contradictory open and blocked",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ControlOperatorProbe.Open = true
+				w.ControlOperatorProbe.Blocked = true
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "proxy target must be ipv4 loopback",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ProxyTarget = "10.0.0.1:8888"
+				w.ProxyAgentProbe.Target = "10.0.0.1:8888"
+				return w
+			},
+			want: false,
+		},
+		{
+			name: "control target must be ipv4 loopback",
+			mutate: func(w playground.HostContainmentWitness) playground.HostContainmentWitness {
+				w.ControlTarget = "localhost:54321"
+				w.ControlOperatorProbe.Target = "localhost:54321"
+				w.ControlAgentProbe.Target = "localhost:54321"
 				return w
 			},
 			want: false,

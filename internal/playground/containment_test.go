@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/luckyPipewrench/pipelock/internal/playground"
@@ -174,6 +175,51 @@ func TestSelfTest_EmptyTargets_AllBlocked(t *testing.T) {
 	}
 }
 
+func TestLocalEscapeProbe_MalformedAndUnknownTargets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		target string
+		detail string
+	}{
+		{name: "missing separator", target: "not-a-target", detail: "malformed local escape target"},
+		{name: "empty value", target: "unix:", detail: "malformed local escape target"},
+		{name: "unknown kind", target: "unknown:/tmp/socket", detail: "unknown local escape target kind"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			result := playground.ProbeLocalEscape(t.Context(), tt.target)
+			if result.Open || result.Blocked {
+				t.Fatalf("target %q must be Open=false Blocked=false, got: %+v", tt.target, result)
+			}
+			if result.Detail != tt.detail {
+				t.Fatalf("detail = %q, want %q", result.Detail, tt.detail)
+			}
+		})
+	}
+}
+
+func TestLocalEscapeProbe_DeviceTargets(t *testing.T) {
+	t.Parallel()
+
+	devicePath := filepath.Join(t.TempDir(), "plain-file")
+	if err := os.WriteFile(devicePath, []byte("not a device"), 0o600); err != nil {
+		t.Fatalf("write probe file: %v", err)
+	}
+	open := playground.ProbeLocalEscape(t.Context(), "device:"+devicePath)
+	if !open.Open || open.Blocked {
+		t.Fatalf("readable local path should classify as open local surface, got: %+v", open)
+	}
+
+	missing := playground.ProbeLocalEscape(t.Context(), "device:"+filepath.Join(t.TempDir(), "missing"))
+	if missing.Open || !missing.Blocked {
+		t.Fatalf("missing local path should classify as blocked/unavailable, got: %+v", missing)
+	}
+}
+
 // --------------------------------------------------------------------------
 // Dual suite definition tests
 // --------------------------------------------------------------------------
@@ -244,6 +290,24 @@ func TestDirectEgressTargets_CoversRequiredCategories(t *testing.T) {
 	}
 }
 
+func TestLocalEscapeTargets_UserNamespaceMountProbeLast(t *testing.T) {
+	t.Parallel()
+
+	targets := playground.LocalEscapeTargets()
+	if len(targets) == 0 {
+		t.Fatal("LocalEscapeTargets must define at least one target")
+	}
+	const mutatingProbe = "cap:userns-mount"
+	if got := targets[len(targets)-1]; got != mutatingProbe {
+		t.Fatalf("%s must remain last, got final target %q", mutatingProbe, got)
+	}
+	for i, target := range targets[:len(targets)-1] {
+		if target == mutatingProbe {
+			t.Fatalf("%s must not appear before final position, found at %d", mutatingProbe, i)
+		}
+	}
+}
+
 // --------------------------------------------------------------------------
 // RealContainmentHook unit tests (non-privileged behavior)
 // --------------------------------------------------------------------------
@@ -288,7 +352,7 @@ func TestRealContainmentHook_Teardown_Succeeds(t *testing.T) {
 // The honest privileged proof is built and verified end-to-end by the demo
 // binary (HostContainmentWitness, signed from a uid-966-dropped probe set) and
 // is exercised by:
-//   - TestHostContainmentWitness_Enforced       (DifferentialProven && DirectSuiteProven && AllAgentBlocked)
+//   - TestHostContainmentWitness_Enforced       (DifferentialProven && ProxyContractProven && DirectSuiteProven && LocalEscapeSuiteProven && AllAgentBlocked)
 //   - TestAllAgentBlocked_HappyAndEmpty          (liverun_internal_test.go)
 //   - TestVerify_Contained_NotEnforced_FailsClosed (containment_verify_test.go)
 //   - `pipelock-playground-demo run --contained` + `... verify` on a real host.

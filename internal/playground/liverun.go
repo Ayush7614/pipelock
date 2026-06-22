@@ -51,6 +51,17 @@ const (
 // canaryEnvVar is the env var the toy agent/webtool reads.
 const canaryEnvVar = "PLAYGROUND_CANARY_VALUE"
 
+// DefaultContainedProxyPort is the fixed loopback port a contained run should
+// bind the in-process proxy to. It mirrors the `pipelock contain install
+// --proxy-port` default (internal/cli/contain), so the stock owner-match rule
+// (allow agent uid -> 127.0.0.1:8888, drop everything else) lets the contained
+// agent reach exactly this proxy and nothing else on loopback. It is the
+// command layer's default for contained serves; the library never auto-applies
+// it (ProxyPort 0 is always ephemeral). Keep in sync with that contain default;
+// an operator who changes one must change both, and the HostContainmentWitness
+// fails closed if they diverge.
+const DefaultContainedProxyPort = 8888
+
 // LiveRunOpts configures a live playground run.
 type LiveRunOpts struct {
 	// Contained selects kernel-containment mode (requires sudo). When true, the
@@ -68,6 +79,16 @@ type LiveRunOpts struct {
 	// AgentUser is the OS user used for contained-mode toy-agent execution.
 	// Empty means pipelock-agent.
 	AgentUser string
+	// ProxyPort is the FIXED loopback port the in-process proxy binds. It must
+	// match the single port the kernel owner-match rule allows the contained agent
+	// uid to reach (`pipelock contain install --proxy-port`, default 8888) -- a
+	// random ephemeral port can never align with that single-port rule. 0 selects
+	// an ephemeral port (dev/test/uncontained only); the library does NOT
+	// substitute a default for 0, so a contained run passes the fixed port
+	// explicitly (the command layer defaults it to DefaultContainedProxyPort). The
+	// bound port is signed into the HostContainmentWitness and the contained agent
+	// must reach EXACTLY it, so a port that does not match the nft rule fails closed.
+	ProxyPort int
 	// OrchestratorKeyPath, when non-empty, loads the run's orchestrator
 	// (trust-root) signing key from disk instead of generating an ephemeral one.
 	OrchestratorKeyPath string
@@ -131,7 +152,23 @@ type LiveRun struct {
 	canaryID    string
 	canaryValue string
 
-	egressProbe func(targets []string, asAgent bool) ([]ProbeResult, error)
+	egressProbe      func(targets []string, asAgent bool) ([]ProbeResult, error)
+	localEscapeProbe func(asAgent bool) ([]ProbeResult, error)
+}
+
+// proxyBindAddrFor returns the loopback bind address for the in-process proxy.
+// A non-zero port binds that exact fixed port (production contained runs pass
+// the port matching their kernel owner-match rule). Port 0 binds an ephemeral
+// port (dev/test/uncontained, where no owner-match rule constrains the agent).
+// The library never substitutes a default for 0: a contained run that wants the
+// stock port passes it explicitly, and the HostContainmentWitness fails closed
+// if the bound port does not match the nft rule the agent is restricted to.
+// Out-of-range ports fail.
+func proxyBindAddrFor(port int) (string, error) {
+	if port < 0 || port > 65535 {
+		return "", fmt.Errorf("proxy port %d out of range (0-65535)", port)
+	}
+	return fmt.Sprintf("127.0.0.1:%d", port), nil
 }
 
 // StartLiveRun boots a complete live demo environment: lab targets, a real
@@ -188,7 +225,10 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 
 	// --- Canary ---
 	lr.canaryID = "playground-canary"
-	lr.canaryValue = liveCanaryValue(opts.RunNonce)
+	lr.canaryValue, err = liveCanaryValue()
+	if err != nil {
+		return nil, fmt.Errorf("generate canary: %w", err)
+	}
 
 	// --- Look up the scenario ---
 	if s, ok := lookupPlaygroundScenario(opts.ScenarioID); ok {
@@ -213,7 +253,17 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 	}
 
 	// --- Start safe target ---
-	lr.safeTarget = NewSafeTarget(lr.liveExfilURL())
+	// On a live MODEL run we do NOT advertise an exfil destination in the lab
+	// config: a real visitor supplies the malicious intent, and the demo should not
+	// hand the agent a target to send the secret to. The collector still runs as the
+	// independent "received nothing" witness (it is not on the allowlist, so any
+	// attempt to reach it is blocked at the door regardless). The deterministic
+	// (replay) path keeps the advertised diagnostics URL so its scripted beat works.
+	reportingURL := lr.liveExfilURL()
+	if opts.ModelBaseURL != "" {
+		reportingURL = ""
+	}
+	lr.safeTarget = NewSafeTarget(reportingURL)
 	lr.safeSrv = &http.Server{
 		Handler:           lr.safeTarget.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -241,16 +291,21 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 	// Trust the .test hosts so they pass the domain check
 	cfg.TrustedDomains = append(cfg.TrustedDomains, liveRunSafeHost, liveRunExfilHost)
 
-	// Model-agent runs enforce a strict host allowlist: a jailbroken model must
-	// not reach any host beyond the two lab targets and its own model API. The
-	// model host is the single real-egress destination (tool calls to the .test
-	// hosts stay loopback; a test override resolves the model host to a loopback
-	// fake, absent an override it resolves for real). Allowlist enforcement is
-	// gated to strict mode in the scanner, so model runs run strict; the
-	// deterministic IntentAgent path (no ModelBaseURL) keeps its balanced config
-	// unchanged. HTTPS model traffic may be an opaque CONNECT tunnel, so the
-	// subprocess tool runtime also refuses the model host as a tool target; the
-	// allowlist entry is for model API traffic only, not lab exfil actions.
+	// Model-agent runs enforce a strict host allowlist: a jailbroken model (which
+	// has a real shell, so tool-runtime host guards are bypassable by curl) must
+	// not be able to reach any host the operator did not approve. The ONLY approved
+	// egress destinations are the benign lab read target and the model's own API.
+	//
+	// CRITICAL: the allowlist is ASSIGNED, never appended to config.Defaults(). The
+	// defaults ship general third-party hosts (github/openai/telegram/slack/discord/
+	// npm) which ARE enforced as reachable in strict mode -- appending would
+	// silently approve real exfil channels (e.g. a visitor's own Telegram bot). The
+	// drop-box/collector host (liveRunExfilHost) is also intentionally NOT approved:
+	// an exfil attempt to it is blocked at the allowlist (destination control, before
+	// DNS), which encoding cannot bypass; the collector still runs as the independent
+	// "received nothing" witness. Allowlist enforcement is gated to strict mode, so
+	// model runs run strict; the deterministic IntentAgent path (no ModelBaseURL)
+	// keeps its balanced config (collector reachable, content-scan beat) unchanged.
 	if opts.ModelBaseURL != "" {
 		modelHost, mhErr := modelHostname(opts.ModelBaseURL)
 		if mhErr != nil {
@@ -262,8 +317,30 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 			cfg.DNS.HostOverrides[modelHost] = opts.ModelHostOverride
 		}
 		cfg.Mode = config.ModeStrict
-		cfg.APIAllowlist = append(cfg.APIAllowlist, liveRunSafeHost, liveRunExfilHost, modelHost)
+		cfg.APIAllowlist = []string{liveRunSafeHost, modelHost}
 		cfg.Suppress = append(cfg.Suppress, modelProviderAuthSuppressions(opts.ModelBaseURL)...)
+
+		// The benign read host is the one approved interactive destination, so lock
+		// it to reads: a request_policy rule blocks the standard write methods at
+		// the proxy (with a signed receipt), so a shell `curl -X POST` cannot use
+		// the approved host as a body-exfil channel. NOTE: this is a method
+		// deny-list, not a true default-deny "only GET" route (an exotic custom
+		// verb is not covered here -- the SafeTarget handler 405s those as
+		// defense-in-depth). Route-level default-deny allow-routes with receipts is
+		// tracked as a separate product item. The model host stays an opaque CONNECT
+		// (its path is not proxy-visible without MITM), so it is NOT route-locked;
+		// the model provider seeing the agent's own context is inherent to using a
+		// model, not exfil to an attacker.
+		cfg.RequestPolicy.Enabled = true
+		cfg.RequestPolicy.Rules = append(cfg.RequestPolicy.Rules, config.RequestPolicyRule{
+			Name:   "benign-read-host-get-only",
+			Action: config.ActionBlock,
+			Route: config.RequestPolicyRoute{
+				Hosts:   []string{liveRunSafeHost},
+				Methods: []string{"POST", "PUT", "PATCH", "DELETE"},
+			},
+			Reason: "benign lab read host is GET-only; a write method could carry a secret body",
+		})
 	}
 
 	cfg.ApplyDefaults()
@@ -312,10 +389,19 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 		return nil, fmt.Errorf("proxy: %w", err)
 	}
 
-	// Start proxy listening on loopback :0
-	lr.proxyLn, err = (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	// Start the in-process proxy on a FIXED loopback port so it aligns with the
+	// single-port kernel owner-match rule the contained agent is restricted to
+	// (C1). A contained run with no explicit port uses the stock containment
+	// default; an ephemeral port (0) is for dev/test/uncontained only, where no
+	// owner-match rule constrains the agent. The bound port is signed into the
+	// host-containment witness and the contained agent must reach exactly it.
+	proxyBindAddr, err := proxyBindAddrFor(opts.ProxyPort)
 	if err != nil {
-		return nil, fmt.Errorf("proxy listen: %w", err)
+		return nil, fmt.Errorf("resolve proxy bind address: %w", err)
+	}
+	lr.proxyLn, err = (&net.ListenConfig{}).Listen(ctx, "tcp", proxyBindAddr)
+	if err != nil {
+		return nil, fmt.Errorf("proxy listen on %s: %w", proxyBindAddr, err)
 	}
 	lr.proxySrv = &http.Server{
 		Handler:           lr.proxyObj.Handler(),
@@ -334,6 +420,7 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 		TargetHost:      liveRunExfilHost,
 		StartedAt:       time.Now().UTC(),
 		Contained:       opts.Contained,
+		AgentKind:       manifestAgentKind(opts.ModelBaseURL),
 	}
 	lr.manifest = SignLaunchManifest(lr.orchestratorPriv, lr.manifest)
 
@@ -438,6 +525,32 @@ func (lr *LiveRun) runEgressProbe(targets []string, asAgent bool) ([]ProbeResult
 	return decodeProbeResults(stdout.Bytes(), targets)
 }
 
+// runLocalEscapeProbe spawns the toy agent in local escape probe mode and
+// parses its JSON results. When asAgent is true, the probe subprocess is dropped
+// to the contained agent user, so it tests the same local permissions as the
+// live agent. These probes cover non-network surfaces that HTTP receipts cannot
+// mediate.
+func (lr *LiveRun) runLocalEscapeProbe(asAgent bool) ([]ProbeResult, error) {
+	targets := LocalEscapeTargets()
+	args := []string{"--probe-local-targets", strings.Join(targets, ",")}
+	cmd := exec.CommandContext(lr.ctx, lr.agentBin, args...)
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
+	if asAgent {
+		if err := configureContainedCommand(cmd, lr.opts.AgentUser); err != nil {
+			return nil, err
+		}
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("local escape probe exec: %w", err)
+	}
+
+	return decodeProbeResults(stdout.Bytes(), targets)
+}
+
 // decodeProbeResults parses the toy agent's probe-mode JSON output and verifies
 // it carries exactly the requested target set, in order. Extracted from
 // runEgressProbe so the parsing/validation logic is unit-testable without
@@ -463,12 +576,17 @@ func decodeProbeResults(stdout []byte, expectedTargets []string) ([]ProbeResult,
 // containment), probes it as the operator (must connect) and as the contained
 // agent (must be blocked) -- the differential that isolates the kernel
 // owner-match drop -- then probes the real direct-egress target suite from the
-// contained position (all must be blocked). The witness is signed by the
-// orchestrator key, the run's trust root.
+// contained position (all must be blocked), and probes local non-network escape
+// surfaces (platform sockets, device nodes, namespace/mount capabilities). The
+// witness is signed by the orchestrator key, the run's trust root.
 func (lr *LiveRun) buildHostContainmentWitness() (HostContainmentWitness, error) {
 	runProbe := lr.runEgressProbe
 	if lr.egressProbe != nil {
 		runProbe = lr.egressProbe
+	}
+	runLocalProbe := lr.runLocalEscapeProbe
+	if lr.localEscapeProbe != nil {
+		runLocalProbe = lr.localEscapeProbe
 	}
 
 	ctrlLn, err := (&net.ListenConfig{}).Listen(lr.ctx, "tcp", "127.0.0.1:0")
@@ -493,12 +611,26 @@ func (lr *LiveRun) buildHostContainmentWitness() (HostContainmentWitness, error)
 		return HostContainmentWitness{}, fmt.Errorf("operator control probe: %w", err)
 	}
 
-	// Contained-agent probes: control target first, then the real suite.
+	if lr.proxyLn == nil {
+		return HostContainmentWitness{}, fmt.Errorf("proxy listener not initialized")
+	}
+	proxyTarget := lr.proxyLn.Addr().String()
+
+	// Contained-agent probes, in order: the proxy port (its ONE permitted egress,
+	// must be reachable -> Open), the control target (a DIFFERENT loopback port,
+	// must be blocked -> the non-proxy-loopback negative), then the real
+	// direct-egress suite (all must be blocked). Probing the proxy as the agent is
+	// what catches an operator port mismatch: a proxy bound to a port the nft rule
+	// does not allow comes back Blocked and the witness fails closed.
 	realTargets := DirectEgressTargets()
-	agentTargets := append([]string{ctrlTarget}, realTargets...)
+	agentTargets := append([]string{proxyTarget, ctrlTarget}, realTargets...)
 	agProbes, err := runProbe(agentTargets, true)
 	if err != nil {
 		return HostContainmentWitness{}, fmt.Errorf("contained agent probe: %w", err)
+	}
+	localProbes, err := runLocalProbe(true)
+	if err != nil {
+		return HostContainmentWitness{}, fmt.Errorf("contained agent local escape probe: %w", err)
 	}
 
 	w := HostContainmentWitness{
@@ -508,8 +640,11 @@ func (lr *LiveRun) buildHostContainmentWitness() (HostContainmentWitness, error)
 		AgentUID:             containedAgentUID(lr.opts.AgentUser),
 		ControlTarget:        ctrlTarget,
 		ControlOperatorProbe: opProbes[0],
-		ControlAgentProbe:    agProbes[0],
-		AgentProbes:          agProbes[1:],
+		ControlAgentProbe:    agProbes[1],
+		ProxyTarget:          proxyTarget,
+		ProxyAgentProbe:      agProbes[0],
+		AgentProbes:          agProbes[2:],
+		LocalAgentProbes:     localProbes,
 		ProbedAt:             time.Now().UTC(),
 	}
 	return SignHostContainmentWitness(lr.orchestratorPriv, w), nil
@@ -702,6 +837,16 @@ func (lr *LiveRun) Close() {
 	if lr.evidenceDir != "" {
 		_ = os.RemoveAll(lr.evidenceDir)
 	}
+}
+
+// manifestAgentKind records which agent drove the run in the signed manifest.
+// A non-empty model base URL means the real model-backed subprocess ran; an
+// empty one means the scripted deterministic IntentAgent.
+func manifestAgentKind(modelBaseURL string) string {
+	if modelBaseURL != "" {
+		return AgentKindModel
+	}
+	return AgentKindDeterministic
 }
 
 // modelHostname extracts the hostname (no port) from a model API base URL, for

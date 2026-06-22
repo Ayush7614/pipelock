@@ -10,13 +10,17 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -177,6 +181,82 @@ func main() {
 	}
 }
 
+func TestRunLocalEscapeProbeParsesSubprocessOutput(t *testing.T) {
+	t.Parallel()
+
+	targetsLiteral, err := json.Marshal(LocalEscapeTargets())
+	if err != nil {
+		t.Fatalf("marshal local targets: %v", err)
+	}
+	agent := buildLLMHelper(t, `package main
+import (
+	"encoding/json"
+	"fmt"
+)
+func main() {
+	var out []map[string]any
+	var decoded []string
+	if err := json.Unmarshal([]byte(`+strconv.Quote(string(targetsLiteral))+`), &decoded); err != nil {
+		panic(err)
+	}
+	for _, target := range decoded {
+		out = append(out, map[string]any{"target": target, "open": false, "blocked": true, "detail": "blocked"})
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(data))
+}
+`)
+
+	lr := &LiveRun{
+		ctx:      t.Context(),
+		agentBin: agent,
+	}
+	got, err := lr.runLocalEscapeProbe(false)
+	if err != nil {
+		t.Fatalf("runLocalEscapeProbe: %v", err)
+	}
+	if len(got) != len(LocalEscapeTargets()) {
+		t.Fatalf("probe results = %d, want %d", len(got), len(LocalEscapeTargets()))
+	}
+	for i, result := range got {
+		if result.Target != LocalEscapeTargets()[i] || !result.Blocked || result.Open {
+			t.Fatalf("result[%d] = %+v", i, result)
+		}
+	}
+}
+
+func TestRunLocalEscapeProbeRequiresRootWhenContained(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("non-root contained error branch requires non-root test process")
+	}
+
+	lr := &LiveRun{
+		ctx:      t.Context(),
+		agentBin: "/bin/echo",
+		opts:     LiveRunOpts{},
+	}
+	if _, err := lr.runLocalEscapeProbe(true); err == nil || !strings.Contains(err.Error(), rootRequirement) {
+		t.Fatalf("contained local escape probe non-root error = %v, want root requirement", err)
+	}
+}
+
+func TestRunLocalEscapeProbeReturnsExecError(t *testing.T) {
+	t.Parallel()
+
+	lr := &LiveRun{
+		ctx:      t.Context(),
+		agentBin: filepath.Join(t.TempDir(), "missing-agent"),
+	}
+	if _, err := lr.runLocalEscapeProbe(false); err == nil || !strings.Contains(err.Error(), "local escape probe exec") {
+		t.Fatalf("local escape probe exec error = %v, want exec context", err)
+	}
+}
+
 func TestRunStepsReturnsNonExitExecErrors(t *testing.T) {
 	t.Parallel()
 
@@ -229,6 +309,13 @@ func TestBuildHostContainmentWitnessSignsProbeEvidence(t *testing.T) {
 		},
 	}
 
+	proxyLn, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listener: %v", err)
+	}
+	defer func() { _ = proxyLn.Close() }()
+	lr.proxyLn = proxyLn
+
 	var controlTarget string
 	lr.egressProbe = func(targets []string, asAgent bool) ([]ProbeResult, error) {
 		if len(targets) == 0 {
@@ -241,11 +328,27 @@ func TestBuildHostContainmentWitnessSignsProbeEvidence(t *testing.T) {
 			controlTarget = targets[0]
 			return []ProbeResult{{Target: targets[0], Open: true, Blocked: false, Detail: "connected"}}, nil
 		}
-		if targets[0] != controlTarget {
-			return nil, fmt.Errorf("agent control target = %q, want %q", targets[0], controlTarget)
+		// Agent targets are [proxy, control, direct...]: the proxy is the one
+		// permitted egress (Open), everything else is blocked.
+		if len(targets) < 2 {
+			return nil, fmt.Errorf("agent target count = %d", len(targets))
+		}
+		if targets[1] != controlTarget {
+			return nil, fmt.Errorf("agent control target = %q, want %q", targets[1], controlTarget)
 		}
 		results := make([]ProbeResult, 0, len(targets))
-		for _, target := range targets {
+		results = append(results, ProbeResult{Target: targets[0], Open: true, Blocked: false, Detail: "connected"})
+		for _, target := range targets[1:] {
+			results = append(results, ProbeResult{Target: target, Open: false, Blocked: true, Detail: "blocked"})
+		}
+		return results, nil
+	}
+	lr.localEscapeProbe = func(asAgent bool) ([]ProbeResult, error) {
+		if !asAgent {
+			return nil, errors.New("local escape probe should run as agent")
+		}
+		results := make([]ProbeResult, 0, len(LocalEscapeTargets()))
+		for _, target := range LocalEscapeTargets() {
 			results = append(results, ProbeResult{Target: target, Open: false, Blocked: true, Detail: "blocked"})
 		}
 		return results, nil
@@ -294,11 +397,144 @@ func TestBuildHostContainmentWitnessFailsClosedOnProbeError(t *testing.T) {
 	}
 }
 
+func TestLLMAgentConfig_EffectiveMaxSteps(t *testing.T) {
+	t.Parallel()
+	if got := (&LLMAgentConfig{MaxSteps: 4}).EffectiveMaxSteps(); got != 4 {
+		t.Errorf("configured MaxSteps = %d, want 4", got)
+	}
+	def := (&LLMAgentConfig{}).EffectiveMaxSteps()
+	if def <= 0 {
+		t.Errorf("unset MaxSteps default = %d, want a positive worst-case", def)
+	}
+	var nilCfg *LLMAgentConfig
+	if nilCfg.EffectiveMaxSteps() != def {
+		t.Errorf("nil config = %d, want the same default as an unset MaxSteps (%d)", nilCfg.EffectiveMaxSteps(), def)
+	}
+}
+
+func TestBuildHostContainmentWitnessFailsClosedOnNilProxyListener(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	lr := &LiveRun{
+		ctx:              t.Context(),
+		orchestratorPriv: priv,
+		opts:             LiveRunOpts{RunNonce: "N1"},
+		// proxyLn deliberately nil: a contained witness build cannot record the
+		// agent's permitted-egress port and must fail closed, never sign a witness
+		// that omits the proxy contract.
+	}
+	lr.egressProbe = func(targets []string, asAgent bool) ([]ProbeResult, error) {
+		// Operator control probe succeeds; the nil proxy listener must then fail.
+		return []ProbeResult{{Target: targets[0], Open: true, Blocked: false, Detail: "connected"}}, nil
+	}
+
+	_, err = lr.buildHostContainmentWitness()
+	if err == nil || !strings.Contains(err.Error(), "proxy listener not initialized") {
+		t.Fatalf("buildHostContainmentWitness error = %v, want proxy listener not initialized", err)
+	}
+}
+
 func TestContainmentAvailableFalseWhenPipelockMissing(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 
 	if ContainmentAvailable() {
 		t.Fatal("empty PATH must report containment unavailable")
+	}
+}
+
+func TestContainmentEnforcedUsesEnforcementOnlyVerify(t *testing.T) {
+	// Not parallel: this test mutates PATH and PIPELOCK_ARGS_LOG, and concurrent
+	// tests that spawn pipelock would observe the fake executable/env.
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "args.log")
+	pipelockPath := filepath.Join(dir, "pipelock")
+	body := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$PIPELOCK_ARGS_LOG\"\n"
+	if err := os.WriteFile(pipelockPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write fake pipelock: %v", err)
+	}
+	if err := syscall.Chmod(pipelockPath, 0o700); err != nil {
+		t.Fatalf("write fake pipelock: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("PIPELOCK_ARGS_LOG", argsLog)
+
+	if !ContainmentEnforced() {
+		t.Fatal("fake pipelock should make containment enforcement available")
+	}
+	got, err := fs.ReadFile(os.DirFS(dir), "args.log")
+	if err != nil {
+		t.Fatalf("read args log: %v", err)
+	}
+	if string(got) != "contain verify --enforcement-only\n" {
+		t.Fatalf("fake pipelock args = %q", got)
+	}
+}
+
+func TestVerifyModelLiveContained(t *testing.T) {
+	t.Parallel()
+	oneReceipt := []receipt.Receipt{{}}
+	cases := []struct {
+		name     string
+		receipts []receipt.Receipt
+		witness  Witness
+		wantErr  bool
+	}{
+		{"clean: observed 0 with a signed decision", oneReceipt, Witness{ObservedCount: 0, TotalCount: 0}, false},
+		{"leak observed fails closed", oneReceipt, Witness{ObservedCount: 1, TotalCount: 1}, true},
+		{"any total reaching collector fails closed", oneReceipt, Witness{ObservedCount: 0, TotalCount: 1}, true},
+		{"empty run has nothing to attest", nil, Witness{ObservedCount: 0, TotalCount: 0}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyModelLiveContained(tc.receipts, tc.witness)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected nil, got %v", err)
+			}
+		})
+	}
+}
+
+func TestHostContainmentEnforcedReasonOldWitnessFormat(t *testing.T) {
+	t.Parallel()
+	reason := hostContainmentEnforcedReason(HostContainmentWitness{})
+	if !strings.Contains(reason, "older format") {
+		t.Fatalf("reason = %q, want older-format diagnostic", reason)
+	}
+}
+
+func TestManifestAgentKind(t *testing.T) {
+	t.Parallel()
+	if got := manifestAgentKind("https://api.vendor.example"); got != AgentKindModel {
+		t.Errorf("model url -> %q, want %q", got, AgentKindModel)
+	}
+	if got := manifestAgentKind(""); got != AgentKindDeterministic {
+		t.Errorf("empty url -> %q, want %q", got, AgentKindDeterministic)
+	}
+}
+
+func TestLaunchManifest_AgentKindIsSigned(t *testing.T) {
+	t.Parallel()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := SignLaunchManifest(priv, LaunchManifest{RunNonce: "n", AgentKind: AgentKindModel})
+	if !VerifyLaunchManifest(pub, signed) {
+		t.Fatal("freshly signed model manifest must verify")
+	}
+	// Flipping AgentKind must break the signature: an attacker must not be able to
+	// relabel a run to route it to a different verify predicate.
+	tampered := signed
+	tampered.AgentKind = AgentKindDeterministic
+	if VerifyLaunchManifest(pub, tampered) {
+		t.Fatal("tampering AgentKind must invalidate the manifest signature")
 	}
 }
 

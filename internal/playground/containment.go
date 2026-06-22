@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -77,6 +78,97 @@ func ProbeDirectEgress(ctx context.Context, target string) ProbeResult {
 	}
 }
 
+// ProbeLocalEscape attempts one local, non-network escape surface from the
+// contained agent's uid: a Unix control socket, a privileged device node, or a
+// capability-gated operation. These paths are not mediated by the HTTP proxy, so
+// they must be proven separately from direct TCP egress. For this local suite,
+// Blocked means "the escape surface is denied or absent"; Open means the agent
+// reached a surface that needs investigation before the playground can claim
+// containment.
+func ProbeLocalEscape(ctx context.Context, target string) ProbeResult {
+	kind, value, ok := strings.Cut(target, ":")
+	if !ok || value == "" {
+		return ProbeResult{
+			Target:  target,
+			Open:    false,
+			Blocked: false,
+			Detail:  "malformed local escape target",
+		}
+	}
+
+	switch kind {
+	case "unix":
+		return probeUnixSocket(ctx, target, value)
+	case "device":
+		return probeDeviceNode(target, value)
+	case "cap":
+		return probeLocalCapability(target, value)
+	default:
+		return ProbeResult{
+			Target:  target,
+			Open:    false,
+			Blocked: false,
+			Detail:  "unknown local escape target kind",
+		}
+	}
+}
+
+func probeUnixSocket(ctx context.Context, target, path string) ProbeResult {
+	dialCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	conn, err := (&net.Dialer{Timeout: probeTimeout}).DialContext(dialCtx, "unix", path)
+	if err != nil {
+		blocked := !isConnectionRefusedError(err)
+		return ProbeResult{
+			Target:  target,
+			Open:    false,
+			Blocked: blocked,
+			Detail:  localProbeErrorDetail(err, blocked),
+		}
+	}
+	_ = conn.Close()
+	return ProbeResult{
+		Target:  target,
+		Open:    true,
+		Blocked: false,
+		Detail:  "connected to local unix socket",
+	}
+}
+
+func localProbeErrorDetail(err error, blocked bool) string {
+	if isConnectionRefusedError(err) {
+		return fmt.Sprintf("reachable: connection refused: %v", err)
+	}
+	if blocked {
+		return fmt.Sprintf("blocked/unavailable: %v", err)
+	}
+	return fmt.Sprintf("not blocked: %v", err)
+}
+
+func isConnectionRefusedError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "connection refused")
+}
+
+func probeDeviceNode(target, path string) ProbeResult {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return ProbeResult{
+			Target:  target,
+			Open:    false,
+			Blocked: true,
+			Detail:  fmt.Sprintf("blocked/unavailable: %v", err),
+		}
+	}
+	_ = f.Close()
+	return ProbeResult{
+		Target:  target,
+		Open:    true,
+		Blocked: false,
+		Detail:  "opened local device node",
+	}
+}
+
 func isEgressBlockError(err error) bool {
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
@@ -95,7 +187,7 @@ func isEgressBlockError(err error) bool {
 }
 
 func probeErrorDetail(err error, blocked bool) string {
-	if strings.Contains(strings.ToLower(err.Error()), "connection refused") {
+	if isConnectionRefusedError(err) {
 		return fmt.Sprintf("reachable: connection refused: %v", err)
 	}
 	if blocked {
@@ -131,6 +223,27 @@ func DirectEgressTargets() []string {
 		"8.8.8.8:53",         // public DNS (Google)
 		"1.1.1.1:853",        // public DNS over TLS (Cloudflare)
 		"93.184.216.34:443",  // public HTTPS (example.com)
+	}
+}
+
+// LocalEscapeTargets returns local, non-network surfaces the contained agent
+// must not be able to use. This suite complements DirectEgressTargets: direct
+// egress proves destination control, while these probes prove the same uid
+// cannot bypass the mediator through platform control sockets, host/device
+// nodes, or capability-gated local privilege operations.
+func LocalEscapeTargets() []string {
+	return []string{
+		"unix:/.fly/api",            // Fly.io local control socket
+		"unix:/var/run/docker.sock", // classic container escape control socket
+		"device:/dev/vda",           // common Fly/KVM block device
+		"device:/dev/vdb",           // common Fly/KVM data block device
+		"device:/dev/root",          // root block-device alias
+		"device:/dev/nvme0n1",       // common NVMe block device
+		"device:/dev/sda",           // common virt/SCSI block device
+		"device:/dev/fuse",          // unmediated FUSE mount surface
+		"cap:mknod",                 // create new device nodes
+		"cap:mount",                 // mount a filesystem
+		"cap:userns-mount",          // create user namespace root and mount
 	}
 }
 
@@ -302,6 +415,18 @@ func (h *RealContainmentHook) Teardown(runDir string) error {
 // ContainmentAvailable checks whether `pipelock contain verify` can be run
 // successfully. Used by tests to gate host-only containment tests.
 func ContainmentAvailable() bool {
+	return runContainVerify("verify")
+}
+
+// ContainmentEnforced checks whether the containment boundary is active without
+// requiring the stock pipelock service or loopback listener to be running. The
+// live playground owns the proxy lifecycle for each session, so its start gate
+// needs the kernel/user/wrapper enforcement probes, not proxy liveness.
+func ContainmentEnforced() bool {
+	return runContainVerify("verify", "--enforcement-only")
+}
+
+func runContainVerify(args ...string) bool {
 	// Quick check: is pipelock in PATH?
 	_, err := exec.LookPath("pipelock")
 	if err != nil {
@@ -311,7 +436,7 @@ func ContainmentAvailable() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "pipelock", "contain", "verify")
+	cmd := exec.CommandContext(ctx, "pipelock", append([]string{"contain"}, args...)...)
 	if err := cmd.Run(); err != nil {
 		return false
 	}

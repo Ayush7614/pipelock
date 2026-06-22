@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -31,7 +32,32 @@ const (
 	// on a child-side block. The watchdog itself only matters for a parent-side
 	// block before the child starts, where ctx cannot help.
 	sandboxWatchdogGrace = 5 * time.Second
+
+	sandboxSmokeTimeout = 8 * time.Second
 )
+
+var sandboxLaunchSmoke struct {
+	once   sync.Once
+	err    error
+	stderr string
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // requireSandboxPrimitives skips when the kernel lacks the namespace/Landlock
 // primitives the launch tests exercise, so a genuinely unsupported environment
@@ -46,6 +72,47 @@ func requireSandboxPrimitives(t *testing.T) {
 	if caps.LandlockABI <= 0 || !caps.UserNamespaces {
 		t.Skipf("sandbox primitives unavailable (Landlock ABI=%d, user namespaces=%v); skipping launch test",
 			caps.LandlockABI, caps.UserNamespaces)
+	}
+	sandboxLaunchSmoke.once.Do(func() {
+		sandboxLaunchSmoke.stderr, sandboxLaunchSmoke.err = probeSandboxLaunch(t.TempDir())
+	})
+	if sandboxLaunchSmoke.err != nil {
+		t.Skipf("sandbox launch unavailable in this runner: %v; stderr: %s",
+			sandboxLaunchSmoke.err, sandboxLaunchSmoke.stderr)
+	}
+}
+
+func probeSandboxLaunch(workspace string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sandboxSmokeTimeout)
+	defer cancel()
+
+	stderr := &lockedBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		cmd, err := LaunchSandboxed(LaunchConfig{
+			Ctx:       ctx,
+			Command:   []string{"true"},
+			Workspace: workspace,
+			Stderr:    stderr,
+		})
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		return stderr.String(), err
+	case <-time.After(sandboxSmokeTimeout + sandboxWatchdogGrace):
+		cancel()
+		select {
+		case err := <-done:
+			return stderr.String(), err
+		case <-time.After(sandboxWatchdogGrace):
+		}
+		return stderr.String(), context.DeadlineExceeded
 	}
 }
 

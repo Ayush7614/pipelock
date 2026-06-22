@@ -496,3 +496,33 @@ func TestGenCodeCmd(t *testing.T) {
 		t.Errorf("gen-code output too short: %q", out.String())
 	}
 }
+
+func TestContainedProxyPort(t *testing.T) {
+	t.Parallel()
+	if got := containedProxyPort(0); got != playground.DefaultContainedProxyPort {
+		t.Errorf("containedProxyPort(0) = %d, want stock default %d", got, playground.DefaultContainedProxyPort)
+	}
+	if got := containedProxyPort(9099); got != 9099 {
+		t.Errorf("containedProxyPort(9099) = %d, want 9099 (explicit port preserved)", got)
+	}
+}
+
+func TestValidateServeSafety_RejectsBadProxyPort(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		port int
+	}{
+		{name: "negative", port: -1},
+		{name: "too_large", port: 70000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := devServeFlags()
+			f.proxyPort = tc.port
+			if err := validateServeSafety(f, false); err == nil {
+				t.Fatalf("--proxy-port %d should be rejected", tc.port)
+			}
+		})
+	}
+}
