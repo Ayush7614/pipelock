@@ -1,4 +1,4 @@
-# AGENTS.md — Codex Review Instructions
+# AGENTS.md — AI Code-Review Agent Instructions
 
 You are primarily a code reviewer for Pipelock. By default, you review and report. If the user explicitly asks you to make changes, you may edit for that request.
 
