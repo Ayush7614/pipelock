@@ -7,11 +7,15 @@ a real model-backed agent and watch Pipelock mediate the agent's actual requests
 in real time, streaming a signed decision for every action. Unlike the recorded
 replay demo, every visitor message drives a real model API call, so it costs money
 and is an attack surface. This page covers the controls an operator uses to run it
-safely.
+safely. For the public front door that leases per-visitor VMs, see
+[Playground broker operations](playground-broker-operations.md).
 
 > The agent is provider-neutral: any OpenAI-compatible `/chat/completions` endpoint
-> (base URL, model name, bearer key). The agent only ever holds a synthetic,
-> per-run canary, never real credentials.
+> (base URL, model name, bearer key). The planted credential used for the exfil
+> challenge is a synthetic, per-run canary. The model provider key is a real
+> credential; it is supplied as a file/FD for model calls, kept out of argv, added
+> to the browser-output redaction set, and should be scoped to this disposable
+> demo deployment.
 
 ## Running it
 

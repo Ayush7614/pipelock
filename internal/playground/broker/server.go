@@ -55,6 +55,9 @@ type ServerConfig struct {
 	Leases *LeaseManager
 	// Gate validates public invite codes before a VM is leased. Required.
 	Gate *livechat.Gate
+	// HumanVerifier validates a browser proof before invite-code redemption and
+	// VM lease. Nil disables this gate for private/Access-gated deployments.
+	HumanVerifier HumanVerifier
 	// IPRate and CodeRate apply to session creation and proxied session routes.
 	IPRate   livechat.RateConfig
 	CodeRate livechat.RateConfig
@@ -107,6 +110,7 @@ type Server struct {
 	mu       sync.Mutex
 	tokens   map[string]*tokenLease
 	bySess   map[string]string
+	starts   []time.Time
 	closed   bool
 	reapDone chan struct{}
 }
@@ -119,7 +123,8 @@ type tokenLease struct {
 }
 
 type sessionRequest struct {
-	Code string `json:"code"`
+	Code           string `json:"code"`
+	TurnstileToken string `json:"turnstile_token,omitempty"`
 }
 
 type vmSessionResponse struct {
@@ -249,12 +254,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeBrokerJSON(w, http.StatusOK, map[string]any{
-		"ok":               s.cfg.Gate.Open() && s.global.Open() && !s.killed.Load(),
-		"in_use":           s.cfg.Leases.ActiveLeases(),
-		"capacity":         s.cfg.Leases.cfg.Concurrency.Cap(),
-		"contained":        true,
-		"budget_remaining": s.global.Remaining(),
-		"killed":           s.killed.Load(),
+		"ok":                         s.cfg.Gate.Open() && s.global.Open() && !s.killed.Load(),
+		"in_use":                     s.cfg.Leases.ActiveLeases(),
+		"capacity":                   s.cfg.Leases.cfg.Concurrency.Cap(),
+		"budget_remaining":           s.global.Remaining(),
+		"killed":                     s.killed.Load(),
+		"session_starts_last_minute": s.sessionStartsSince(time.Now(), time.Minute),
 	})
 }
 
@@ -286,6 +291,14 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if body.Code == "" {
 		writeBrokerErr(w, http.StatusForbidden, "invite code rejected")
 		return
+	}
+	if s.cfg.HumanVerifier != nil {
+		// Turnstile remoteip must be the exact client address, not the /64
+		// abuse bucket, so token-to-IP binding stays correct.
+		if err := s.cfg.HumanVerifier.Verify(r.Context(), body.TurnstileToken, s.clientIPExact(r)); err != nil {
+			writeBrokerErr(w, http.StatusForbidden, "human verification required")
+			return
+		}
 	}
 	codeLimiterKey := "code:" + codeKey(body.Code)
 	if !s.codeRate.Allow(codeLimiterKey) {
@@ -381,6 +394,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Gate.Commit(claims)
+	s.recordSessionStart(time.Now())
 	writeBrokerJSON(w, http.StatusOK, resp)
 }
 
@@ -424,8 +438,15 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		writeBrokerErr(w, http.StatusServiceUnavailable, "the demo is paused")
 		return
 	}
-	body, token, err := readMessageToken(r)
+	body, token, err := readMessageToken(w, r)
 	if err != nil {
+		// http.MaxBytesReader sets the response to 413 automatically for
+		// oversize bodies. For other parse errors, respond 400.
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeBrokerErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		writeBrokerErr(w, http.StatusBadRequest, "bad request")
 		return
 	}
@@ -612,6 +633,14 @@ func (s *Server) registerToken(token string, binding *tokenLease) bool {
 	if s.closed {
 		return false
 	}
+	// Re-check the kill switch under the lock. Kill() stores killed=true before
+	// releaseAll() snapshots the token map, so a session-create that was in flight
+	// during a pause (blocked in VM boot, past the early killed check) must refuse
+	// to register here, or its VM survives the pause: a fail-open emergency stop.
+	// Mirrors the inner livechat server's pre-insert kill recheck.
+	if s.killed.Load() {
+		return false
+	}
 	if _, exists := s.tokens[token]; exists {
 		return false
 	}
@@ -655,6 +684,35 @@ func (s *Server) releaseAll() {
 	}
 }
 
+func (s *Server) recordSessionStart(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneStartsLocked(now, time.Minute)
+	s.starts = append(s.starts, now)
+}
+
+func (s *Server) sessionStartsSince(now time.Time, window time.Duration) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneStartsLocked(now, window)
+	return len(s.starts)
+}
+
+func (s *Server) pruneStartsLocked(now time.Time, window time.Duration) {
+	cutoff := now.Add(-window)
+	keep := 0
+	for _, started := range s.starts {
+		if started.After(cutoff) {
+			s.starts[keep] = started
+			keep++
+		}
+	}
+	for i := keep; i < len(s.starts); i++ {
+		s.starts[i] = time.Time{}
+	}
+	s.starts = s.starts[:keep]
+}
+
 func (s *Server) reapLoop() {
 	ticker := time.NewTicker(s.cfg.ReapInterval)
 	defer ticker.Stop()
@@ -692,19 +750,11 @@ func (s *Server) setCORS(w http.ResponseWriter) {
 }
 
 func (s *Server) clientIP(r *http.Request) string {
-	if s.cfg.TrustForwardedFor {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i >= 0 {
-				return strings.TrimSpace(xff[:i])
-			}
-			return strings.TrimSpace(xff)
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return livechat.ClientIP(r, s.cfg.TrustForwardedFor)
+}
+
+func (s *Server) clientIPExact(r *http.Request) string {
+	return livechat.ClientIPExact(r, s.cfg.TrustForwardedFor)
 }
 
 type statusRecorder struct {
@@ -734,8 +784,9 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
-func readMessageToken(r *http.Request) ([]byte, string, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBrokerBodyBytes))
+func readMessageToken(w http.ResponseWriter, r *http.Request) ([]byte, string, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBrokerBodyBytes)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, "", fmt.Errorf("broker: read message request: %w", err)
 	}
