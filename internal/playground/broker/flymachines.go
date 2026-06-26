@@ -21,12 +21,25 @@ import (
 // in tests (httptest server).
 const defaultFlyBaseURL = "https://api.machines.dev/v1"
 
+// playgroundRoleKey and playgroundRoleVal are the metadata tag set on every
+// per-visitor VM so the orphan reaper can distinguish them from the broker's own
+// machine and unrelated infra. ListManagedMachines filters on this tag.
+const (
+	playgroundRoleKey = "pipelock_role"
+	playgroundRoleVal = "playground-vm"
+)
+
 // defaultWaitTimeout bounds a single WaitReady call's server-side wait.
 const defaultWaitTimeout = 60 * time.Second
 
 // flyMaxBodyBytes caps how much of a Fly API response body is read, so a
 // misbehaving/huge response cannot exhaust broker memory.
 const flyMaxBodyBytes = 1 << 20 // 1 MiB
+
+// flyRequestIDHeader is the Fly API response header that carries a per-request
+// trace identifier. Including it in error messages lets operators debug failures
+// with Fly support without exposing potentially secret response-body content.
+const flyRequestIDHeader = "Fly-Request-Id"
 
 // FlyMachines is the Fly Machines API adapter for MachineProvider. It leases one
 // ephemeral, internal-only Firecracker microVM per visitor: the machine has no
@@ -68,6 +81,7 @@ type flyMachineConfig struct {
 	Guest       flyGuest          `json:"guest"`
 	AutoDestroy bool              `json:"auto_destroy"`
 	Restart     flyRestart        `json:"restart"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 type flyCreateRequest struct {
@@ -132,6 +146,9 @@ func (f *FlyMachines) CreateMachine(ctx context.Context, spec MachineSpec) (*Mac
 			// never restart it. The broker also force-destroys explicitly.
 			AutoDestroy: true,
 			Restart:     flyRestart{Policy: "no"},
+			// Tag the VM so the orphan reaper can distinguish per-visitor VMs
+			// from the broker's own machine and unrelated infra.
+			Metadata: map[string]string{playgroundRoleKey: playgroundRoleVal},
 		},
 		Region: spec.Region,
 	}
@@ -193,6 +210,82 @@ func (f *FlyMachines) DestroyMachine(ctx context.Context, id string) error {
 	return nil
 }
 
+// flyListMachine mirrors the Fly Machines API list-machines response fields that
+// the broker reads. Only the fields needed for orphan reaping are modeled.
+type flyListMachine struct {
+	ID        string `json:"id"`
+	State     string `json:"state"`
+	CreatedAt string `json:"created_at"`
+	Config    struct {
+		Metadata map[string]string `json:"metadata"`
+	} `json:"config"`
+}
+
+type flyListMachinesPage struct {
+	Machines         []flyListMachine `json:"machines"`
+	NextCursor       string           `json:"next_cursor"`
+	ResponseMetadata struct {
+		NextCursor string `json:"next_cursor"`
+	} `json:"response_metadata"`
+}
+
+// ListManagedMachines returns only per-visitor VMs (those tagged with
+// pipelock_role == playground-vm). The broker's own machine and unrelated infra
+// are excluded. A machine whose created_at is missing or unparseable gets a zero
+// CreatedAt (the reaper treats zero as "unknown age, spare it").
+func (f *FlyMachines) ListManagedMachines(ctx context.Context) ([]Machine, error) {
+	if err := f.validate(); err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/apps/%s/machines", url.PathEscape(f.AppName))
+	query := url.Values{"summary": []string{"true"}, "limit": []string{"200"}}
+	var raw []flyListMachine
+	for {
+		respBody, err := f.do(ctx, http.MethodGet, path, query, nil)
+		if err != nil {
+			return nil, err
+		}
+		page, next, err := parseFlyListMachines(respBody)
+		if err != nil {
+			return nil, err
+		}
+		raw = append(raw, page...)
+		if next == "" {
+			break
+		}
+		query.Set("cursor", next)
+	}
+	var managed []Machine
+	for _, m := range raw {
+		if m.Config.Metadata[playgroundRoleKey] != playgroundRoleVal {
+			continue
+		}
+		created, _ := time.Parse(time.RFC3339, m.CreatedAt)
+		managed = append(managed, Machine{
+			ID:        m.ID,
+			State:     m.State,
+			CreatedAt: created,
+		})
+	}
+	return managed, nil
+}
+
+func parseFlyListMachines(respBody []byte) ([]flyListMachine, string, error) {
+	var raw []flyListMachine
+	if err := json.Unmarshal(respBody, &raw); err == nil {
+		return raw, "", nil
+	}
+	var page flyListMachinesPage
+	if err := json.Unmarshal(respBody, &page); err != nil {
+		return nil, "", fmt.Errorf("fly: parse list machines response: %w", err)
+	}
+	next := strings.TrimSpace(page.NextCursor)
+	if next == "" {
+		next = strings.TrimSpace(page.ResponseMetadata.NextCursor)
+	}
+	return page.Machines, next, nil
+}
+
 func (f *FlyMachines) validate() error {
 	if strings.TrimSpace(f.AppName) == "" {
 		return errors.New("fly: AppName is empty")
@@ -204,16 +297,22 @@ func (f *FlyMachines) validate() error {
 }
 
 // apiError carries a non-2xx Fly API response for typed handling (e.g. 404 on
-// destroy). The body is truncated and must never be assumed secret-free in logs.
+// destroy is status-based). The response body is deliberately excluded: Fly
+// error responses can echo back parts of the submitted request, which may
+// contain VM environment secrets (model API keys, invite codes, etc.). Only
+// non-sensitive diagnostics (status, method, path, request ID) are surfaced.
 type apiError struct {
-	status int
-	method string
-	path   string
-	body   string
+	status    int
+	method    string
+	path      string
+	requestID string // Fly-Request-Id header for operator debugging
 }
 
 func (e *apiError) Error() string {
-	return fmt.Sprintf("fly: %s %s: HTTP %d: %s", e.method, e.path, e.status, e.body)
+	if e.requestID != "" {
+		return fmt.Sprintf("fly: %s %s: HTTP %d (request-id: %s)", e.method, e.path, e.status, e.requestID)
+	}
+	return fmt.Sprintf("fly: %s %s: HTTP %d", e.method, e.path, e.status)
 }
 
 // do performs a Fly API request and returns the response body for 2xx, or an
@@ -254,7 +353,12 @@ func (f *FlyMachines) do(ctx context.Context, method, path string, query url.Val
 		return nil, fmt.Errorf("fly: read %s %s response: %w", method, path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &apiError{status: resp.StatusCode, method: method, path: path, body: strings.TrimSpace(string(respBody))}
+		return nil, &apiError{
+			status:    resp.StatusCode,
+			method:    method,
+			path:      path,
+			requestID: resp.Header.Get(flyRequestIDHeader),
+		}
 	}
 	return respBody, nil
 }

@@ -42,6 +42,10 @@ func (fakeProvider) DestroyMachine(_ context.Context, _ string) error {
 	return nil
 }
 
+func (fakeProvider) ListManagedMachines(_ context.Context) ([]broker.Machine, error) {
+	return nil, nil
+}
+
 type lockedBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -91,7 +95,7 @@ func TestBuildServerWithInjectedProvider(t *testing.T) {
 	t.Cleanup(func() { newMachineProvider = oldFactory })
 
 	var out bytes.Buffer
-	srv, handler, err := buildServer(context.Background(), &out, &serveFlags{
+	srv, handler, _, _, err := buildServer(context.Background(), &out, &serveFlags{
 		listen:                defaultListen,
 		provider:              "fake",
 		flyApp:                "playground-test",
@@ -164,7 +168,7 @@ func TestBuildServerStaticDir(t *testing.T) {
 	}
 
 	// With --static-dir: / serves the UI AND the API still routes on the same origin.
-	srv, handler, err := buildServer(context.Background(), &bytes.Buffer{}, flags(uiDir))
+	srv, handler, _, _, err := buildServer(context.Background(), &bytes.Buffer{}, flags(uiDir))
 	if err != nil {
 		t.Fatalf("buildServer(static): %v", err)
 	}
@@ -179,7 +183,7 @@ func TestBuildServerStaticDir(t *testing.T) {
 	}
 
 	// Without --static-dir: / is 404 (broker is API-only).
-	srv2, handler2, err := buildServer(context.Background(), &bytes.Buffer{}, flags(""))
+	srv2, handler2, _, _, err := buildServer(context.Background(), &bytes.Buffer{}, flags(""))
 	if err != nil {
 		t.Fatalf("buildServer(no static): %v", err)
 	}
@@ -208,7 +212,7 @@ func TestBuildServerHostGuardFromAllowOrigin(t *testing.T) {
 	}
 	t.Cleanup(func() { newMachineProvider = oldFactory })
 
-	srv, handler, err := buildServer(context.Background(), &bytes.Buffer{}, &serveFlags{
+	srv, handler, _, _, err := buildServer(context.Background(), &bytes.Buffer{}, &serveFlags{
 		listen: defaultListen, provider: "fake", flyApp: "playground-test",
 		flyTokenFile: flyTokenFile, image: "registry.example/playground:test",
 		staticDir: uiDir, internalPort: 8080, concurrency: 2,
@@ -280,7 +284,7 @@ func TestBuildServerCFAccessGuard(t *testing.T) {
 	}
 	t.Cleanup(func() { newMachineProvider = oldFactory })
 
-	srv, handler, err := buildServer(context.Background(), &bytes.Buffer{}, &serveFlags{
+	srv, handler, _, _, err := buildServer(context.Background(), &bytes.Buffer{}, &serveFlags{
 		listen: defaultListen, provider: "fake", flyApp: "playground-test",
 		flyTokenFile: flyTokenFile, image: "registry.example/playground:test",
 		staticDir: uiDir, internalPort: 8080, concurrency: 2,
@@ -343,7 +347,7 @@ func TestBuildServerTurnstileRejectsMissingToken(t *testing.T) {
 	}
 	t.Cleanup(func() { newMachineProvider = oldFactory })
 
-	srv, handler, err := buildServer(context.Background(), &bytes.Buffer{}, &serveFlags{
+	srv, handler, _, _, err := buildServer(context.Background(), &bytes.Buffer{}, &serveFlags{
 		listen:                defaultListen,
 		provider:              "fake",
 		flyApp:                "playground-test",
@@ -498,6 +502,64 @@ func TestBuildServerValidation(t *testing.T) {
 				t.Fatal("validateFlags succeeded, want error")
 			}
 		})
+	}
+}
+
+func TestValidateDefaultCode(t *testing.T) {
+	t.Parallel()
+	const pub = "pub-code"
+	mk := func(mut func(*serveFlags)) *serveFlags {
+		f := &serveFlags{codes: []string{pub, "other"}}
+		mut(f)
+		return f
+	}
+	cases := []struct {
+		name    string
+		f       *serveFlags
+		wantErr bool
+	}{
+		{"empty_is_noop", mk(func(f *serveFlags) {}), false},
+		{"turnstile_gate_ok", mk(func(f *serveFlags) { f.defaultCode = pub; f.turnstileSecretEnv = "TS_SECRET" }), false},
+		{"cfaccess_gate_ok", mk(func(f *serveFlags) {
+			f.defaultCode = pub
+			f.cfAccessTeamDomain = "https://x.cloudflareaccess.com"
+			f.cfAccessAUD = "aud-tag"
+		}), false},
+		// The security guardrail: a default code with NO human gate would let
+		// anyone create sessions code-free. Must fail closed.
+		{"no_gate_rejected", mk(func(f *serveFlags) { f.defaultCode = pub }), true},
+		{"unsafe_no_human_gate_rejected", mk(func(f *serveFlags) { f.defaultCode = pub; f.unsafeNoHumanGate = true }), true},
+		{"unknown_code_rejected", mk(func(f *serveFlags) { f.defaultCode = "ghost"; f.turnstileSecretEnv = "TS_SECRET" }), true},
+		{"conflicting_flags_rejected", mk(func(f *serveFlags) {
+			f.defaultCode = pub
+			f.cfAccessDefaultCode = "other"
+			f.turnstileSecretEnv = "TS_SECRET"
+		}), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateDefaultCode(tc.f)
+			if tc.wantErr && err == nil {
+				t.Fatal("validateDefaultCode succeeded, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateDefaultCode failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestEffectiveDefaultCode(t *testing.T) {
+	t.Parallel()
+	if got := effectiveDefaultCode(&serveFlags{defaultCode: "general"}); got != "general" {
+		t.Fatalf("general wins: got %q", got)
+	}
+	if got := effectiveDefaultCode(&serveFlags{cfAccessDefaultCode: "cf"}); got != "cf" {
+		t.Fatalf("cf fallback: got %q", got)
+	}
+	if got := effectiveDefaultCode(&serveFlags{}); got != "" {
+		t.Fatalf("empty: got %q", got)
 	}
 }
 
@@ -871,6 +933,8 @@ func TestValidateFlagsBranches(t *testing.T) {
 	}
 	turnstileGate := noHumanGate
 	turnstileGate.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
+	turnstileGate.turnstileExpectedHostname = "playground.example"
+	turnstileGate.turnstileExpectedAction = "playground-session"
 	if err := validateFlags(&turnstileGate); err != nil {
 		t.Fatalf("turnstile gate should validate: %v", err)
 	}
@@ -904,6 +968,34 @@ func TestValidateFlagsBranches(t *testing.T) {
 		{name: "bad_turnstile_verify_url", mutate: func(f *serveFlags) {
 			f.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
 			f.turnstileVerifyURL = "file:///tmp/siteverify"
+		}},
+		{name: "bad_turnstile_max_age", mutate: func(f *serveFlags) {
+			f.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
+			f.turnstileVerifyURL = "https://turnstile.example/verify"
+			f.turnstileMaxAge = -1
+		}},
+		{name: "turnstile_production_missing_hostname_action", mutate: func(f *serveFlags) {
+			// Turnstile against Cloudflare (no --turnstile-verify-url) must bind
+			// hostname + action; omitting them is rejected.
+			f.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
+		}},
+		{name: "turnstile_explicit_cloudflare_url_missing_bindings", mutate: func(f *serveFlags) {
+			// Explicitly pointing at the real Cloudflare Siteverify URL must NOT
+			// escape the hostname/action binding requirement.
+			f.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
+			f.turnstileVerifyURL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+		}},
+		{name: "turnstile_explicit_cloudflare_url_with_port_missing_bindings", mutate: func(f *serveFlags) {
+			// A port on the real Cloudflare host is still the production
+			// Siteverify endpoint, so hostname/action binding remains required.
+			f.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
+			f.turnstileVerifyURL = "https://challenges.cloudflare.com:443/turnstile/v0/siteverify"
+		}},
+		{name: "turnstile_explicit_cloudflare_url_trailing_dot_missing_bindings", mutate: func(f *serveFlags) {
+			// A DNS-root trailing dot is still the real Cloudflare host, so it
+			// must not bypass hostname/action binding.
+			f.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
+			f.turnstileVerifyURL = "https://challenges.cloudflare.com./turnstile/v0/siteverify"
 		}},
 		{name: "bad_cf_combo", mutate: func(f *serveFlags) { f.cfAccessCertsURL = "https://keys.example/certs" }},
 		{name: "bad_cf_aud", mutate: func(f *serveFlags) {
@@ -944,6 +1036,13 @@ func TestBrokerPublicHosts(t *testing.T) {
 	}
 	if len(hosts) != 1 || hosts[0] != "playground.pipelab.org" {
 		t.Fatalf("hosts from origin = %#v", hosts)
+	}
+	hosts, err = brokerPublicHosts(&serveFlags{turnstileExpectedHostname: "Playground.Pipelab.Org."})
+	if err != nil {
+		t.Fatalf("brokerPublicHosts turnstile hostname: %v", err)
+	}
+	if len(hosts) != 1 || hosts[0] != "playground.pipelab.org" {
+		t.Fatalf("hosts from turnstile hostname = %#v", hosts)
 	}
 	if _, err := brokerPublicHosts(&serveFlags{publicHosts: []string{"https://bad.example"}}); err == nil {
 		t.Fatal("URL-shaped public host should error")
@@ -1284,28 +1383,57 @@ type writeDeadliner interface{ SetWriteDeadline(time.Time) error }
 
 var _ writeDeadliner = (*deadlineRecorder)(nil)
 
+func TestNoCacheStatic(t *testing.T) {
+	t.Parallel()
+	var served bool
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		served = true
+		w.WriteHeader(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/viewer-live.js", nil)
+	noCacheStatic(inner).ServeHTTP(rec, req)
+	if !served {
+		t.Fatal("inner static handler was not called")
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control = %q, want no-cache (so the viewer revalidates after a redeploy)", got)
+	}
+}
+
 func TestWriteDeadlineMiddleware(t *testing.T) {
 	t.Parallel()
 	const (
-		timeout      = 30 * time.Second
-		routeHealth  = "/api/live/health"
-		routeSession = "/api/live/session"
-		routeStream  = "/api/live/stream"
-		routeMessage = "/api/live/message"
+		defaultTimeout = 30 * time.Second
+		longTimeout    = 90 * time.Second
+		routeHealth    = "/api/live/health"
+		routeSession   = "/api/live/session"
+		routeStream    = "/api/live/stream"
+		routeMessage   = "/api/live/message"
 	)
-	exempt := []string{routeStream, routeMessage}
+	overrides := map[string]time.Duration{
+		routeStream:  0,           // exempt: SSE writes indefinitely
+		routeMessage: 0,           // exempt: held open for the whole model turn
+		routeSession: longTimeout, // bounded long: cold VM boot+proof
+	}
 
+	const (
+		kindExempt  = "exempt"  // no deadline
+		kindDefault = "default" // ~defaultTimeout
+		kindLong    = "long"    // ~longTimeout (bounded, but > default)
+	)
 	tests := []struct {
 		name string
 		path string
-		// exempt routes get NO deadline (cleared to zero); bounded routes get a
-		// future deadline so a slow reader cannot pin the goroutine.
-		wantExempt bool
+		kind string
 	}{
-		{name: "health_bounded", path: routeHealth, wantExempt: false},
-		{name: "session_bounded", path: routeSession, wantExempt: false},
-		{name: "stream_exempt", path: routeStream, wantExempt: true},
-		{name: "message_exempt_held_open_for_turn", path: routeMessage, wantExempt: true},
+		{name: "health_default", path: routeHealth, kind: kindDefault},
+		// session-create boots+proves a cold microVM (can exceed 30s): a longer
+		// but still BOUNDED deadline, not a full exemption (a slow reader must
+		// not pin the goroutine). 30s here made cold starts fail closed (PU02/502).
+		{name: "session_long_bounded", path: routeSession, kind: kindLong},
+		{name: "stream_exempt", path: routeStream, kind: kindExempt},
+		{name: "message_exempt_held_open_for_turn", path: routeMessage, kind: kindExempt},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1315,7 +1443,7 @@ func TestWriteDeadlineMiddleware(t *testing.T) {
 				ran = true
 				w.WriteHeader(http.StatusOK)
 			})
-			mw := writeDeadlineMiddleware(inner, timeout, exempt...)
+			mw := writeDeadlineMiddleware(inner, defaultTimeout, overrides)
 			rec := &deadlineRecorder{ResponseWriter: httptest.NewRecorder()}
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.path, nil)
 			before := time.Now()
@@ -1327,13 +1455,24 @@ func TestWriteDeadlineMiddleware(t *testing.T) {
 			if !rec.set {
 				t.Fatal("middleware never called SetWriteDeadline")
 			}
-			if tc.wantExempt {
+			switch tc.kind {
+			case kindExempt:
 				if !rec.deadline.IsZero() {
 					t.Fatalf("exempt path %s: deadline = %v, want zero (cleared)", tc.path, rec.deadline)
 				}
-			} else {
-				if !rec.deadline.After(before) {
-					t.Fatalf("bounded path %s: deadline = %v, want a future deadline", tc.path, rec.deadline)
+			case kindDefault:
+				// ~defaultTimeout out, and clearly shorter than the long budget.
+				if !rec.deadline.After(before) || rec.deadline.After(before.Add(defaultTimeout+5*time.Second)) {
+					t.Fatalf("default path %s: deadline = %v, want ~%s out", tc.path, rec.deadline, defaultTimeout)
+				}
+			case kindLong:
+				// Bounded (not zero) AND longer than the default deadline, so a
+				// cold VM boot completes but a slow reader is still capped.
+				if rec.deadline.IsZero() {
+					t.Fatalf("long path %s: deadline = zero, want a bounded future deadline", tc.path)
+				}
+				if !rec.deadline.After(before.Add(defaultTimeout)) {
+					t.Fatalf("long path %s: deadline = %v, want > default (%s) out", tc.path, rec.deadline, defaultTimeout)
 				}
 			}
 		})

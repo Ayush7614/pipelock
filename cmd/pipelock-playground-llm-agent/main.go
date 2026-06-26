@@ -65,19 +65,24 @@ const maxInputLine = 16 << 10 // 16 KiB
 // to, so the proxy records this subprocess's requests as the lab agent.
 const defaultActor = "lab-agent"
 
-// liveHistoryTokens is the PRIMARY bound on the live chat agent's persistent
-// working conversation: an approximate token budget for the full carried context
-// (visitor messages + the agent's tool calls and tool results + replies). The
-// demo is a multi-step chat, so the agent must remember what it already explored
-// to handle "and then..." / "continue" without re-discovering from scratch; the
-// budget keeps that rich memory bounded in cost and context size. The oldest
-// whole turns are dropped when it overflows.
-const liveHistoryTokens = 16000
+// liveHistoryTokens is the high-water retained-history budget for known
+// 64k-context demo models. Smaller or unknown models get lower caps from
+// liveHistoryCaps so persisted history leaves room for the system prompt, current
+// turn, tool transcripts, and response headroom.
+const liveHistoryTokens = 40000
 
 // liveHistoryTurns is a secondary safety cap on the number of turns retained, a
 // backstop against a long run of tiny turns. The token budget is the real
 // limiter for normal tool-laden turns.
-const liveHistoryTurns = 12
+const liveHistoryTurns = 24
+
+const (
+	minLiveHistoryTokens          = 4000
+	defaultModelContextTokens     = 16384
+	liveHistoryReservedHeadroom   = 8192
+	deepSeekChatContextTokens     = 64000
+	deepSeekReasonerContextTokens = 64000
+)
 
 type config struct {
 	modelBaseURL   string
@@ -275,6 +280,7 @@ func buildAgent(cfg config, apiKey string, emit func(llmagent.Event)) (*llmagent
 		SecretValues:   cfg.secretValues,
 		BlockedHosts:   []string{modelHost},
 	})
+	historyTokens, historyTurns := liveHistoryCaps(cfg.model)
 	mc := llmagent.ModelConfig{
 		BaseURL: cfg.modelBaseURL,
 		Model:   cfg.model,
@@ -292,11 +298,41 @@ func buildAgent(cfg config, apiKey string, emit func(llmagent.Event)) (*llmagent
 		// still told nothing about secrets, collectors, or guardrails.
 		SystemPrompt:     buildSystemPrompt(cfg.safeURL),
 		MaxSteps:         cfg.maxSteps,
-		MaxHistoryTurns:  liveHistoryTurns,
-		MaxHistoryTokens: liveHistoryTokens,
+		MaxHistoryTurns:  historyTurns,
+		MaxHistoryTokens: historyTokens,
 		Timeout:          cfg.timeout,
 	}
 	return llmagent.New(mc, client, tools, emit), nil
+}
+
+func liveHistoryCaps(model string) (tokens int, turns int) {
+	contextTokens := modelContextTokens(model)
+	tokens = contextTokens - liveHistoryReservedHeadroom
+	if tokens < minLiveHistoryTokens {
+		tokens = minLiveHistoryTokens
+	}
+	if tokens > liveHistoryTokens {
+		tokens = liveHistoryTokens
+	}
+	turns = liveHistoryTurns
+	if tokens < liveHistoryTokens {
+		turns = liveHistoryTurns / 2
+	}
+	if turns < 1 {
+		turns = 1
+	}
+	return tokens, turns
+}
+
+func modelContextTokens(model string) int {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "deepseek-chat":
+		return deepSeekChatContextTokens
+	case "deepseek-reasoner":
+		return deepSeekReasonerContextTokens
+	default:
+		return defaultModelContextTokens
+	}
 }
 
 // buildSystemPrompt returns the default agent framing, plus a hint that the lab

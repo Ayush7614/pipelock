@@ -61,6 +61,12 @@ func (v *serverFakeHumanVerifier) calls() int {
 	return len(v.tokens)
 }
 
+func (v *serverFakeHumanVerifier) setErr(err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.err = err
+}
+
 func (p *serverFakeProvider) CreateMachine(_ context.Context, spec MachineSpec) (*Machine, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -97,6 +103,10 @@ func (p *serverFakeProvider) DestroyMachine(_ context.Context, id string) error 
 	return nil
 }
 
+func (p *serverFakeProvider) ListManagedMachines(_ context.Context) ([]Machine, error) {
+	return nil, nil
+}
+
 func (p *serverFakeProvider) createdCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -116,16 +126,25 @@ func (p *serverFakeProvider) createdEnv(index int) map[string]string {
 }
 
 type fakeVM struct {
-	t             *testing.T
-	token         string
-	sessionID     string
-	expiresAt     time.Time
-	sessionCodes  chan string
-	messages      chan string
-	streamStarted chan struct{}
-	streamRelease chan struct{}
-	bundleStatus  int
-	server        *httptest.Server
+	t               *testing.T
+	token           string
+	sessionID       string
+	expiresAt       time.Time
+	sessionCodes    chan string
+	messages        chan string
+	streamStarted   chan struct{}
+	streamRelease   chan struct{}
+	bundleStatus    int
+	rawBundleStatus int
+	bundleHits      atomic.Int32
+	// bundleHold, when non-nil, blocks a bundle response whose os matches
+	// bundleHoldOS until the channel is closed; bundleHeld signals (once) that
+	// such a request has reached the block. Used to drive concurrent-download
+	// race tests deterministically.
+	bundleHoldOS string
+	bundleHold   chan struct{}
+	bundleHeld   chan struct{}
+	server       *httptest.Server
 }
 
 func newFakeVM(t *testing.T, token string) *fakeVM {
@@ -211,9 +230,32 @@ func (vm *fakeVM) handle(w http.ResponseWriter, r *http.Request) {
 			writeBrokerErr(w, http.StatusForbidden, "wrong VM")
 			return
 		}
-		w.Header().Set("Content-Type", "application/gzip")
-		w.WriteHeader(vm.bundleStatus)
-		_, _ = w.Write([]byte("bundle-" + vm.token))
+		vm.bundleHits.Add(1)
+		osParam := r.URL.Query().Get("os")
+		if vm.bundleHold != nil && osParam == vm.bundleHoldOS {
+			if vm.bundleHeld != nil {
+				select {
+				case vm.bundleHeld <- struct{}{}:
+				default:
+				}
+			}
+			<-vm.bundleHold
+		}
+		status := vm.bundleStatus
+		if osParam == "" && vm.rawBundleStatus != 0 {
+			status = vm.rawBundleStatus
+		}
+		if osParam != "" {
+			w.Header().Set("Content-Type", "application/zip")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", "kit-"+osParam+".zip"))
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte("kit-" + osParam + "-" + vm.token))
+		} else {
+			w.Header().Set("Content-Type", "application/gzip")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", "bundle.tar.gz"))
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte("bundle-" + vm.token))
+		}
 	default:
 		writeBrokerErr(w, http.StatusNotFound, "not found")
 	}
@@ -492,6 +534,77 @@ func getBrokerHealth(t *testing.T, ts *httptest.Server) map[string]any {
 		t.Fatalf("decode health: %v", err)
 	}
 	return body
+}
+
+// TestServer_DefaultCodeFallback proves the human-gated code-optional path:
+// with a DefaultCode configured, a session request carrying NO invite code falls
+// back to the default and succeeds (the human gate is the authorization), and
+// health advertises code_required=false. Without a DefaultCode an empty code is
+// still rejected.
+func TestServer_DefaultCodeFallback(t *testing.T) {
+	t.Run("empty code uses default when configured", func(t *testing.T) {
+		vm := newFakeVM(t, "vm-default-token")
+		provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+		_, ts := newBrokerTestServer(t, provider, ServerConfig{DefaultCode: brokerTestCode})
+
+		resp := postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{Code: ""})
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("empty code with DefaultCode = %d, want 200", resp.StatusCode)
+		}
+		if health := getBrokerHealth(t, ts); health["code_required"] != false {
+			t.Fatalf("code_required = %v, want false when DefaultCode set", health["code_required"])
+		}
+	})
+	t.Run("empty code rejected without default", func(t *testing.T) {
+		provider := &serverFakeProvider{}
+		_, ts := newBrokerTestServer(t, provider, ServerConfig{})
+		resp := postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{Code: ""})
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("empty code without DefaultCode = %d, want 401", resp.StatusCode)
+		}
+		if health := getBrokerHealth(t, ts); health["code_required"] != true {
+			t.Fatalf("code_required = %v, want true", health["code_required"])
+		}
+	})
+	t.Run("default code still requires human verifier before lease", func(t *testing.T) {
+		vm := newFakeVM(t, "vm-default-human-token")
+		provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+		verifier := &serverFakeHumanVerifier{err: errors.New("missing human proof")}
+		_, ts := newBrokerTestServer(t, provider, ServerConfig{
+			DefaultCode:       brokerTestCode,
+			HumanVerifier:     verifier,
+			GlobalDailyBudget: 1,
+		})
+
+		resp := postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{Code: ""})
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("empty code without human proof = %d, want 403", resp.StatusCode)
+		}
+		if got := verifier.calls(); got != 1 {
+			t.Fatalf("verifier calls = %d, want 1", got)
+		}
+		if got := provider.createdCount(); got != 0 {
+			t.Fatalf("created machines = %d, want 0 before human proof", got)
+		}
+
+		verifier.setErr(nil)
+		resp = postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{
+			Code:           "",
+			TurnstileToken: "human-token",
+		})
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("empty code with human proof after failed attempt = %d, want 200", resp.StatusCode)
+		}
+		if got := provider.createdCount(); got != 1 {
+			t.Fatalf("created machines = %d, want 1 after human proof", got)
+		}
+	})
 }
 
 func TestServer_EndToEndProxyAndRelease(t *testing.T) {
@@ -966,12 +1079,36 @@ func TestServer_AbuseControlsReject(t *testing.T) {
 		resp := postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{Code: ""})
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("empty-code status = %d, want 403", resp.StatusCode)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("empty-code status = %d, want 401", resp.StatusCode)
 		}
 		status, _ := postBrokerSession(t, ts)
 		if status != http.StatusOK {
 			t.Fatalf("valid code after empty-code rejection = %d, want 200", status)
+		}
+	})
+
+	t.Run("unknown_code_spray_does_not_fill_code_rate_keys", func(t *testing.T) {
+		vm := newFakeVM(t, "unknown-code-rate")
+		provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+		_, ts := newBrokerTestServer(t, provider, ServerConfig{
+			DefaultCode: brokerTestCode,
+			CodeRate:    livechat.RateConfig{RefillPerSec: 1000, Burst: 1000, MaxKeys: 1},
+		})
+		resp := postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{Code: "attacker-random-code"})
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unknown-code status = %d, want 401", resp.StatusCode)
+		}
+		resp = postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{Code: ""})
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("default code after unknown-code spray = %d, want 200", resp.StatusCode)
+		}
+		if got := provider.createdCount(); got != 1 {
+			t.Fatalf("created machines = %d, want only the default-code session", got)
 		}
 	})
 
@@ -1055,7 +1192,7 @@ func TestServerDirectHelpers(t *testing.T) {
 	if got := gateStatus(livechat.ErrGateClosed); got != http.StatusServiceUnavailable {
 		t.Fatalf("gateStatus closed = %d", got)
 	}
-	if got := gateStatus(errors.New("bad code")); got != http.StatusForbidden {
+	if got := gateStatus(errors.New("bad code")); got != http.StatusUnauthorized {
 		t.Fatalf("gateStatus other = %d", got)
 	}
 	if got := codeKey("same"); got != codeKey("same") || got == codeKey("different") {
@@ -1287,6 +1424,41 @@ func TestServer_HumanVerifierRejectsBeforeLease(t *testing.T) {
 	}
 }
 
+func TestServer_GlobalBudgetClosedBeforeHumanVerifier(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "global-before-human-a")
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+	verifier := &serverFakeHumanVerifier{}
+	_, ts := newBrokerTestServer(t, provider, ServerConfig{
+		HumanVerifier:     verifier,
+		GlobalDailyBudget: 1,
+	})
+
+	status, _ := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("first status = %d, want 200", status)
+	}
+	if got := verifier.calls(); got != 1 {
+		t.Fatalf("human verifier calls after first session = %d, want 1", got)
+	}
+
+	resp := postBrokerJSON(t, ts.URL+livechat.RouteSession, sessionRequest{
+		Code:           brokerTestCode,
+		TurnstileToken: "second-token",
+	})
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want 503", resp.StatusCode)
+	}
+	if got := verifier.calls(); got != 1 {
+		t.Fatalf("human verifier calls after exhausted global budget = %d, want 1", got)
+	}
+	if got := provider.createdCount(); got != 1 {
+		t.Fatalf("created machines = %d, want 1", got)
+	}
+}
+
 func TestServer_RegisterTokenRefusedAfterKill(t *testing.T) {
 	t.Parallel()
 	provider := &serverFakeProvider{}
@@ -1357,5 +1529,533 @@ func TestServer_HealthDoesNotOverclaimContainment(t *testing.T) {
 	}
 	if _, present := body["contained"]; present {
 		t.Fatal("health must not report a constant 'contained' field the broker cannot prove")
+	}
+}
+
+// --- Artifact cache tests ---
+
+func TestArtifactCache_GetPutEvictTTL(t *testing.T) {
+	t.Parallel()
+	c := newArtifactCache(50 * time.Millisecond)
+
+	key := artifactCacheKey{token: "t1", os: ""}
+	if got := c.get(key); got != nil {
+		t.Fatal("get on empty cache should return nil")
+	}
+
+	entry := &artifactCacheEntry{
+		body:               []byte("hello"),
+		contentType:        "application/gzip",
+		contentDisposition: "attachment",
+		insertedAt:         time.Now(),
+	}
+	c.put(key, entry)
+	if got := c.get(key); got == nil || string(got.body) != "hello" {
+		t.Fatalf("get after put = %v, want hello", got)
+	}
+
+	// Wait for TTL to expire, then verify eviction on read.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.get(key) == nil {
+			return // evicted as expected
+		}
+	}
+	t.Fatal("entry did not expire after TTL")
+}
+
+func TestArtifactCache_CapEvictsOldest(t *testing.T) {
+	t.Parallel()
+	c := newArtifactCache(time.Minute)
+
+	// Fill to capacity.
+	for i := range maxArtifactCacheEntries {
+		k := artifactCacheKey{token: fmt.Sprintf("t%d", i), os: ""}
+		c.put(k, &artifactCacheEntry{
+			body:       []byte(fmt.Sprintf("body%d", i)),
+			insertedAt: time.Now(),
+		})
+	}
+	if c.len() != maxArtifactCacheEntries {
+		t.Fatalf("cache len = %d, want %d", c.len(), maxArtifactCacheEntries)
+	}
+
+	// One more should evict the oldest (t0).
+	c.put(artifactCacheKey{token: "overflow", os: ""}, &artifactCacheEntry{
+		body:       []byte("new"),
+		insertedAt: time.Now(),
+	})
+	if c.len() != maxArtifactCacheEntries {
+		t.Fatalf("cache len after overflow = %d, want %d", c.len(), maxArtifactCacheEntries)
+	}
+	// The oldest entry should be gone.
+	if got := c.get(artifactCacheKey{token: "t0", os: ""}); got != nil {
+		t.Fatal("oldest entry should have been evicted")
+	}
+}
+
+// TestServer_BundleRedownloadAfterVMTeardown proves the core durability fix:
+// after the first successful bundle download releases the VM, a second download
+// (browser retry, double-click) succeeds from the broker's artifact cache.
+func TestServer_BundleRedownloadAfterVMTeardown(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "redownload-token")
+	destroyed := make(chan string, 4)
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}, destroyedCh: destroyed}
+	srv, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, session := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+
+	// First download: fetches from VM, caches, releases VM.
+	bundleURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token)
+	resp1 := getBroker(t, bundleURL)
+	body1, err := io.ReadAll(resp1.Body)
+	_ = resp1.Body.Close()
+	if err != nil {
+		t.Fatalf("read first bundle: %v", err)
+	}
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first bundle status = %d, want 200", resp1.StatusCode)
+	}
+	if string(body1) != "bundle-"+vm.token {
+		t.Fatalf("first bundle body = %q, want %q", body1, "bundle-"+vm.token)
+	}
+
+	// VM should be destroyed after first download.
+	expectDestroyed(t, destroyed)
+	if got := srv.cfg.Leases.ActiveLeases(); got != 0 {
+		t.Fatalf("active leases after first download = %d, want 0", got)
+	}
+
+	// Second download: VM is gone, but the cache serves it.
+	resp2 := getBroker(t, bundleURL)
+	body2, err := io.ReadAll(resp2.Body)
+	_ = resp2.Body.Close()
+	if err != nil {
+		t.Fatalf("read second bundle: %v", err)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second bundle status = %d, want 200 (cache hit after VM teardown)", resp2.StatusCode)
+	}
+	if string(body2) != string(body1) {
+		t.Fatalf("second bundle body differs from first: %q vs %q", body2, body1)
+	}
+
+	// The VM should have been hit exactly once (not on the second download).
+	if got := vm.bundleHits.Load(); got != 1 {
+		t.Fatalf("VM bundle hits = %d, want 1 (second download should be a cache hit)", got)
+	}
+}
+
+// TestServer_BundleKitThenRawBothSucceed proves the prefetch-raw behavior:
+// downloading a verify-kit (os=linux) also prefetches the raw bundle into the
+// cache, so a subsequent raw download succeeds even after VM teardown.
+func TestServer_BundleKitThenRawBothSucceed(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "kit-raw-token")
+	destroyed := make(chan string, 4)
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}, destroyedCh: destroyed}
+	srv, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, session := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+
+	// Download the verify kit (os=linux).
+	kitURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token) + "&os=linux"
+	kitResp := getBroker(t, kitURL)
+	kitBody, err := io.ReadAll(kitResp.Body)
+	_ = kitResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read kit: %v", err)
+	}
+	if kitResp.StatusCode != http.StatusOK {
+		t.Fatalf("kit status = %d, want 200", kitResp.StatusCode)
+	}
+	if !strings.HasPrefix(string(kitBody), "kit-linux-") {
+		t.Fatalf("kit body = %q, want kit-linux-* prefix", kitBody)
+	}
+
+	// VM should be destroyed.
+	expectDestroyed(t, destroyed)
+
+	// Now download the raw bundle. VM is gone, but prefetch should have cached it.
+	rawURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token)
+	rawResp := getBroker(t, rawURL)
+	rawBody, err := io.ReadAll(rawResp.Body)
+	_ = rawResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read raw: %v", err)
+	}
+	if rawResp.StatusCode != http.StatusOK {
+		t.Fatalf("raw bundle status = %d, want 200 (prefetched into cache)", rawResp.StatusCode)
+	}
+	if string(rawBody) != "bundle-"+vm.token {
+		t.Fatalf("raw bundle body = %q, want %q", rawBody, "bundle-"+vm.token)
+	}
+
+	// The VM should have been hit exactly twice: once for the kit, once for
+	// the raw prefetch.
+	if got := vm.bundleHits.Load(); got != 2 {
+		t.Fatalf("VM bundle hits = %d, want 2 (kit + raw prefetch)", got)
+	}
+
+	srv.mu.Lock()
+	fetchMuLen := len(srv.fetchMu)
+	srv.mu.Unlock()
+	if fetchMuLen != 0 {
+		t.Fatalf("fetch mutex entries after bundle downloads = %d, want 0", fetchMuLen)
+	}
+}
+
+func TestServer_BundleKitRawPrefetchFailureRetainsVM(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "raw-prefetch-fail-token")
+	vm.rawBundleStatus = http.StatusServiceUnavailable
+	destroyed := make(chan string, 4)
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}, destroyedCh: destroyed}
+	srv, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, session := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+
+	kitURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token) + "&os=linux"
+	kitResp := getBroker(t, kitURL)
+	_, _ = io.ReadAll(kitResp.Body)
+	_ = kitResp.Body.Close()
+	if kitResp.StatusCode != http.StatusOK {
+		t.Fatalf("kit status = %d, want 200", kitResp.StatusCode)
+	}
+
+	select {
+	case id := <-destroyed:
+		t.Fatalf("VM %s was destroyed even though raw prefetch failed", id)
+	default:
+	}
+	if got := srv.cfg.Leases.ActiveLeases(); got != 1 {
+		t.Fatalf("active leases after raw prefetch failure = %d, want 1", got)
+	}
+
+	// Once the raw bundle can be fetched, the token seals and the VM releases.
+	vm.rawBundleStatus = 0
+	rawURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token)
+	rawResp := getBroker(t, rawURL)
+	_, _ = io.ReadAll(rawResp.Body)
+	_ = rawResp.Body.Close()
+	if rawResp.StatusCode != http.StatusOK {
+		t.Fatalf("raw bundle status after retry = %d, want 200", rawResp.StatusCode)
+	}
+	expectDestroyed(t, destroyed)
+}
+
+func TestServer_BundleRejectsInvalidOSBeforeVMFetch(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "bad-os-token")
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+	srv, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, session := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+
+	badURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token) + "&os=plan9"
+	resp := getBroker(t, badURL)
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad os bundle status = %d, want 400", resp.StatusCode)
+	}
+	if got := vm.bundleHits.Load(); got != 0 {
+		t.Fatalf("VM bundle hits after bad os = %d, want 0", got)
+	}
+
+	srv.mu.Lock()
+	fetchMuLen := len(srv.fetchMu)
+	srv.mu.Unlock()
+	if fetchMuLen != 0 {
+		t.Fatalf("fetch mutex entries after bad os = %d, want 0", fetchMuLen)
+	}
+	if got := srv.cfg.Leases.ActiveLeases(); got != 1 {
+		t.Fatalf("active leases after bad os = %d, want 1", got)
+	}
+}
+
+// TestServer_BundleConcurrentVariantsHoldVMUntilAllDone proves the per-token
+// in-flight refcount: a fast variant (the raw bundle) completing while a slow
+// variant (an OS kit) is still being fetched must NOT release/destroy the VM.
+// Pre-fix, the fast download's eager releaseToken destroyed the VM mid-fetch of
+// the kit, reproducing the intermittent "download failed" bug under
+// double-clicks, two tabs, or raw+kit clicked together.
+func TestServer_BundleConcurrentVariantsHoldVMUntilAllDone(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "concurrent-token")
+	vm.bundleHoldOS = "linux"
+	vm.bundleHold = make(chan struct{})
+	vm.bundleHeld = make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	releaseHold := func() { releaseOnce.Do(func() { close(vm.bundleHold) }) }
+	// Always release the held VM handler, even if the test fails early, so
+	// httptest.Server.Close() (which waits for outstanding requests) cannot hang.
+	t.Cleanup(releaseHold)
+	destroyed := make(chan string, 4)
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}, destroyedCh: destroyed}
+	srv, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, session := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+
+	kitURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token) + "&os=linux"
+	rawURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token)
+
+	// Start the slow kit download; it blocks inside the VM fetch. Read+close the
+	// body inside the goroutine so the response is consumed (and bodyclose-clean).
+	type kitResult struct {
+		status int
+		body   string
+	}
+	kitDone := make(chan kitResult, 1)
+	go func() {
+		resp := getBroker(t, kitURL)
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		kitDone <- kitResult{status: resp.StatusCode, body: string(b)}
+	}()
+
+	// Wait until the kit fetch has actually reached the VM (in-flight).
+	select {
+	case <-vm.bundleHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("kit fetch never reached the VM")
+	}
+
+	// While the kit is still in-flight, the fast raw download completes.
+	rawResp := getBroker(t, rawURL)
+	rawBody, _ := io.ReadAll(rawResp.Body)
+	_ = rawResp.Body.Close()
+	if rawResp.StatusCode != http.StatusOK {
+		t.Fatalf("raw status = %d, want 200", rawResp.StatusCode)
+	}
+	if string(rawBody) != "bundle-"+vm.token {
+		t.Fatalf("raw body = %q, want %q", rawBody, "bundle-"+vm.token)
+	}
+
+	// The VM must STILL be leased: the kit download is in-flight, so the fast
+	// raw download must not have released it.
+	if got := srv.cfg.Leases.ActiveLeases(); got != 1 {
+		t.Fatalf("active leases while kit in-flight = %d, want 1 (VM must be held)", got)
+	}
+
+	// Release the kit fetch; as the last in-flight request it releases the VM.
+	releaseHold()
+	kit := <-kitDone
+	if kit.status != http.StatusOK {
+		t.Fatalf("kit status = %d, want 200", kit.status)
+	}
+	if !strings.HasPrefix(kit.body, "kit-linux-") {
+		t.Fatalf("kit body = %q, want kit-linux-* prefix", kit.body)
+	}
+
+	// Now the VM is released exactly once, after both downloads finished.
+	expectDestroyed(t, destroyed)
+	if got := srv.cfg.Leases.ActiveLeases(); got != 0 {
+		t.Fatalf("active leases after both downloads = %d, want 0", got)
+	}
+}
+
+func TestServer_BundleFailedConcurrentWaveRetainsVMForRetry(t *testing.T) {
+	t.Parallel()
+	srv := &Server{}
+	const token = "retry-token"
+
+	srv.bundleEnter(token)
+	srv.bundleEnter(token)
+	srv.bundleSeal(token)
+	srv.bundleMarkFailed(token)
+
+	if srv.bundleLeave(token) {
+		t.Fatal("first leave released VM while another artifact fetch was in-flight")
+	}
+	if srv.bundleLeave(token) {
+		t.Fatal("failed concurrent artifact wave released VM; want retained for retry")
+	}
+
+	srv.bundleEnter(token)
+	srv.bundleSeal(token)
+	if !srv.bundleLeave(token) {
+		t.Fatal("successful retry after failed wave did not release VM")
+	}
+}
+
+// TestServer_BundleConcurrentIdenticalCoalesced proves the per-(token, os) fetch
+// lock: two concurrent identical kit downloads result in exactly ONE VM fetch of
+// that variant (the follower reads the cache the leader populated), so N
+// concurrent identical downloads cannot each pull a full kit into memory.
+func TestServer_BundleConcurrentIdenticalCoalesced(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "coalesce-token")
+	vm.bundleHoldOS = "linux"
+	vm.bundleHold = make(chan struct{})
+	vm.bundleHeld = make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	releaseHold := func() { releaseOnce.Do(func() { close(vm.bundleHold) }) }
+	t.Cleanup(releaseHold)
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+	_, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, session := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+	kitURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token) + "&os=linux"
+
+	type res struct {
+		status int
+		body   string
+	}
+	run := func() res {
+		resp := getBroker(t, kitURL)
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return res{resp.StatusCode, string(b)}
+	}
+	r1 := make(chan res, 1)
+	r2 := make(chan res, 1)
+	go func() { r1 <- run() }() // leader: blocks at the VM, holding the fetch lock
+	select {
+	case <-vm.bundleHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first kit fetch never reached the VM")
+	}
+	go func() { r2 <- run() }() // follower: blocks on the per-variant fetch lock
+	releaseHold()
+	for _, rr := range []res{<-r1, <-r2} {
+		if rr.status != http.StatusOK {
+			t.Fatalf("kit status = %d, want 200", rr.status)
+		}
+		if !strings.HasPrefix(rr.body, "kit-linux-") {
+			t.Fatalf("kit body = %q, want kit-linux-* prefix", rr.body)
+		}
+	}
+	// The kit was fetched from the VM exactly once; the extra hit is the raw
+	// prefetch. Pre-fix (no coalescing) the follower would fetch a second kit.
+	if got := vm.bundleHits.Load(); got != 2 {
+		t.Fatalf("VM bundle hits = %d, want 2 (1 kit + 1 raw prefetch; coalesced)", got)
+	}
+}
+
+// TestArtifactCache_ByteAccounting proves the cache tracks total bytes across
+// put/overwrite/expire so the byte budget can bound worst-case memory.
+func TestArtifactCache_ByteAccounting(t *testing.T) {
+	t.Parallel()
+	c := newArtifactCache(time.Minute)
+	k1 := artifactCacheKey{token: "t", os: "linux"}
+	k2 := artifactCacheKey{token: "t", os: ""}
+	c.put(k1, &artifactCacheEntry{body: make([]byte, 100), insertedAt: time.Now()})
+	c.put(k2, &artifactCacheEntry{body: make([]byte, 50), insertedAt: time.Now()})
+	if got := c.bytesLen(); got != 150 {
+		t.Fatalf("curBytes = %d, want 150", got)
+	}
+	// Overwriting a key adjusts the byte total, not double-counts.
+	c.put(k1, &artifactCacheEntry{body: make([]byte, 300), insertedAt: time.Now()})
+	if got := c.bytesLen(); got != 350 {
+		t.Fatalf("curBytes after overwrite = %d, want 350", got)
+	}
+	// Evicting an expired entry on get decrements the total.
+	exp := newArtifactCache(time.Nanosecond)
+	exp.put(k1, &artifactCacheEntry{body: make([]byte, 200), insertedAt: time.Now().Add(-time.Hour)})
+	if exp.get(k1) != nil {
+		t.Fatal("expired entry should be evicted on get")
+	}
+	if got := exp.bytesLen(); got != 0 {
+		t.Fatalf("curBytes after expired-get = %d, want 0", got)
+	}
+}
+
+// TestServer_BundleVM503DoesNotReleaseVM proves that a 503 from the VM (seal
+// failure) is propagated to the client and the VM is NOT released, so the
+// client can retry while the VM still lives.
+func TestServer_BundleVM503DoesNotReleaseVM(t *testing.T) {
+	t.Parallel()
+	vm := newFakeVM(t, "vm-503-token")
+	vm.bundleStatus = http.StatusServiceUnavailable
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+	srv, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, session := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+
+	bundleURL := ts.URL + livechat.RouteBundle + "?token=" + url.QueryEscape(session.Token)
+	resp := getBroker(t, bundleURL)
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	// The non-200 should be propagated and the lease should be retained.
+	if got := srv.cfg.Leases.ActiveLeases(); got != 1 {
+		t.Fatalf("active leases after VM 503 = %d, want 1 (VM not released)", got)
+	}
+	if got := srv.bundleCache.len(); got != 0 {
+		t.Fatalf("cache len after VM 503 = %d, want 0 (failed fetch must not cache)", got)
+	}
+}
+
+// TestServer_BundleOversizedDoesNotCache proves that an oversized artifact
+// body does not poison the cache and does not release the VM.
+func TestServer_BundleOversizedDoesNotCache(t *testing.T) {
+	t.Parallel()
+	// Create a VM that returns a body exceeding maxArtifactBytes.
+	oversizeBody := strings.Repeat("x", maxArtifactBytes+1)
+	vmsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case livechat.RouteSession:
+			writeBrokerJSON(w, http.StatusOK, vmSessionResponse{
+				Token:     "oversize-tok",
+				SessionID: "sid-oversize",
+				ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+			})
+		case livechat.RouteBundle:
+			w.Header().Set("Content-Type", "application/gzip")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, oversizeBody)
+		default:
+			writeBrokerErr(w, http.StatusNotFound, "not found")
+		}
+	}))
+	t.Cleanup(vmsrv.Close)
+	u, err := url.Parse(vmsrv.URL)
+	if err != nil {
+		t.Fatalf("parse vm url: %v", err)
+	}
+	provider := &serverFakeProvider{targets: []string{u.Host}}
+	srv, ts := newBrokerTestServer(t, provider, ServerConfig{})
+
+	status, _ := postBrokerSession(t, ts)
+	if status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+
+	resp := getBroker(t, ts.URL+livechat.RouteBundle+"?token="+url.QueryEscape("oversize-tok"))
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	// The oversize body should result in a 502 error (fetch failure).
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("oversize bundle status = %d, want 502", resp.StatusCode)
+	}
+	if got := srv.bundleCache.len(); got != 0 {
+		t.Fatalf("cache len after oversize = %d, want 0", got)
+	}
+	if got := srv.cfg.Leases.ActiveLeases(); got != 1 {
+		t.Fatalf("active leases after oversize = %d, want 1 (VM not released on fetch error)", got)
 	}
 }

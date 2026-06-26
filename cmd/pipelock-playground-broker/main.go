@@ -36,70 +36,95 @@ import (
 )
 
 const (
-	defaultListen            = "127.0.0.1:8100"
-	defaultConcurrency       = 3
-	defaultMaxPerCode        = 25
-	defaultSessionTTL        = 10 * time.Minute
-	defaultGrace             = 30 * time.Second
-	defaultIPRate            = 0.5
-	defaultIPBurst           = 5
-	defaultCodeRate          = 0.5
-	defaultCodeBurst         = 10
-	nonStreamWriteTimeout    = 30 * time.Second
+	defaultListen         = "127.0.0.1:8100"
+	defaultConcurrency    = 3
+	defaultMaxPerCode     = 25
+	defaultSessionTTL     = 10 * time.Minute
+	defaultGrace          = 30 * time.Second
+	defaultIPRate         = 0.5
+	defaultIPBurst        = 5
+	defaultCodeRate       = 0.5
+	defaultCodeBurst      = 10
+	nonStreamWriteTimeout = 30 * time.Second
+	// sessionWriteTimeout bounds the session-create response write. It must exceed
+	// the WHOLE cold-path budget, summed across every stage, or a legitimate cold
+	// start fails closed mid-response (the 30s default did exactly that: Fly PU02
+	// / client 502). On a warm-pool MISS the handler runs, in sequence, three
+	// independently-bounded Fly/broker calls before it writes the response:
+	//   - CreateMachine  — Fly adapter HTTP client timeout ~65s (waitTimeout+5s)
+	//   - WaitReady      — Fly adapter HTTP client timeout ~65s (incl. image pull)
+	//   - createVMSession — broker vmReadyTimeout ~60s
+	// i.e. a code-level worst case of ~190s. The ceiling is set above that with
+	// margin so a cold miss completes, while still CAPPING a slow/non-reading
+	// client (a full exemption would leave that goroutine-pin hole open; the
+	// concurrency cap bounds how many such pins can exist). The warm-pool common
+	// path is ~2-3s; this ceiling only bites on a cold miss.
+	sessionWriteTimeout      = 300 * time.Second
 	cfAccessJWTHeader        = "Cf-Access-Jwt-Assertion"
 	cfAccessKeysTTL          = 5 * time.Minute
 	cfAccessNegativeCacheTTL = 30 * time.Second
 
 	envModelKey        = "PLAYGROUND_MODEL_" + "KEY"
 	envOrchestratorKey = "PLAYGROUND_ORCHESTRATOR_" + "KEY"
+
+	// warmPoolVMCodeBytes mirrors broker.vmInviteCodeBytes for warm-pool VM
+	// code generation. Kept in sync with the broker constant.
+	warmPoolVMCodeBytes = 18
 )
 
 type serveFlags struct {
-	listen                  string
-	adminListen             string
-	adminTokenFile          string
-	adminTokenEnv           string
-	unsafeAdminListenPublic bool
-	staticDir               string
-	provider                string
-	flyApp                  string
-	flyTokenFile            string
-	flyTokenEnv             string
-	image                   string
-	region                  string
-	memoryMB                int
-	cpus                    int
-	internalPort            int
-	concurrency             int
-	codes                   []string
-	maxPerCode              int
-	gateSecretFile          string
-	gateSecretEnv           string
-	ipRate                  float64
-	ipBurst                 float64
-	codeRate                float64
-	codeBurst               float64
-	perIPDailyBudget        int
-	perCodeDailyBudget      int
-	globalDailyBudget       int
-	unsafeUnlimited         bool
-	unsafeNoHumanGate       bool
-	turnstileSecretFile     string
-	turnstileSecretEnv      string
-	turnstileVerifyURL      string
-	sessionTTL              time.Duration
-	deadlineGrace           time.Duration
-	allowOrigin             string
-	publicHosts             []string
-	cfAccessTeamDomain      string
-	cfAccessAUD             string
-	cfAccessCertsURL        string
-	trustForwardedFor       bool
-	modelKeyFile            string
-	modelKeyEnv             string
-	orchestratorKeyFile     string
-	orchestratorKeyEnv      string
-	requireSessionSecrets   bool
+	listen                    string
+	adminListen               string
+	adminTokenFile            string
+	adminTokenEnv             string
+	unsafeAdminListenPublic   bool
+	staticDir                 string
+	provider                  string
+	flyApp                    string
+	flyTokenFile              string
+	flyTokenEnv               string
+	image                     string
+	region                    string
+	memoryMB                  int
+	cpus                      int
+	internalPort              int
+	concurrency               int
+	codes                     []string
+	maxPerCode                int
+	gateSecretFile            string
+	gateSecretEnv             string
+	ipRate                    float64
+	ipBurst                   float64
+	codeRate                  float64
+	codeBurst                 float64
+	perIPDailyBudget          int
+	perCodeDailyBudget        int
+	globalDailyBudget         int
+	unsafeUnlimited           bool
+	unsafeNoHumanGate         bool
+	turnstileSecretFile       string
+	turnstileSecretEnv        string
+	turnstileVerifyURL        string
+	turnstileExpectedHostname string
+	turnstileExpectedAction   string
+	turnstileMaxAge           time.Duration
+	turnstileSitekey          string
+	sessionTTL                time.Duration
+	deadlineGrace             time.Duration
+	allowOrigin               string
+	publicHosts               []string
+	cfAccessTeamDomain        string
+	cfAccessAUD               string
+	cfAccessCertsURL          string
+	cfAccessDefaultCode       string
+	defaultCode               string
+	trustForwardedFor         bool
+	modelKeyFile              string
+	modelKeyEnv               string
+	orchestratorKeyFile       string
+	orchestratorKeyEnv        string
+	requireSessionSecrets     bool
+	warmPoolSize              int
 	// VM model/session config, passed into each per-visitor VM via PLAYGROUND_*
 	// env (consumed by deploy/fly-playground/entrypoint.sh).
 	vmModelBaseURL    string
@@ -174,6 +199,10 @@ func newServeCmd() *cobra.Command {
 	fl.StringVar(&f.turnstileSecretFile, "turnstile-secret-file", "", "path to the Cloudflare Turnstile secret; enables human verification for session creation")
 	fl.StringVar(&f.turnstileSecretEnv, "turnstile-secret-env", "", "environment variable holding the Cloudflare Turnstile secret; enables human verification for session creation")
 	fl.StringVar(&f.turnstileVerifyURL, "turnstile-verify-url", "", "Cloudflare Turnstile Siteverify URL override (tests/dev only; empty uses Cloudflare)")
+	fl.StringVar(&f.turnstileExpectedHostname, "turnstile-expected-hostname", "", "expected hostname in the Turnstile Siteverify response; required when Turnstile runs against Cloudflare")
+	fl.StringVar(&f.turnstileExpectedAction, "turnstile-action", "", "expected action label in the Turnstile Siteverify response; required when Turnstile runs against Cloudflare")
+	fl.DurationVar(&f.turnstileMaxAge, "turnstile-max-age", broker.DefaultTurnstileMaxAge, "max age for a Turnstile challenge_ts before it is rejected (0 disables)")
+	fl.StringVar(&f.turnstileSitekey, "turnstile-sitekey", "", "public Cloudflare Turnstile site key; reported via /health so the viewer renders the widget (the secret is set separately via --turnstile-secret-*)")
 	fl.DurationVar(&f.sessionTTL, "session-ttl", defaultSessionTTL, "VM session token TTL")
 	fl.DurationVar(&f.deadlineGrace, "deadline-grace", defaultGrace, "lease teardown grace after VM session expiry")
 	fl.StringVar(&f.allowOrigin, "allow-origin", "", "Access-Control-Allow-Origin for the browser")
@@ -181,6 +210,8 @@ func newServeCmd() *cobra.Command {
 	fl.StringVar(&f.cfAccessTeamDomain, "cf-access-team-domain", "", "Cloudflare Access team domain, e.g. https://team.cloudflareaccess.com; enables origin-side Access JWT validation when set with --cf-access-aud")
 	fl.StringVar(&f.cfAccessAUD, "cf-access-aud", "", "Cloudflare Access application AUD tag expected in Cf-Access-Jwt-Assertion")
 	fl.StringVar(&f.cfAccessCertsURL, "cf-access-certs-url", "", "override Cloudflare Access JWKS URL (tests/dev only; defaults to <team-domain>/cdn-cgi/access/certs)")
+	fl.StringVar(&f.cfAccessDefaultCode, "cf-access-default-code", "", "invite code used when an Access-gated request sends none, so allowlisted users skip the code prompt; REQUIRES --cf-access-team-domain/--cf-access-aud and must be one of the --code values")
+	fl.StringVar(&f.defaultCode, "default-code", "", "invite code auto-applied when a session request sends none, so public visitors skip the code prompt; REQUIRES a human gate (--turnstile-secret-* or Cloudflare Access) and must be one of the --code values. Use this for a public Turnstile-gated demo (no email allowlist)")
 	fl.BoolVar(&f.trustForwardedFor, "trust-forwarded-for", false, "read client IP from X-Forwarded-For behind a trusted proxy")
 	fl.StringVar(&f.modelKeyFile, "model-key-file", "", "path to the model key file passed to the VM env")
 	fl.StringVar(&f.modelKeyEnv, "model-key-env", "", "environment variable holding the model key passed to the VM env")
@@ -193,6 +224,7 @@ func newServeCmd() *cobra.Command {
 	fl.IntVar(&f.vmDailyTurnBudget, "vm-daily-turn-budget", 0, "per-VM model round-trip ceiling per UTC day (the in-VM spend kill switch; required by the VM when a model is set)")
 	fl.DurationVar(&f.vmSessionTTL, "vm-session-ttl", 0, "per-VM session wall-clock cap (0 = VM default)")
 	fl.IntVar(&f.vmMaxMessages, "vm-max-messages-per-session", 0, "per-VM max messages per session (0 = VM default)")
+	fl.IntVar(&f.warmPoolSize, "warm-pool-size", 0, "number of pre-created warm VMs to maintain (0 = disabled)")
 	return cmd
 }
 
@@ -201,11 +233,28 @@ func runServe(cmd *cobra.Command, f *serveFlags) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	srv, handler, err := buildServer(ctx, cmd.OutOrStdout(), f)
+	srv, handler, startReaper, pool, err := buildServer(ctx, cmd.OutOrStdout(), f)
 	if err != nil {
 		return err
 	}
 	defer srv.Close()
+
+	// Start the orphan-VM reaper under a context that cancels when the serve
+	// function returns (server close / shutdown / signal).
+	reaperCtx, reaperCancel := context.WithCancel(ctx)
+	defer reaperCancel()
+	go startReaper(reaperCtx)
+
+	// Start the warm pool maintainer if enabled; drain on shutdown.
+	// INVARIANT 4: warm VMs are drained on graceful shutdown.
+	if pool != nil {
+		poolCtx, poolCancel := context.WithCancel(ctx)
+		defer func() {
+			poolCancel()
+			pool.Drain(context.Background())
+		}()
+		go pool.Run(poolCtx)
+	}
 
 	httpSrv := &http.Server{
 		Handler:           handler,
@@ -234,17 +283,17 @@ func runServe(cmd *cobra.Command, f *serveFlags) error {
 	return nil
 }
 
-func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Server, http.Handler, error) {
+func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Server, http.Handler, func(context.Context), *broker.Pool, error) {
 	if err := validateFlags(f); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	secret, err := resolveGateSecret(f.gateSecretFile, f.gateSecretEnv)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	codes, err := resolveCodes(f.codes, f.maxPerCode)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	gate, err := livechat.NewGate(livechat.GateConfig{
 		Secret:   secret,
@@ -252,40 +301,78 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 		TokenTTL: f.sessionTTL,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	token, err := resolveFlyToken(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	provider, err := newMachineProvider(ctx, f, token)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	sessionEnv, err := resolveSessionEnv(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	humanVerifier, err := resolveTurnstileVerifier(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
+	// The concurrency limiter is shared between the LeaseManager and the
+	// optional warm pool so warm + active machines never exceed the cap.
+	concLimiter := livechat.NewConcurrencyLimiter(f.concurrency)
+
+	baseEnv := buildVMBaseEnv(f)
 	lm, err := broker.NewLeaseManager(broker.LeaseConfig{
 		Provider:     provider,
-		Concurrency:  livechat.NewConcurrencyLimiter(f.concurrency),
+		Concurrency:  concLimiter,
 		Image:        f.image,
 		Region:       f.region,
 		MemoryMB:     f.memoryMB,
 		CPUs:         f.cpus,
 		InternalPort: f.internalPort,
-		BaseEnv:      buildVMBaseEnv(f),
+		BaseEnv:      baseEnv,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
+
+	// Build the optional warm pool when --warm-pool-size > 0.
+	var warmPool *broker.Pool
+	if f.warmPoolSize > 0 {
+		pool, poolErr := broker.NewPool(broker.PoolConfig{
+			Provider:    provider,
+			Concurrency: concLimiter,
+			NewVMCode: func() (string, error) {
+				return livechat.NewRandomCode(warmPoolVMCodeBytes)
+			},
+			BuildSpec: func(vmCode string) broker.MachineSpec {
+				return broker.MachineSpec{
+					Image:        f.image,
+					Env:          mergeSessionAndBaseEnv(sessionEnv, baseEnv, vmCode),
+					Region:       f.region,
+					MemoryMB:     f.memoryMB,
+					CPUs:         f.cpus,
+					InternalPort: f.internalPort,
+				}
+			},
+			Size: f.warmPoolSize,
+			Log:  out,
+		})
+		if poolErr != nil {
+			return nil, nil, nil, nil, poolErr
+		}
+		warmPool = pool
+		_, _ = fmt.Fprintf(out, "warm pool enabled: size %d\n", f.warmPoolSize)
+	}
+
 	srv, err := broker.NewServer(broker.ServerConfig{
 		Leases:             lm,
+		WarmPool:           warmPool,
 		Gate:               gate,
+		DefaultCode:        effectiveDefaultCode(f),
+		TurnstileSitekey:   f.turnstileSitekey,
 		HumanVerifier:      humanVerifier,
 		IPRate:             livechat.RateConfig{RefillPerSec: f.ipRate, Burst: f.ipBurst},
 		CodeRate:           livechat.RateConfig{RefillPerSec: f.codeRate, Burst: f.codeBurst},
@@ -299,8 +386,43 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 		AllowOrigin:        f.allowOrigin,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
+
+	// The reaper's protected-ID set is (warm pool + in-flight handoffs) UNION
+	// (active leases). INVARIANT 2: the reaper MUST NOT destroy warm or
+	// handing-off VMs.
+	//
+	// HAND-OVER-HAND ORDERING (do NOT reorder these two reads): a machine's
+	// protection moves from the pool's handoff set to the lease's active set, and
+	// the pool clears the handoff marker only AFTER AdoptWarm has registered the
+	// active lease (handleSession calls FinishHandoff after AdoptWarm). The two
+	// sets are independently locked, so this snapshot is non-atomic. We therefore
+	// read the SOURCE (warm + handoff) FIRST and the DESTINATION (active leases)
+	// SECOND: if a machine has already left handoff between the reads, it is
+	// guaranteed to be in active by the time we read active (and stays there until
+	// the session ends). Reading active first would let a machine that adopts +
+	// finishes between the two reads fall out of BOTH snapshots, and the reaper
+	// could destroy a live VM (TOCTOU).
+	activeIDsFn := func() map[string]struct{} {
+		if warmPool == nil {
+			return lm.ActiveMachineIDs()
+		}
+		ids := warmPool.WarmMachineIDs()        // source: warm + in-flight handoff, FIRST
+		for id := range lm.ActiveMachineIDs() { // destination: active leases, SECOND
+			ids[id] = struct{}{}
+		}
+		return ids
+	}
+	reaper, err := broker.NewReaper(broker.ReaperConfig{
+		Provider:  provider,
+		ActiveIDs: activeIDsFn,
+		Log:       out,
+	})
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
 	_, _ = fmt.Fprintf(out, "broker configured: %d code(s), capacity %d, image %s\n", len(codes), f.concurrency, f.image)
 
 	// The broker API lives under /api/live/*. When a static UI directory is
@@ -312,17 +434,33 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 	if strings.TrimSpace(f.staticDir) != "" {
 		mux := http.NewServeMux()
 		mux.Handle(livechat.RouteAPIPrefix, srv.Handler())
-		mux.Handle("/", http.FileServer(http.Dir(f.staticDir)))
+		mux.Handle("/", noCacheStatic(http.FileServer(http.Dir(f.staticDir))))
 		handler = mux
 		_, _ = fmt.Fprintf(out, "serving static UI from %s at /\n", f.staticDir)
 	}
-	// Stream writes indefinitely; the message route is held open for the whole
-	// model turn. Both are exempt from the write deadline (see the middleware).
-	handler = writeDeadlineMiddleware(handler, nonStreamWriteTimeout, livechat.RouteStream, livechat.RouteMessage)
+	// Per-route write deadlines. Stream writes indefinitely and the message route
+	// is held open for the whole model turn, so both are exempt (deadline 0).
+	// Session-create synchronously boots and proves a fresh per-visitor microVM;
+	// on a cold start that legitimately exceeds the default 30s (a 30s deadline
+	// made cold starts fail closed mid-response: Fly PU02 / client 502), so it
+	// gets a longer BOUNDED deadline (sessionWriteTimeout > the 60s vmReadyTimeout)
+	// rather than a full exemption — capping a slow reader without cutting off a
+	// healthy boot. Everything else gets the default fast deadline.
+	handler = writeDeadlineMiddleware(handler, nonStreamWriteTimeout, map[string]time.Duration{
+		livechat.RouteStream:  0,
+		livechat.RouteMessage: 0,
+		livechat.RouteSession: sessionWriteTimeout,
+		// The signed bundle / verify kit can be large (one receipt per action — a
+		// long session is hundreds of KB) and the VM generates it on demand, so a
+		// 30s write deadline truncates the proxied download mid-body (Fly "could
+		// not finish reading HTTP body from instance"). Give it the same long
+		// bounded budget as session-create.
+		livechat.RouteBundle: sessionWriteTimeout,
+	})
 
 	hosts, err := brokerPublicHosts(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if len(hosts) > 0 {
 		handler = hostGuard(handler, hosts)
@@ -330,13 +468,13 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 	}
 	cfAccess, err := newCFAccessVerifier(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if cfAccess != nil {
 		handler = cfAccessGuard(handler, cfAccess)
 		_, _ = fmt.Fprintf(out, "broker Cloudflare Access JWT guard enabled for %s\n", cfAccess.issuer)
 	}
-	return srv, handler, nil
+	return srv, handler, reaper.Run, warmPool, nil
 }
 
 func defaultMachineProvider(_ context.Context, f *serveFlags, flyToken string) (broker.MachineProvider, error) {
@@ -412,7 +550,46 @@ func validateFlags(f *serveFlags) error {
 	if err := validateCFAccessFlags(f); err != nil {
 		return err
 	}
+	if err := validateDefaultCode(f); err != nil {
+		return err
+	}
 	return nil
+}
+
+// effectiveDefaultCode is the server-side invite code auto-applied when a
+// session request sends none. The general --default-code wins; --cf-access-default-code
+// remains as the Access-only alias. Empty means "client must send a code".
+func effectiveDefaultCode(f *serveFlags) string {
+	if dc := strings.TrimSpace(f.defaultCode); dc != "" {
+		return dc
+	}
+	return strings.TrimSpace(f.cfAccessDefaultCode)
+}
+
+// validateDefaultCode fails closed on --default-code: like --cf-access-default-code
+// it lets visitors skip the invite-code prompt, so it is only safe behind a human
+// gate (Turnstile OR Cloudflare Access) — never with no gate / --unsafe-no-human-gate
+// alone, which would let ANYONE create sessions code-free. It must also name a real
+// --code. (--cf-access-default-code keeps its own Access-only check in validateCFAccessFlags.)
+func validateDefaultCode(f *serveFlags) error {
+	dc := strings.TrimSpace(f.defaultCode)
+	if dc == "" {
+		return nil
+	}
+	if cfdc := strings.TrimSpace(f.cfAccessDefaultCode); cfdc != "" && cfdc != dc {
+		return errors.New("set only one of --default-code or --cf-access-default-code")
+	}
+	hasTurnstile := strings.TrimSpace(f.turnstileSecretFile) != "" || strings.TrimSpace(f.turnstileSecretEnv) != ""
+	hasCFAccess := strings.TrimSpace(f.cfAccessTeamDomain) != "" || strings.TrimSpace(f.cfAccessAUD) != ""
+	if !hasTurnstile && !hasCFAccess {
+		return errors.New("--default-code requires a human gate (--turnstile-secret-file/--turnstile-secret-env or Cloudflare Access); a default code with no human gate would open the broker")
+	}
+	for _, c := range f.codes {
+		if strings.TrimSpace(c) == dc {
+			return nil
+		}
+	}
+	return errors.New("--default-code must be one of the --code values")
 }
 
 func validateAdminFlags(f *serveFlags) error {
@@ -496,8 +673,27 @@ func validateHumanGateFlags(f *serveFlags) error {
 
 func validateTurnstileFlags(f *serveFlags) error {
 	configured := strings.TrimSpace(f.turnstileSecretFile) != "" || strings.TrimSpace(f.turnstileSecretEnv) != ""
+	if f.turnstileMaxAge < 0 {
+		return errors.New("--turnstile-max-age must be >= 0")
+	}
 	if !configured && strings.TrimSpace(f.turnstileVerifyURL) != "" {
 		return errors.New("--turnstile-verify-url requires --turnstile-secret-file or --turnstile-secret-env")
+	}
+	// The endpoint is Cloudflare's production Siteverify when no override is set
+	// OR the override explicitly points at challenges.cloudflare.com. In that
+	// case the hostname + action bindings are mandatory, not advisory: without
+	// them a token solved for another page/action could be replayed against this
+	// broker. Only a non-Cloudflare override (a local dev/test stub) is exempt.
+	cloudflareEndpoint := strings.TrimSpace(f.turnstileVerifyURL) == ""
+	if v := strings.TrimSpace(f.turnstileVerifyURL); v != "" {
+		if u, err := url.Parse(v); err == nil && strings.EqualFold(strings.TrimSuffix(u.Hostname(), "."), "challenges.cloudflare.com") {
+			cloudflareEndpoint = true
+		}
+	}
+	if configured && cloudflareEndpoint {
+		if strings.TrimSpace(f.turnstileExpectedHostname) == "" || strings.TrimSpace(f.turnstileExpectedAction) == "" {
+			return errors.New("--turnstile-expected-hostname and --turnstile-action are required when Turnstile is enabled against Cloudflare (use a non-Cloudflare --turnstile-verify-url for dev/test only)")
+		}
 	}
 	if strings.TrimSpace(f.turnstileVerifyURL) == "" {
 		return nil
@@ -744,6 +940,11 @@ func brokerPublicHosts(f *serveFlags) ([]string, error) {
 			return nil, fmt.Errorf("--allow-origin host: %w", err)
 		}
 	}
+	if len(hosts) == 0 && f.turnstileExpectedHostname != "" {
+		if err := add(f.turnstileExpectedHostname); err != nil {
+			return nil, fmt.Errorf("--turnstile-expected-hostname: %w", err)
+		}
+	}
 	return hosts, nil
 }
 
@@ -776,18 +977,33 @@ func normalizePublicHost(raw string) (string, error) {
 // than the deadline) before the response is written. Those long-lived routes
 // are bounded instead by the session TTL and the upstream/edge connection
 // timeouts, not by this deadline.
-func writeDeadlineMiddleware(next http.Handler, timeout time.Duration, exemptPaths ...string) http.Handler {
-	exempt := make(map[string]struct{}, len(exemptPaths))
-	for _, p := range exemptPaths {
-		exempt[p] = struct{}{}
-	}
+// noCacheStatic sets Cache-Control: no-cache on static viewer assets so the
+// browser revalidates them (via ETag/Last-Modified) on every load instead of
+// serving a stale copy from disk cache. The demo updates the viewer (HTML/JS/CSS)
+// in place behind the same paths, so without revalidation a redeploy leaves
+// visitors on a stale viewer — e.g. old example prompts after the assets change.
+// no-cache (revalidate), not no-store, keeps 304s cheap when nothing changed.
+func noCacheStatic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeDeadlineMiddleware(next http.Handler, defaultTimeout time.Duration, overrides map[string]time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rc := http.NewResponseController(w)
-		if _, ok := exempt[r.URL.Path]; ok {
-			// Long-lived route: clear any inherited deadline.
+		d, ok := overrides[r.URL.Path]
+		switch {
+		case ok && d <= 0:
+			// Exempt long-lived route: clear any inherited deadline.
 			_ = rc.SetWriteDeadline(time.Time{})
-		} else {
-			_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+		case ok:
+			// Route-specific bounded deadline (e.g. session-create's long
+			// cold-start budget). Still bounded so a slow reader can't pin us.
+			_ = rc.SetWriteDeadline(time.Now().Add(d))
+		default:
+			_ = rc.SetWriteDeadline(time.Now().Add(defaultTimeout))
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -830,6 +1046,25 @@ type cfAccessVerifier struct {
 func validateCFAccessFlags(f *serveFlags) error {
 	team := strings.TrimSpace(f.cfAccessTeamDomain)
 	aud := strings.TrimSpace(f.cfAccessAUD)
+	// --cf-access-default-code lets Access-gated users skip the invite code.
+	// Fail closed: it is only safe behind the Access JWT gate (without it, a
+	// default code would let ANYONE create sessions code-free), and it must name
+	// a real configured code so the gate can redeem it.
+	if dc := strings.TrimSpace(f.cfAccessDefaultCode); dc != "" {
+		if team == "" || aud == "" {
+			return errors.New("--cf-access-default-code requires --cf-access-team-domain and --cf-access-aud (a default code without a human gate would open the broker)")
+		}
+		found := false
+		for _, c := range f.codes {
+			if strings.TrimSpace(c) == dc {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("--cf-access-default-code must be one of the --code values")
+		}
+	}
 	if team == "" && aud == "" {
 		if strings.TrimSpace(f.cfAccessCertsURL) != "" {
 			return errors.New("--cf-access-certs-url requires --cf-access-team-domain and --cf-access-aud")
@@ -1093,6 +1328,21 @@ func buildVMBaseEnv(f *serveFlags) map[string]string {
 	return env
 }
 
+// mergeSessionAndBaseEnv builds the full VM environment for a warm-pool VM:
+// baseEnv (shared config) + sessionEnv (per-session secrets) + the per-VM
+// invite code. Mirrors the layering that handleSession does for cold-path VMs.
+func mergeSessionAndBaseEnv(sessionEnv, baseEnv map[string]string, vmCode string) map[string]string {
+	out := make(map[string]string, len(baseEnv)+len(sessionEnv)+1)
+	for k, v := range baseEnv {
+		out[k] = v
+	}
+	for k, v := range sessionEnv {
+		out[k] = v
+	}
+	out["PLAYGROUND_CODE"] = vmCode
+	return out
+}
+
 func resolveTurnstileVerifier(f *serveFlags) (broker.HumanVerifier, error) {
 	file := strings.TrimSpace(f.turnstileSecretFile)
 	envName := strings.TrimSpace(f.turnstileSecretEnv)
@@ -1113,13 +1363,17 @@ func resolveTurnstileVerifier(f *serveFlags) (broker.HumanVerifier, error) {
 		return nil, err
 	}
 	inner := broker.TurnstileVerifier{
-		Secret:    secretValue,
-		VerifyURL: strings.TrimSpace(f.turnstileVerifyURL),
-		Client:    &http.Client{Timeout: 5 * time.Second},
+		Secret:           secretValue,
+		VerifyURL:        strings.TrimSpace(f.turnstileVerifyURL),
+		Client:           &http.Client{Timeout: 5 * time.Second},
+		ExpectedHostname: strings.TrimSpace(f.turnstileExpectedHostname),
+		ExpectedAction:   strings.TrimSpace(f.turnstileExpectedAction),
+		MaxAge:           f.turnstileMaxAge,
 	}
 	return &broker.ReplayGuardVerifier{
-		Inner: inner,
-		Seen:  broker.NewSeenTokens(0, nil),
+		Inner:  inner,
+		Seen:   broker.NewSeenTokens(0, nil),
+		Failed: broker.NewSeenTokens(broker.DefaultFailedTokenTTL, nil),
 	}, nil
 }
 

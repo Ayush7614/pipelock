@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/playground"
 	"github.com/luckyPipewrench/pipelock/internal/playground/livechat"
 )
 
@@ -33,6 +34,33 @@ const (
 	vmInviteCodeBytes   = 18
 
 	envVMInviteCode = "PLAYGROUND_CODE"
+
+	// maxArtifactBytes caps the per-artifact size of the raw sealed bundle the
+	// broker will cache. The bundle is signed JSON/tar.gz; 16 MiB is generous.
+	maxArtifactBytes = 16 << 20 // 16 MiB
+
+	// maxKitBytes caps the per-artifact size of a verify kit (os != ""), which
+	// bundles a platform verifier binary alongside the signed run and is much
+	// larger than the raw bundle. Kept separate so a future notarized/universal
+	// build cannot silently exceed the bundle cap and fail on one platform only.
+	maxKitBytes = 64 << 20 // 64 MiB
+
+	// maxArtifactCacheEntries bounds the total number of cached artifacts to
+	// prevent unbounded memory growth. A single session can hold up to four
+	// entries (the raw bundle plus a per-OS verify kit each), so this is sized
+	// well above the global daily session budget to keep a traffic spike from
+	// evicting one visitor's artifact before they re-download within the cache
+	// TTL. Each entry is capped at maxArtifactBytes, bounding worst-case memory.
+	maxArtifactCacheEntries = 256
+
+	// maxArtifactCacheBytes bounds the total resident size of all cached
+	// artifacts independent of the entry count, so many concurrent large verify
+	// kits cannot exhaust memory. The oldest entries are evicted to stay under it.
+	maxArtifactCacheBytes = 512 << 20 // 512 MiB
+
+	// artifactFetchTimeout bounds a single detached artifact fetch so a stalled
+	// VM cannot pin a goroutine, memory, or the per-token in-flight counter.
+	artifactFetchTimeout = 90 * time.Second
 
 	// defaultVMReadyTimeout bounds the broker's whole VM session-create retry
 	// window. A freshly leased VM reports "started" (Firecracker booted) before it
@@ -53,8 +81,23 @@ const (
 type ServerConfig struct {
 	// Leases owns VM lifecycle and the global machine concurrency cap. Required.
 	Leases *LeaseManager
+	// WarmPool is the optional pre-created VM pool. When set, handleSession
+	// tries to acquire a warm VM before falling back to the synchronous
+	// Lease() create path. Nil disables warm-pool handout.
+	WarmPool *Pool
 	// Gate validates public invite codes before a VM is leased. Required.
 	Gate *livechat.Gate
+	// DefaultCode, when non-empty, is the invite code used when a session request
+	// arrives with no code. It MUST be one of the Gate's configured codes, and is
+	// only safe to set when a human gate (Turnstile or Cloudflare Access) protects
+	// session creation — the caller (main) enforces that. Empty means a code is
+	// always required. It is never sent to clients.
+	DefaultCode string
+	// TurnstileSitekey is the PUBLIC Cloudflare Turnstile site key, reported via
+	// /health so the viewer can render the widget. Empty means no Turnstile
+	// widget (Access-gated or unsafe-no-gate deploy). The secret is held by
+	// HumanVerifier, never here.
+	TurnstileSitekey string
 	// HumanVerifier validates a browser proof before invite-code redemption and
 	// VM lease. Nil disables this gate for private/Access-gated deployments.
 	HumanVerifier HumanVerifier
@@ -107,12 +150,31 @@ type Server struct {
 
 	killed atomic.Bool
 
+	// bundleCache holds sealed artifacts so re-downloads and kit-then-raw
+	// flows survive VM teardown. Keyed by (token, os).
+	bundleCache *artifactCache
+
 	mu       sync.Mutex
 	tokens   map[string]*tokenLease
 	bySess   map[string]string
 	starts   []time.Time
 	closed   bool
 	reapDone chan struct{}
+
+	// bundleInflight counts in-flight bundle-download requests per token, and
+	// bundleSealed records tokens whose artifact is durably cached. Together
+	// they hold the VM until every concurrent download for a token finishes, so
+	// a fast variant (raw bundle, a double-click, a second tab) cannot
+	// release/destroy the VM while another variant is still being fetched. Both
+	// are guarded by mu.
+	bundleInflight map[string]int
+	bundleSealed   map[string]bool
+	bundleFailed   map[string]bool
+	// fetchMu serializes concurrent identical (token, os) cache misses so only
+	// one request reads a full artifact from the VM into memory. Entries are
+	// removed after the last waiter leaves so long-running brokers cannot grow
+	// one lock per historical session. Guarded by mu.
+	fetchMu map[artifactCacheKey]*artifactFetchLock
 }
 
 type tokenLease struct {
@@ -120,6 +182,118 @@ type tokenLease struct {
 	sessionKey string
 	lease      *Lease
 	deadline   time.Time
+}
+
+// artifactCacheKey identifies a cached artifact by session token and OS
+// variant (empty string = the raw .tar.gz bundle).
+type artifactCacheKey struct {
+	token string
+	os    string
+}
+
+type artifactFetchLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// artifactCacheEntry holds a single sealed artifact served to visitors.
+type artifactCacheEntry struct {
+	body               []byte
+	contentType        string
+	contentDisposition string
+	insertedAt         time.Time
+}
+
+// artifactCache is a bounded in-memory cache for sealed session artifacts,
+// keyed by (token, os). It survives VM teardown so re-downloads and kit-then-
+// raw flows work after the VM is destroyed.
+type artifactCache struct {
+	mu       sync.Mutex
+	entries  map[artifactCacheKey]*artifactCacheEntry
+	ttl      time.Duration
+	curBytes int64
+}
+
+func newArtifactCache(ttl time.Duration) *artifactCache {
+	return &artifactCache{
+		entries: make(map[artifactCacheKey]*artifactCacheEntry),
+		ttl:     ttl,
+	}
+}
+
+// evictLocked removes an entry and decrements the byte total. Caller holds mu.
+// It is safe to call inside a range over c.entries (Go permits delete-on-range).
+func (c *artifactCache) evictLocked(key artifactCacheKey) {
+	if e, ok := c.entries[key]; ok {
+		c.curBytes -= int64(len(e.body))
+		delete(c.entries, key)
+	}
+}
+
+// get returns the cached artifact for the key, or nil if absent/expired.
+func (c *artifactCache) get(key artifactCacheKey) *artifactCacheEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return nil
+	}
+	if time.Since(e.insertedAt) > c.ttl {
+		c.evictLocked(key)
+		return nil
+	}
+	return e
+}
+
+// put stores an artifact, evicting expired entries first and then the oldest
+// entries until both the entry-count cap AND the total-byte budget are
+// satisfied. The byte budget bounds worst-case memory regardless of how many
+// large verify kits are cached at once.
+func (c *artifactCache) put(key artifactCacheKey, e *artifactCacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Replace any existing entry for this key (adjust the byte total).
+	c.evictLocked(key)
+	// Evict expired entries.
+	now := time.Now()
+	for k, v := range c.entries {
+		if now.Sub(v.insertedAt) > c.ttl {
+			c.evictLocked(k)
+		}
+	}
+	// Evict the oldest entries until within both the entry and byte budgets.
+	newBytes := int64(len(e.body))
+	for len(c.entries) >= maxArtifactCacheEntries ||
+		(len(c.entries) > 0 && c.curBytes+newBytes > maxArtifactCacheBytes) {
+		var oldestKey artifactCacheKey
+		var oldestTime time.Time
+		first := true
+		for k, v := range c.entries {
+			if first || v.insertedAt.Before(oldestTime) {
+				oldestKey, oldestTime, first = k, v.insertedAt, false
+			}
+		}
+		if first {
+			break
+		}
+		c.evictLocked(oldestKey)
+	}
+	c.entries[key] = e
+	c.curBytes += newBytes
+}
+
+// len returns the number of entries (for testing).
+func (c *artifactCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}
+
+// bytesLen returns the tracked total cached bytes (for testing).
+func (c *artifactCache) bytesLen() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.curBytes
 }
 
 type sessionRequest struct {
@@ -177,6 +351,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if vmReadyTimeout <= 0 {
 		vmReadyTimeout = defaultVMReadyTimeout
 	}
+	// The artifact cache TTL covers the session TTL plus generous grace for
+	// re-downloads. 10 minutes is safe: cached bytes are the visitor-facing
+	// signed artifact (offline-verifiable), not secrets.
+	const artifactCacheTTL = 10 * time.Minute
 	s := &Server{
 		cfg:            cfg,
 		ipRate:         livechat.NewRateLimiter(cfg.IPRate),
@@ -186,6 +364,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		global:         livechat.NewDailyBudget(cfg.GlobalDailyBudget),
 		client:         client,
 		vmReadyTimeout: vmReadyTimeout,
+		bundleCache:    newArtifactCache(artifactCacheTTL),
 		tokens:         make(map[string]*tokenLease),
 		bySess:         make(map[string]string),
 		reapDone:       make(chan struct{}),
@@ -227,15 +406,24 @@ func (s *Server) Close() {
 	}
 }
 
-// Kill refuses new sessions/messages and releases every active lease.
+// Kill refuses new sessions/messages, releases every active lease, and drains
+// the warm pool (so a killed broker holds no standing compute/spend and does not
+// keep replenishing warm VMs).
 func (s *Server) Kill() {
 	s.killed.Store(true)
 	s.releaseAll()
+	if s.cfg.WarmPool != nil {
+		s.cfg.WarmPool.Pause(context.Background())
+	}
 }
 
-// Resume clears the kill switch for future sessions.
+// Resume clears the kill switch for future sessions and re-enables warm-pool
+// refill.
 func (s *Server) Resume() {
 	s.killed.Store(false)
+	if s.cfg.WarmPool != nil {
+		s.cfg.WarmPool.Resume()
+	}
 }
 
 // Killed reports whether the broker emergency stop is active.
@@ -260,6 +448,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"budget_remaining":           s.global.Remaining(),
 		"killed":                     s.killed.Load(),
 		"session_starts_last_minute": s.sessionStartsSince(time.Now(), time.Minute),
+		// code_required is false when a server-side DefaultCode is configured
+		// (Access-gated deploys): the viewer then auto-starts instead of
+		// prompting for an invite code.
+		"code_required": s.cfg.DefaultCode == "",
+		// turnstile_sitekey is the public site key (empty if no Turnstile gate);
+		// the viewer renders the widget and sends turnstile_token when present.
+		"turnstile_sitekey": s.cfg.TurnstileSitekey,
 	})
 }
 
@@ -288,8 +483,22 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeBrokerErr(w, http.StatusBadRequest, "bad request")
 		return
 	}
-	if body.Code == "" {
-		writeBrokerErr(w, http.StatusForbidden, "invite code rejected")
+	// An empty client code falls back to the configured DefaultCode. DefaultCode is
+	// only ever set when a human gate (Turnstile or Cloudflare Access) protects
+	// session creation, so the human proof — not the invite-code prompt — is the
+	// public authorization step. The default code is server-side only (never
+	// embedded in client JS). When no DefaultCode is configured, an empty code is
+	// still rejected.
+	code := body.Code
+	if code == "" {
+		code = s.cfg.DefaultCode
+	}
+	if code == "" {
+		writeBrokerErr(w, http.StatusUnauthorized, "invite code rejected")
+		return
+	}
+	if !s.global.Open() {
+		writeBrokerErr(w, http.StatusServiceUnavailable, "daily limit reached, the demo is paused until tomorrow")
 		return
 	}
 	if s.cfg.HumanVerifier != nil {
@@ -300,18 +509,12 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	codeLimiterKey := "code:" + codeKey(body.Code)
-	if !s.codeRate.Allow(codeLimiterKey) {
-		writeBrokerErr(w, http.StatusTooManyRequests, "rate limited")
-		return
-	}
-
 	sessionKey, err := newBrokerSessionKey()
 	if err != nil {
 		writeBrokerErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	_, claims, err := s.cfg.Gate.Redeem(body.Code, sessionKey)
+	_, claims, err := s.cfg.Gate.Redeem(code, sessionKey)
 	if err != nil {
 		writeBrokerErr(w, gateStatus(err), "invite code rejected")
 		return
@@ -324,6 +527,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rollback = append(rollback, func() { s.cfg.Gate.Refund(claims) })
+
+	codeLimiterKey := "code:" + claims.CodeID
+	if !s.codeRate.Allow(codeLimiterKey) {
+		undo()
+		writeBrokerErr(w, http.StatusTooManyRequests, "rate limited")
+		return
+	}
 
 	ipBudgetKey := "ip:" + ip
 	codeBudgetKey := "code:" + claims.CodeID
@@ -348,22 +558,51 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	rollback = append(rollback, func() { s.global.Refund(1) })
 
-	vmCode, err := livechat.NewRandomCode(vmInviteCodeBytes)
-	if err != nil {
-		undo()
-		writeBrokerErr(w, http.StatusInternalServerError, "internal error")
-		return
+	// Try the warm pool first for instant handout; fall through to the
+	// synchronous create path if the pool is empty or disabled.
+	//
+	// INVARIANT 3: a visitor NEVER fails because the pool is empty.
+	var lease *Lease
+	var vmCode string
+	if s.cfg.WarmPool != nil {
+		if wm, wc, wRelease, ok := s.cfg.WarmPool.Acquire(); ok {
+			vmCode = wc
+			adopted, adoptErr := s.cfg.Leases.AdoptWarm(sessionKey, wm, wRelease)
+			if adoptErr != nil {
+				// Adoption failed (e.g. duplicate key race). Destroy the warm VM
+				// and release the slot so neither leaks.
+				_ = s.cfg.Leases.cfg.Provider.DestroyMachine(context.WithoutCancel(r.Context()), wm.ID)
+				wRelease()
+			} else {
+				lease = adopted
+			}
+			// Clear the in-flight handoff marker now that the machine is either an
+			// active lease (protected by ActiveMachineIDs) or destroyed. Closes the
+			// reaper TOCTOU window opened by Acquire.
+			s.cfg.WarmPool.FinishHandoff(wm.ID)
+		}
 	}
-	sessionEnv := mergeEnv(s.cfg.SessionEnv, map[string]string{envVMInviteCode: vmCode})
-	lease, err := s.cfg.Leases.Lease(r.Context(), sessionKey, sessionEnv)
-	if err != nil {
-		undo()
-		if errors.Is(err, ErrAtCapacity) {
-			writeBrokerErr(w, http.StatusServiceUnavailable, "at capacity, try again")
+	if lease == nil {
+		// Cold path: mint a fresh vmCode, create a VM synchronously.
+		var codeErr error
+		vmCode, codeErr = livechat.NewRandomCode(vmInviteCodeBytes)
+		if codeErr != nil {
+			undo()
+			writeBrokerErr(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		writeBrokerErr(w, http.StatusServiceUnavailable, "session could not be started")
-		return
+		sessionEnv := mergeEnv(s.cfg.SessionEnv, map[string]string{envVMInviteCode: vmCode})
+		var leaseErr error
+		lease, leaseErr = s.cfg.Leases.Lease(r.Context(), sessionKey, sessionEnv)
+		if leaseErr != nil {
+			undo()
+			if errors.Is(leaseErr, ErrAtCapacity) {
+				writeBrokerErr(w, http.StatusServiceUnavailable, "at capacity, try again")
+				return
+			}
+			writeBrokerErr(w, http.StatusServiceUnavailable, "session could not be started")
+			return
+		}
 	}
 
 	resp, expiresAt, err := s.createVMSession(r.Context(), lease, vmCode)
@@ -474,17 +713,266 @@ func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 		writeBrokerErr(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
-	token := r.URL.Query().Get("token")
-	binding := s.lookupToken(token)
+	queryToken := r.URL.Query().Get("token")
+	osParam := r.URL.Query().Get("os")
+	if osParam != "" {
+		normalized, err := playground.ParseVerifyKitOS(osParam)
+		if err != nil {
+			writeBrokerErr(w, http.StatusBadRequest, "unsupported verify kit")
+			return
+		}
+		osParam = string(normalized)
+	}
+
+	// Cache HIT: serve the cached artifact without touching the VM. This
+	// makes re-downloads and kit-then-raw flows work after VM teardown.
+	cacheKey := artifactCacheKey{token: queryToken, os: osParam}
+	if cached := s.bundleCache.get(cacheKey); cached != nil {
+		w.Header().Set("Content-Type", cached.contentType)
+		w.Header().Set("Content-Disposition", cached.contentDisposition)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached.body)
+		return
+	}
+
+	// Cache MISS: the VM must still be alive to fetch the artifact.
+	binding := s.lookupToken(queryToken)
 	if binding == nil {
 		writeBrokerErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	rec := &statusRecorder{ResponseWriter: w}
-	s.proxy(rec, r, binding, false)
-	if rec.status == http.StatusOK {
-		s.releaseToken(context.WithoutCancel(r.Context()), token)
+
+	// Mark this request in-flight for the token so a concurrent download of a
+	// different variant (raw bundle + OS kit, a double-click, two tabs, browser
+	// prefetch/retry) cannot release/destroy the VM while another fetch is still
+	// running. The VM is released only when the LAST in-flight request for the
+	// token finishes AND an artifact has been durably sealed into the cache.
+	s.bundleEnter(queryToken)
+	defer func() {
+		if s.bundleLeave(queryToken) {
+			s.releaseToken(context.WithoutCancel(r.Context()), queryToken)
+		}
+	}()
+
+	// Coalesce concurrent identical (token, os) misses so only ONE request reads
+	// a full artifact from the VM into memory; the others serialize on this
+	// per-variant lock and then read the cache the leader populated.
+	fm := s.bundleFetchLock(cacheKey)
+	defer s.bundleFetchUnlock(cacheKey, fm)
+	if cached := s.bundleCache.get(cacheKey); cached != nil {
+		w.Header().Set("Content-Type", cached.contentType)
+		w.Header().Set("Content-Disposition", cached.contentDisposition)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached.body)
+		return
 	}
+
+	// Detach the fetch from request cancellation so a client disconnect mid-fetch
+	// cannot abort populating the durable cache, but bound it with a hard timeout
+	// so a stalled VM cannot pin a goroutine or the in-flight counter forever.
+	fetchCtx, cancelFetch := context.WithTimeout(context.WithoutCancel(r.Context()), artifactFetchTimeout)
+	defer cancelFetch()
+
+	// Fetch the requested artifact variant from the VM.
+	fetched, fetchErr := s.fetchVMArtifact(fetchCtx, binding.lease, queryToken, osParam)
+	if fetchErr != nil {
+		// Propagate without sealing so the VM is retained for retry.
+		s.bundleMarkFailed(queryToken)
+		writeBrokerErr(w, http.StatusBadGateway, "session proxy unavailable")
+		return
+	}
+	if fetched.status != http.StatusOK {
+		// Non-200 from the VM (e.g. 503 seal failure): propagate and do NOT
+		// seal. The visitor can retry while the VM still lives.
+		s.bundleMarkFailed(queryToken)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fetched.status)
+		_, _ = w.Write(fetched.body)
+		return
+	}
+
+	// Store the successfully fetched artifact in the cache and mark the token
+	// sealed so the VM may be released once all in-flight requests finish.
+	s.bundleCache.put(cacheKey, &artifactCacheEntry{
+		body:               fetched.body,
+		contentType:        fetched.contentType,
+		contentDisposition: fetched.contentDisposition,
+		insertedAt:         time.Now(),
+	})
+
+	// Also prefetch the raw bundle (os="") into the cache so a later
+	// raw-bundle download succeeds even after the VM is gone.
+	sealToken := true
+	if osParam != "" {
+		rawKey := artifactCacheKey{token: queryToken, os: ""}
+		if s.bundleCache.get(rawKey) == nil {
+			if raw, rawErr := s.fetchVMArtifact(fetchCtx, binding.lease, queryToken, ""); rawErr == nil && raw.status == http.StatusOK {
+				s.bundleCache.put(rawKey, &artifactCacheEntry{
+					body:               raw.body,
+					contentType:        raw.contentType,
+					contentDisposition: raw.contentDisposition,
+					insertedAt:         time.Now(),
+				})
+			} else {
+				sealToken = false
+				s.bundleMarkFailed(queryToken)
+			}
+		}
+	}
+	if sealToken {
+		s.bundleSeal(queryToken)
+	}
+
+	// Serve the fetched artifact to the client. VM release happens in the
+	// deferred bundleLeave once the last in-flight request for the token ends.
+	w.Header().Set("Content-Type", fetched.contentType)
+	w.Header().Set("Content-Disposition", fetched.contentDisposition)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(fetched.body)
+}
+
+// bundleEnter records a handleBundle request as in-flight for the token so the
+// VM is not released while a concurrent artifact fetch for the same token is
+// still running.
+func (s *Server) bundleEnter(token string) {
+	s.mu.Lock()
+	if s.bundleInflight == nil {
+		s.bundleInflight = make(map[string]int)
+	}
+	s.bundleInflight[token]++
+	s.mu.Unlock()
+}
+
+// bundleFetchLock locks the per-(token, os) mutex used to coalesce concurrent
+// identical cache misses so only one request fetches the artifact from the VM.
+// The returned lock must be released with bundleFetchUnlock.
+func (s *Server) bundleFetchLock(key artifactCacheKey) *artifactFetchLock {
+	s.mu.Lock()
+	if s.fetchMu == nil {
+		s.fetchMu = make(map[artifactCacheKey]*artifactFetchLock)
+	}
+	m := s.fetchMu[key]
+	if m == nil {
+		m = &artifactFetchLock{}
+		s.fetchMu[key] = m
+	}
+	m.refs++
+	s.mu.Unlock()
+	m.mu.Lock()
+	return m
+}
+
+func (s *Server) bundleFetchUnlock(key artifactCacheKey, m *artifactFetchLock) {
+	m.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m.refs--
+	if m.refs == 0 && s.fetchMu[key] == m {
+		delete(s.fetchMu, key)
+	}
+}
+
+// bundleSeal records that an artifact for the token has been durably cached, so
+// the VM may be released once all in-flight requests finish.
+func (s *Server) bundleSeal(token string) {
+	s.mu.Lock()
+	if s.bundleSealed == nil {
+		s.bundleSealed = make(map[string]bool)
+	}
+	s.bundleSealed[token] = true
+	s.mu.Unlock()
+}
+
+func (s *Server) bundleMarkFailed(token string) {
+	s.mu.Lock()
+	if s.bundleFailed == nil {
+		s.bundleFailed = make(map[string]bool)
+	}
+	s.bundleFailed[token] = true
+	s.mu.Unlock()
+}
+
+// bundleLeave decrements the in-flight count for the token. It returns true if
+// this was the last in-flight request, an artifact was sealed, and no concurrent
+// artifact fetch failed, meaning the caller should release the VM now. If any
+// fetch in the wave failed, the VM is retained for retry and the reaper reclaims
+// it at TTL. This preserves the "try another variant / retry the failed
+// download" path instead of letting one successful variant tear down the VM
+// behind a concurrent failed one.
+func (s *Server) bundleLeave(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bundleInflight[token]--
+	if s.bundleInflight[token] > 0 {
+		return false
+	}
+	delete(s.bundleInflight, token)
+	sealed := s.bundleSealed[token]
+	failed := s.bundleFailed[token]
+	delete(s.bundleFailed, token)
+	if failed {
+		return false
+	}
+	delete(s.bundleSealed, token)
+	return sealed
+}
+
+// vmArtifact holds the result of a direct bounded GET to the VM's bundle route.
+type vmArtifact struct {
+	status             int
+	body               []byte
+	contentType        string
+	contentDisposition string
+}
+
+// fetchVMArtifact makes a bounded HTTP GET to the VM's bundle endpoint and
+// reads the full response body into memory. It does NOT use the streaming
+// reverse proxy because the broker needs the complete body to cache it.
+func (s *Server) fetchVMArtifact(ctx context.Context, lease *Lease, vmToken, osParam string) (vmArtifact, error) {
+	target, err := s.targetURL(lease, livechat.RouteBundle)
+	if err != nil {
+		return vmArtifact{}, err
+	}
+	q := target.Query()
+	q.Set("token", vmToken)
+	if osParam != "" {
+		q.Set("os", osParam)
+	}
+	target.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return vmArtifact{}, fmt.Errorf("broker: build bundle request: %w", err)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return vmArtifact{}, fmt.Errorf("broker: fetch bundle: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Verify kits (os != "") bundle a platform verifier binary and are far
+	// larger than the raw bundle, so they get a separate, higher cap.
+	sizeCap := int64(maxArtifactBytes)
+	if osParam != "" {
+		sizeCap = int64(maxKitBytes)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, sizeCap+1))
+	if err != nil {
+		return vmArtifact{}, fmt.Errorf("broker: read bundle body: %w", err)
+	}
+	if int64(len(body)) > sizeCap {
+		return vmArtifact{}, fmt.Errorf("broker: bundle body exceeds %d bytes", sizeCap)
+	}
+
+	return vmArtifact{
+		status:             resp.StatusCode,
+		body:               body,
+		contentType:        resp.Header.Get("Content-Type"),
+		contentDisposition: resp.Header.Get("Content-Disposition"),
+	}, nil
 }
 
 func (s *Server) createVMSession(ctx context.Context, lease *Lease, code string) (vmSessionResponse, time.Time, error) {
@@ -826,7 +1314,11 @@ func gateStatus(err error) int {
 	if errors.Is(err, livechat.ErrGateClosed) {
 		return http.StatusServiceUnavailable
 	}
-	return http.StatusForbidden
+	// An invite-code redemption failure is an authentication problem (a bad or
+	// spent code), distinct from the human-verification gate (403). Returning
+	// 401 lets the viewer tell the visitor to fix their code rather than retry
+	// the human check.
+	return http.StatusUnauthorized
 }
 
 func codeKey(code string) string {

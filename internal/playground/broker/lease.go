@@ -169,6 +169,43 @@ func (lm *LeaseManager) ActiveLeases() int {
 	return len(lm.leases)
 }
 
+// AdoptWarm registers an already-created warm-pool VM as an active lease for
+// sessionKey, without creating a new machine or acquiring a concurrency slot
+// (the pool already holds the slot and transfers it via release). This is the
+// handout path that skips the cold-start cost.
+func (lm *LeaseManager) AdoptWarm(sessionKey string, machine *Machine, release func()) (*Lease, error) {
+	if sessionKey == "" {
+		return nil, errors.New("broker: empty session key")
+	}
+	if machine == nil {
+		return nil, errors.New("broker: nil machine for AdoptWarm")
+	}
+	lease := &Lease{SessionKey: sessionKey, Machine: machine, release: release}
+	lm.mu.Lock()
+	if _, exists := lm.leases[sessionKey]; exists {
+		lm.mu.Unlock()
+		return nil, ErrDuplicateLease
+	}
+	lm.leases[sessionKey] = lease
+	lm.mu.Unlock()
+	return lease, nil
+}
+
+// ActiveMachineIDs returns a snapshot of machine IDs currently held in active
+// leases. The reaper uses this to distinguish machines that are in use from
+// orphans.
+func (lm *LeaseManager) ActiveMachineIDs() map[string]struct{} {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	ids := make(map[string]struct{}, len(lm.leases))
+	for _, lease := range lm.leases {
+		if lease.Machine != nil {
+			ids[lease.Machine.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
 // mergeEnv returns base overlaid with over (over wins). Neither input is
 // mutated. A nil result is fine for the provider (no env).
 func mergeEnv(base, over map[string]string) map[string]string {

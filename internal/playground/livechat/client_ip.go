@@ -7,10 +7,17 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strings"
 )
 
 const cfConnectingIPHeader = "CF-Connecting-IP"
+
+// flyClientIPHeader is set by Fly.io's proxy to the address that connected to
+// Fly's edge. The app is reachable only through that proxy, which overwrites any
+// client-supplied value, so this header is trustworthy for identifying the
+// immediate upstream (e.g. Cloudflare) in front of Fly.
+const flyClientIPHeader = "Fly-Client-IP"
 
 // cloudflareProxyPrefixes is a snapshot of Cloudflare's published proxy IP
 // ranges used to validate CF-Connecting-IP headers. These are NOT fetched at
@@ -72,12 +79,49 @@ func ClientIPExact(r *http.Request, trustForwardedFor bool) string {
 	if ip := cloudflareConnectingIP(r, peer); ip != "" {
 		return ip
 	}
+	// Cloudflare-behind-Fly path: on Fly.io the direct peer is Fly's internal
+	// proxy, not Cloudflare, so the direct-peer check above fails and every
+	// visitor would otherwise collapse into one rate/budget bucket. Fly sets
+	// Fly-Client-IP to whoever connected to its edge; when that is a Cloudflare
+	// proxy IP, Cloudflare is the immediate upstream and CF-Connecting-IP is
+	// trustworthy. This path is gated on Fly runtime indicators so a non-Fly
+	// reverse proxy that forwards client-supplied headers cannot forge identity.
+	if ip := cloudflareBehindEdgeIP(r, peer); ip != "" {
+		return ip
+	}
 	if trustForwardedFor {
 		if ip := firstForwardedFor(r.Header.Get("X-Forwarded-For")); ip != "" {
 			return ip
 		}
 	}
 	return peer
+}
+
+// cloudflareBehindEdgeIP trusts CF-Connecting-IP when the request reached us
+// through a front edge (Fly) whose own client-IP header reports a Cloudflare
+// proxy address. Returns "" when the edge header is absent or is not Cloudflare,
+// or when CF-Connecting-IP is missing or unparseable.
+func cloudflareBehindEdgeIP(r *http.Request, peer string) string {
+	if !runningOnFly() {
+		return ""
+	}
+	// Only honor Fly-Client-IP when the DIRECT peer is a private/loopback address
+	// — i.e. the request actually arrived through a co-located front proxy (Fly's
+	// internal proxy connects from a private ULA address). A directly-exposed
+	// deployment sees the real client as the peer (a public address), so a forged
+	// Fly-Client-IP from such a client is ignored and cannot mint a fake identity.
+	if a, err := netip.ParseAddr(peer); err != nil || (!a.IsPrivate() && !a.IsLoopback()) {
+		return ""
+	}
+	edge := strings.TrimSpace(r.Header.Get(flyClientIPHeader))
+	if edge == "" || !isCloudflareProxy(edge) {
+		return ""
+	}
+	return parseCFConnectingIP(r)
+}
+
+func runningOnFly() bool {
+	return os.Getenv("FLY_APP_NAME") != "" || os.Getenv("FLY_MACHINE_ID") != ""
 }
 
 // abuseBucket collapses an IPv6 address to its /64 network so rotating within a
@@ -100,6 +144,10 @@ func cloudflareConnectingIP(r *http.Request, peer string) string {
 	if !isCloudflareProxy(peer) {
 		return ""
 	}
+	return parseCFConnectingIP(r)
+}
+
+func parseCFConnectingIP(r *http.Request) string {
 	raw := strings.TrimSpace(r.Header.Get(cfConnectingIPHeader))
 	if raw == "" {
 		return ""
