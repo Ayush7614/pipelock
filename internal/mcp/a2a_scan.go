@@ -4,6 +4,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
@@ -48,7 +50,7 @@ const rollingTailSize = 4096
 // text/opaque through injection + DLP. Falls back to raw DLP for split-secret
 // detection when the walker completes within budget.
 func ScanA2ARequestBody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *config.A2AScanning) A2AScanResult {
-	if cfg == nil || !cfg.Enabled || len(body) == 0 {
+	if cfg == nil || !cfg.Enabled {
 		return A2AScanResult{Clean: true}
 	}
 	return scanA2ABody(ctx, body, sc, cfg)
@@ -56,7 +58,7 @@ func ScanA2ARequestBody(ctx context.Context, body []byte, sc *scanner.Scanner, c
 
 // ScanA2AResponseBody runs field-aware scanning on an A2A response body.
 func ScanA2AResponseBody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *config.A2AScanning) A2AScanResult {
-	if cfg == nil || !cfg.Enabled || len(body) == 0 {
+	if cfg == nil || !cfg.Enabled {
 		return A2AScanResult{Clean: true}
 	}
 	return scanA2ABody(ctx, body, sc, cfg)
@@ -66,6 +68,33 @@ func ScanA2AResponseBody(ctx context.Context, body []byte, sc *scanner.Scanner, 
 func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *config.A2AScanning) A2AScanResult {
 	result := A2AScanResult{Clean: true}
 	budgetExceeded := false
+
+	// Reject unparseable JSON and duplicate JSON object keys before WalkA2AJSON
+	// decodes the body into a map[string]interface{}, which silently keeps only
+	// the last value for a repeated key. A malicious peer can hide an injection,
+	// secret, or exfil URL in the first occurrence - which a first-wins consumer
+	// acts on - behind a benign duplicate, evading every walker pass (Pass 2 is
+	// DLP-only). Parser-integrity failures hard-block, matching the MCP response
+	// scan guard in ScanResponseOpts and the existing inspect-depth hard block.
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return A2AScanResult{
+			Clean:  false,
+			Action: config.ActionBlock,
+			Reason: "a2a: invalid JSON: empty body",
+		}
+	}
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil {
+		reason := fmt.Sprintf("a2a: invalid JSON: %v", err)
+		if isDuplicateKeyBlock(err) {
+			reason = fmt.Sprintf("a2a: duplicate JSON object key: %v", err)
+		}
+		return A2AScanResult{
+			Clean:  false,
+			Action: config.ActionBlock,
+			Reason: reason,
+		}
+	}
 
 	// Pass 1: field-aware walker - classifies and routes each leaf.
 	WalkA2AJSON(json.RawMessage(body), func(path, value string, class FieldClass) {

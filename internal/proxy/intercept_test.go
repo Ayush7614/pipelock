@@ -67,8 +67,8 @@ func testInterceptSetup(t *testing.T) (*certgen.CertCache, *x509.CertPool, *conf
 func TestInterceptEmitReceiptOrBlockRequiresReceipt(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.FlightRecorder.RequireReceipts = true
-	cfg.Internal = nil
 	cfg.ApplyDefaults()
+	cfg.Internal = nil
 
 	m := metrics.New()
 	sc := scanner.New(cfg)
@@ -116,8 +116,8 @@ func TestInterceptEmitReceiptOrBlockRequiresReceipt(t *testing.T) {
 func TestInterceptEmitReceiptOrBlockUnavailableEmitterRecordsMetric(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.FlightRecorder.RequireReceipts = true
-	cfg.Internal = nil
 	cfg.ApplyDefaults()
+	cfg.Internal = nil
 
 	m := metrics.New()
 	sc := scanner.New(cfg)
@@ -157,8 +157,8 @@ func TestInterceptEmitReceiptOrBlockUnavailableEmitterRecordsMetric(t *testing.T
 func TestInterceptEmitReceiptOrBlockRequiresProxy(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.FlightRecorder.RequireReceipts = true
-	cfg.Internal = nil
 	cfg.ApplyDefaults()
+	cfg.Internal = nil
 
 	m := metrics.New()
 	ic := &InterceptContext{
@@ -3391,7 +3391,8 @@ func TestInterceptTunnel_ResponseScanStripWithAdaptive(t *testing.T) {
 // in warn mode log but forward the request.
 func TestInterceptTunnel_A2AHeaderScanWarnMode(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprint(w, "ok")
+		w.Header().Set("Content-Type", "application/a2a+json")
+		_, _ = fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"taskId":"t-1"}}`)
 	}))
 	defer upstream.Close()
 
