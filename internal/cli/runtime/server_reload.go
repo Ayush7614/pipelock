@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/cli/runtimeconfig"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/license"
@@ -304,13 +305,13 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 	// the startup flags: reload cannot toggle MCP listener or forward
 	// proxy enablement (both gated above).
 	var reloadBundleResult *rules.LoadResult
-	newCfg, _ = newCfg.ResolveRuntime(config.RuntimeResolveOpts{
+	newCfg, _ = runtimeconfig.ResolveAndReportConfig(newCfg, config.RuntimeResolveOpts{
 		Mode: s.runtimeMode,
 		MergeBundles: func(c *config.Config) {
 			reloadBundleResult = rules.MergeIntoConfig(c, cliutil.Version)
 		},
 		DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
-	})
+	}, s.opts.Stderr, reloadRuntimeModeLabel(s.runtimeMode))
 	for _, e := range reloadBundleResult.Errors {
 		_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: bundle %s: %s\n", e.Name, e.Reason)
 	}
@@ -380,6 +381,19 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 	s.logger.LogConfigReload("success", fmt.Sprintf("mode=%s", newCfg.Mode), reloadHash)
 	s.recordReloadSuccess(reloadHash)
 	return nil
+}
+
+func reloadRuntimeModeLabel(mode config.RuntimeMode) string {
+	switch mode {
+	case config.RuntimeForwardWithMCPListener:
+		return "listener"
+	case config.RuntimeMCPProxy:
+		return "proxy"
+	case config.RuntimeMCPScan:
+		return "scan"
+	default:
+		return "forward"
+	}
 }
 
 func implausibleReloadTeardownReasons(oldCfg, newCfg *config.Config) []string {
