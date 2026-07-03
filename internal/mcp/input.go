@@ -1119,15 +1119,13 @@ func ForwardScannedInput(
 				},
 			})
 			if holdErr != nil {
-				_ = emitDeferredResolutionReceipt(opts, logW, deferred.Resolution{
-					DeferID:          actionID,
-					ParentActionID:   actionID,
-					FinalDecision:    config.ActionBlock,
-					ResolutionSource: deferred.SourceCapacity,
+				errorMessage := emitHoldFailureResolution(opts, logW, holdErr, holdFailureResolution{
+					DeferID: actionID,
 					Authority: deferred.AuthoritySnapshot{
 						SessionID:         receiptSessionID,
 						SessionIDOriginal: receiptSessionIDOriginal,
 					},
+					Policy: manager.Policy(),
 					Target: toolCallName,
 					Method: verdict.Method,
 					Reason: reasonStr,
@@ -1136,7 +1134,7 @@ func ForwardScannedInput(
 					blockedCh <- BlockedRequest{
 						ID:           verdict.ID,
 						ErrorCode:    -32002,
-						ErrorMessage: "pipelock: defer capacity exceeded",
+						ErrorMessage: errorMessage,
 					}
 				}
 				effectiveAction = config.ActionBlock

@@ -269,15 +269,13 @@ func RunHTTPProxy(
 				},
 			})
 			if holdErr != nil {
-				_ = emitDeferredResolutionReceipt(fwdOpts, safeLogW, deferred.Resolution{
-					DeferID:          deferredReq.DeferID,
-					ParentActionID:   deferredReq.DeferID,
-					FinalDecision:    config.ActionBlock,
-					ResolutionSource: deferred.SourceCapacity,
+				errorMessage := emitHoldFailureResolution(fwdOpts, safeLogW, holdErr, holdFailureResolution{
+					DeferID: deferredReq.DeferID,
 					Authority: deferred.AuthoritySnapshot{
 						SessionID:         deferredReq.SessionID,
 						SessionIDOriginal: deferredReq.SessionIDOriginal,
 					},
+					Policy: manager.Policy(),
 					Target: deferredReq.ToolName,
 					Method: deferredReq.Method,
 					Reason: deferredReq.Reason,
@@ -286,7 +284,7 @@ func RunHTTPProxy(
 					_ = safeClientOut.WriteMessage(blockRequestResponse(BlockedRequest{
 						ID:           deferredReq.ID,
 						ErrorCode:    -32002,
-						ErrorMessage: "pipelock: defer capacity exceeded",
+						ErrorMessage: errorMessage,
 					}))
 				}
 			} else if held, ok := manager.Held(deferredReq.DeferID); ok && deferredReq.ResolverProfileName != "" {
