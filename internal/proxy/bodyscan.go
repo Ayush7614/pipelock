@@ -771,7 +771,7 @@ func extractFormURLEncoded(body []byte) ([]string, string) {
 // Returns extracted strings and an error message if any limit is exceeded.
 // On limit violation: fail-closed (returns error, caller blocks).
 func extractMultipart(body []byte, boundary string, maxBytes int) ([]string, string) {
-	reader := multipart.NewReader(strings.NewReader(string(body)), boundary)
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 
 	var result []string
 	partCount := 0
@@ -781,7 +781,7 @@ func extractMultipart(body []byte, boundary string, maxBytes int) ([]string, str
 			return nil, fmt.Sprintf("multipart body exceeds %d parts limit", maxMultipartParts)
 		}
 
-		part, err := reader.NextPart()
+		part, err := reader.NextRawPart()
 		if err == io.EOF {
 			break
 		}
@@ -841,11 +841,9 @@ func extractMultipart(body []byte, boundary string, maxBytes int) ([]string, str
 			return nil, fmt.Sprintf("multipart part exceeds max_body_bytes (%d)", maxBytes)
 		}
 
-		// Decode Content-Transfer-Encoding before scanning. Go's
-		// multipart.Reader does NOT decode CTE, so base64/QP content
-		// reaches the scanner as raw encoded text. Decode it so DLP
-		// patterns match the actual secret. If decoding fails, scan raw
-		// (fail-closed: don't skip, raw scan still catches plaintext).
+		// Decode Content-Transfer-Encoding before scanning. NextRawPart
+		// keeps CTE visible instead of transparently decoding quoted-printable,
+		// so Pipelock can fail closed when encoded content is uninspectable.
 		cte := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
 		rawBody := string(partBody)
 		switch cte {
@@ -859,24 +857,29 @@ func extractMultipart(body []byte, boundary string, maxBytes int) ([]string, str
 				return r
 			}, rawBody)
 			decoded, err := base64.StdEncoding.DecodeString(cleaned)
-			if err == nil {
-				// Scan BOTH decoded (catches actual secrets) and raw
-				// (catches patterns visible in encoded form).
-				result = append(result, string(decoded))
+			if err != nil {
+				return nil, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
 			}
-			// Always scan raw form too - fail-closed on decode failure,
-			// and catches patterns visible in encoded form.
+			// Scan BOTH decoded (catches actual secrets) and raw
+			// (catches patterns visible in encoded form).
+			result = append(result, string(decoded))
 			result = append(result, rawBody)
 		case "quoted-printable":
-			decoded, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(partBody)))
-			if err == nil {
-				result = append(result, string(decoded))
+			if err := validateQuotedPrintable(partBody); err != nil {
+				return nil, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
 			}
+			decoded, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(partBody)))
+			if err != nil {
+				return nil, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
+			}
+			result = append(result, string(decoded))
 			result = append(result, rawBody)
-		default:
+		case "", "7bit", "8bit", "binary":
 			if len(partBody) > 0 {
 				result = append(result, rawBody)
 			}
+		default:
+			return nil, fmt.Sprintf("unsupported multipart part content-transfer-encoding %q", cte)
 		}
 
 		// Include field name and filename in extracted text (can carry exfil data).
@@ -889,6 +892,37 @@ func extractMultipart(body []byte, boundary string, maxBytes int) ([]string, str
 	}
 
 	return result, ""
+}
+
+func validateQuotedPrintable(body []byte) error {
+	for i := 0; i < len(body); i++ {
+		if body[i] != '=' {
+			continue
+		}
+		if i+1 >= len(body) {
+			return fmt.Errorf("invalid quoted-printable escape at byte %d", i)
+		}
+		if body[i+1] == '\n' {
+			i++
+			continue
+		}
+		if body[i+1] == '\r' {
+			if i+2 >= len(body) || body[i+2] != '\n' {
+				return fmt.Errorf("invalid quoted-printable escape at byte %d", i)
+			}
+			i += 2
+			continue
+		}
+		if i+2 >= len(body) || !isHexDigit(body[i+1]) || !isHexDigit(body[i+2]) {
+			return fmt.Errorf("invalid quoted-printable escape at byte %d", i)
+		}
+		i += 2
+	}
+	return nil
+}
+
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 // isBinaryContentType returns true for content types that are clearly binary
