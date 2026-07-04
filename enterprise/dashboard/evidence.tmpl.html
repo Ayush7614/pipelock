@@ -247,7 +247,7 @@
               <h1>Evidence · {{.Evidence.Agent}}</h1>
               <div class="muted mono">{{.Evidence.ID}}</div>
             </div>
-            <div class="dim mono">{{len .Evidence.Receipts}}{{if .Evidence.ReadLimited}}+{{end}} receipts</div>
+            <div class="dim mono">{{.Evidence.ReceiptCount}}{{if .Evidence.ReadLimited}}+{{end}} receipts</div>
           </div>
 
           {{if not .Evidence.ReceiptsEnabled}}
@@ -257,10 +257,17 @@
             </section>
           {{end}}
 
+          {{if not .RawAllowed}}
+            <section class="section callout">
+              <h2>Metadata view</h2>
+              <div class="muted">Receipt destinations and signed payloads are redacted. Raw access requires the raw operator token; the scorecard, hashes, and offline verifier below do not depend on the raw fields.</div>
+            </section>
+          {{end}}
+
           {{if .Evidence.ReadLimited}}
             <section class="section callout">
               <h2>Dashboard read limit reached</h2>
-              <div class="muted">This online view loaded only the first {{len .Evidence.Receipts}} receipts before the {{.Evidence.ReadLimit}}-entry ceiling. Use offline verification before relying on this session.</div>
+              <div class="muted">This online view loaded only the first {{.Evidence.ReceiptCount}} receipts before the {{.Evidence.ReadLimit}}-entry ceiling. Use offline verification before relying on this session.</div>
             </section>
           {{end}}
 
@@ -300,7 +307,7 @@
           <section class="section">
             <h2>Receipt Timeline</h2>
             {{if .Evidence.TimelineLimited}}
-              <p class="dim">Showing {{.Evidence.TimelineWindow}} {{len .Evidence.Timeline}} of {{len .Evidence.Receipts}}{{if .Evidence.ReadLimited}}+{{end}} loaded receipts.</p>
+              <p class="dim">Showing {{.Evidence.TimelineWindow}} {{len .Evidence.Timeline}} of {{.Evidence.ReceiptCount}}{{if .Evidence.ReadLimited}}+{{end}} loaded receipts.</p>
             {{end}}
             <div class="timeline">
               {{range .Evidence.Timeline}}
@@ -314,10 +321,14 @@
                     <div><div class="label">Prev → Hash</div><div class="value mono">{{.PrevShort}} → {{.HashShort}}</div></div>
                   </div>
                   {{if .Unverifiable}}<div class="sub">This receipt is at or after the break and is unverifiable.</div>{{end}}
+                  {{if .RawJSON}}
                   <details>
                     <summary>Signed JSON payload</summary>
                     <pre>{{.RawJSON}}</pre>
                   </details>
+                  {{else}}
+                  <div class="sub">Signed payload and destination hidden — raw access required.</div>
+                  {{end}}
                 </article>
               {{else}}
                 <div class="empty">No receipt timeline is available for this session.</div>
