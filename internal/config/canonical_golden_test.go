@@ -257,17 +257,13 @@ const (
 	// Re-bumped for bounded size-exempt response scanning: the per-response
 	// and per-proxy-instance scan ceilings plus the explicit unscannable passthrough
 	// allowlist change response-size enforcement.
-	// Re-bumped for Credential Path Directive partitioning: high-signal
-	// credential paths now block on strong bare access verbs, while doc-prone
-	// paths still require an explicit output/exfiltration cue.
-	// Re-bumped for the Credential Path Directive bare-tier hardening: public
-	// key/template/docs prose stays clean, while command-shaped bare reads of
-	// high-signal credential paths still block.
-	// Re-bumped for Credential Path Directive newline termination: bare
-	// high-signal credential-path commands now terminate at line boundaries,
-	// not only end-of-text, so multiline prompt continuations cannot slip
-	// past the bare-access tier.
-	goldenHashDefaults = "82340f353c1bd70daac4b6587c0cc4fefc9f1c6ac6f39b3851ea6b2a6421e9f9"
+	// Re-bumped for Credential Path Directive partitioning + bare-tier hardening
+	// + newline termination (merged from origin/main).
+	// Bumped for fetch_proxy.monitoring.query_entropy_param_exclusions: exact
+	// endpoint+parameter query-value entropy exemptions are policy-semantic.
+	// Advisory metadata is excluded, but the effective tuple is included in
+	// sorted order.
+	goldenHashDefaults = "6653383bbbf6d327ea4cdecf3284f56c85c47a857212039b3a8fa50991c16ece"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -394,13 +390,10 @@ const (
 	// goldenHashDefaults note above.
 	// Re-bumped for bounded size-exempt response scanning: see
 	// goldenHashDefaults note above.
-	// Re-bumped for Credential Path Directive partitioning: see
+	// Re-bumped for Credential Path Directive changes (merged from origin/main)
+	// and for fetch_proxy.monitoring.query_entropy_param_exclusions: see
 	// goldenHashDefaults note above.
-	// Re-bumped for Credential Path Directive bare-tier hardening: see
-	// goldenHashDefaults note above.
-	// Re-bumped for Credential Path Directive newline termination: see
-	// goldenHashDefaults note above.
-	goldenHashRichConfig = "65d20f4ff1270dadc22ac1a29003411277ccb32ca04d4204ddf1522d248f82a3"
+	goldenHashRichConfig = "35861d2ae576c832f74c7cb2d5e9a1e673cf525aabf77ee5adae1f6b15c15de0"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It
