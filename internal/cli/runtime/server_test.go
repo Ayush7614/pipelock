@@ -122,6 +122,219 @@ func TestNewServer_SurfacesValidateWarnings(t *testing.T) {
 	}
 }
 
+func TestStartupSummaryLine(t *testing.T) {
+	s, _ := newTestServer(t, func(o *ServerOpts) {
+		o.Listen = serverTestEphemeralListen
+		o.ListenChanged = true
+	})
+
+	line := s.startupSummaryLine(s.cfg)
+	for _, want := range []string{
+		"Check:",
+		"mode=balanced",
+		"listeners=fetch=127.0.0.1:0",
+		"allowlist=6",
+		"dlp_patterns=",
+		"checks=",
+		"entropy=on",
+		"pipelock explain",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("summary missing %q:\n%s", want, line)
+		}
+	}
+	if strings.Contains(line, "scanners=") {
+		t.Fatalf("summary should describe aggregate checks, not scanner count:\n%s", line)
+	}
+}
+
+func TestStartupSummaryLineIncludesKillAPIWhenTokenComesFromEnv(t *testing.T) {
+	envToken := strings.Repeat("x", 16)
+	t.Setenv(config.EnvKillSwitchAPIToken, envToken)
+	cfgPath := writeServerTestConfig(t, `
+kill_switch:
+  api_listen: "127.0.0.1:19091"
+`)
+	s, _ := newTestServer(t, func(o *ServerOpts) {
+		o.ConfigFile = cfgPath
+	})
+
+	line := s.startupSummaryLine(s.cfg)
+	if !strings.Contains(line, "kill_api=127.0.0.1:19091") {
+		t.Fatalf("summary missing env-token kill API listener:\n%s", line)
+	}
+	if strings.Contains(line, envToken) {
+		t.Fatalf("summary leaked env token value:\n%s", line)
+	}
+}
+
+func TestStartupSummaryLineKillAPIResolvedMatrix(t *testing.T) {
+	envToken := strings.Repeat("e", 16)
+	tests := []struct {
+		name       string
+		yaml       string
+		envToken   string
+		want       string
+		wantAbsent string
+	}{
+		{
+			name:       "unset",
+			wantAbsent: "kill_api=",
+		},
+		{
+			name: "yaml token main listener",
+			yaml: `
+kill_switch:
+  api_token: "yaml-token"
+`,
+			want: "kill_api=127.0.0.1:0",
+		},
+		{
+			name: "yaml token separate listener",
+			yaml: `
+kill_switch:
+  api_token: "yaml-token"
+  api_listen: "127.0.0.1:19091"
+`,
+			want: "kill_api=127.0.0.1:19091",
+		},
+		{
+			name:     "env token separate listener",
+			envToken: envToken,
+			yaml: `
+kill_switch:
+  api_listen: "127.0.0.1:19091"
+`,
+			want: "kill_api=127.0.0.1:19091",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(config.EnvKillSwitchAPIToken, tt.envToken)
+			cfgPath := ""
+			if tt.yaml != "" {
+				cfgPath = writeServerTestConfig(t, tt.yaml)
+			}
+			s, _ := newTestServer(t, func(o *ServerOpts) {
+				o.Listen = serverTestEphemeralListen
+				o.ListenChanged = true
+				o.ConfigFile = cfgPath
+			})
+
+			line := s.startupSummaryLine(s.cfg)
+			if tt.want != "" && !strings.Contains(line, tt.want) {
+				t.Fatalf("summary missing %q:\n%s", tt.want, line)
+			}
+			if tt.wantAbsent != "" && strings.Contains(line, tt.wantAbsent) {
+				t.Fatalf("summary contained %q:\n%s", tt.wantAbsent, line)
+			}
+			if tt.envToken != "" && strings.Contains(line, tt.envToken) {
+				t.Fatalf("summary leaked env token value:\n%s", line)
+			}
+		})
+	}
+
+	t.Run("present api_listen without resolved token is inactive", func(t *testing.T) {
+		cfg := config.Defaults()
+		cfg.KillSwitch.APIListen = "127.0.0.1:19091"
+		resolved, _ := cfg.ResolveRuntime(config.RuntimeResolveOpts{Mode: config.RuntimeForward})
+		if killSwitchAPITokenConfigured(resolved) {
+			t.Fatal("killSwitchAPITokenConfigured = true with api_listen present but no resolved token")
+		}
+	})
+}
+
+func TestStartupEnabledCheckCountResolvedMatrix(t *testing.T) {
+	base := startupEnabledCheckCount(config.Defaults())
+
+	tests := []struct {
+		name string
+		mut  func(*config.Config)
+		mode config.RuntimeMode
+		want int
+	}{
+		{
+			name: "address protection enabled",
+			mut: func(cfg *config.Config) {
+				cfg.AddressProtection.Enabled = true
+			},
+			mode: config.RuntimeForward,
+			want: base + 1,
+		},
+		{
+			name: "address protection present but disabled",
+			mut: func(cfg *config.Config) {
+				cfg.AddressProtection.AllowedAddresses = []string{"0x1111111111111111111111111111111111111111"}
+			},
+			mode: config.RuntimeForward,
+			want: base,
+		},
+		{
+			name: "mcp tool policy enabled",
+			mut: func(cfg *config.Config) {
+				cfg.MCPToolPolicy.Enabled = true
+				cfg.MCPToolPolicy.Action = config.ActionWarn
+			},
+			mode: config.RuntimeForward,
+			want: base + 1,
+		},
+		{
+			name: "mcp redirect profile present but policy disabled",
+			mut: func(cfg *config.Config) {
+				cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
+					"fetch_proxy": {Exec: []string{"/proc/self/exe", "internal-redirect", "fetch-proxy"}},
+				}
+			},
+			mode: config.RuntimeForward,
+			want: base,
+		},
+		{
+			name: "mcp listener auto enable",
+			mode: config.RuntimeForwardWithMCPListener,
+			want: base + 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Defaults()
+			if tt.mut != nil {
+				tt.mut(cfg)
+			}
+			resolved, _ := cfg.ResolveRuntime(config.RuntimeResolveOpts{Mode: tt.mode})
+			if got := startupEnabledCheckCount(resolved); got != tt.want {
+				t.Fatalf("startupEnabledCheckCount = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStartupEntropyStateOff(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.FetchProxy.Monitoring.EntropyThreshold = 0
+	cfg.FetchProxy.Monitoring.SubdomainEntropyThreshold = 0
+
+	if got := startupEntropyState(cfg); got != "off" {
+		t.Fatalf("entropy state = %q, want off", got)
+	}
+}
+
+func TestStartupEnabledCheckCountIncludesURLScannerFloor(t *testing.T) {
+	seedDisabled := false
+	cfg := &config.Config{
+		Mode: config.ModeBalanced,
+		FetchProxy: config.FetchProxy{
+			Monitoring: config.Monitoring{MaxURLLength: 2048},
+		},
+		SeedPhraseDetection: config.SeedPhraseDetection{Enabled: &seedDisabled},
+	}
+
+	if got := startupEnabledCheckCount(cfg); got != 8 {
+		t.Fatalf("startupEnabledCheckCount = %d, want parser/length/scheme/CRLF/path/core-SSRF/core-DLP/context floor", got)
+	}
+}
+
 func TestNewServer_ValidatesListenerFlagPairs(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -574,6 +787,8 @@ func TestServer_RefreshRuntimeStateClearsBundleDerivedState(t *testing.T) {
 }
 
 func TestServer_StartAuxiliaryListeners(t *testing.T) {
+	t.Setenv(config.EnvKillSwitchAPIToken, "test-token")
+
 	s, buf := newTestServer(t, func(o *ServerOpts) {
 		o.Listen = serverTestEphemeralListen
 		o.ListenChanged = true
@@ -593,7 +808,6 @@ func TestServer_StartAuxiliaryListeners(t *testing.T) {
 		Read:  "50ms",
 		Write: "50ms",
 	}
-	s.cfg.KillSwitch.APIToken = "test-token"
 	s.cfg.KillSwitch.APIListen = serverTestEphemeralListen
 	s.apiOnSeparatePort = true
 	s.cfg.WebSocketProxy.Enabled = true

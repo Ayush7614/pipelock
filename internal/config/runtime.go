@@ -3,6 +3,8 @@
 
 package config
 
+import "os"
+
 // RuntimeMode selects which runtime-time defaults ResolveRuntime applies.
 // It is an explicit CLI-surface value: the same loaded Config can produce
 // different effective policies depending on which command path consumes it
@@ -115,6 +117,8 @@ func (c *Config) ResolveRuntime(opts RuntimeResolveOpts) (*Config, ResolveRuntim
 	clone := c.Clone()
 	var info ResolveRuntimeInfo
 
+	clone.resolveKillSwitchAPIToken()
+
 	if opts.Mode.NeedsResponseScanningFallback() && !clone.ResponseScanning.Enabled {
 		// MCP proxy mode re-enables default response scanning if the
 		// operator disabled it. Response scanning is the primary injection
@@ -135,6 +139,37 @@ func (c *Config) ResolveRuntime(opts RuntimeResolveOpts) (*Config, ResolveRuntim
 	}
 
 	return clone, info
+}
+
+func resolvedKillSwitchAPITokenValue(yamlToken string) string {
+	if envToken := os.Getenv(EnvKillSwitchAPIToken); envToken != "" {
+		return envToken
+	}
+	return yamlToken
+}
+
+func (c *Config) resolveKillSwitchAPIToken() {
+	c.resolvedKillSwitchAPIToken = resolvedKillSwitchAPITokenValue(c.KillSwitch.APIToken)
+	c.killSwitchAPITokenWasResolved = true
+}
+
+// EffectiveKillSwitchAPIToken returns the admin API bearer token after applying
+// the runtime's env-over-YAML precedence. Callers should use this instead of
+// reading KillSwitch.APIToken directly when wiring runtime surfaces.
+func (c *Config) EffectiveKillSwitchAPIToken() string {
+	if c == nil {
+		return ""
+	}
+	if c.killSwitchAPITokenWasResolved {
+		return c.resolvedKillSwitchAPIToken
+	}
+	return resolvedKillSwitchAPITokenValue(c.KillSwitch.APIToken)
+}
+
+// EffectiveKillSwitchAPITokenConfigured reports whether the resolved runtime
+// config has an admin API bearer token without exposing the token value.
+func (c *Config) EffectiveKillSwitchAPITokenConfigured() bool {
+	return c.EffectiveKillSwitchAPIToken() != ""
 }
 
 // applyMCPAutoEnable flips MCP scanning sections on when the operator did
