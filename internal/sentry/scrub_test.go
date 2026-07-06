@@ -257,8 +257,8 @@ func TestScrubEvent_AllowlistPayloadShape(t *testing.T) {
 	if result.EventID != event.EventID || !result.Timestamp.Equal(eventTime) || result.Level != sentry.LevelError || result.Release != "v1.2.3" {
 		t.Fatalf("safe scalar fields not preserved: %+v", result)
 	}
-	if result.Platform != "go/"+runtime.GOOS {
-		t.Fatalf("platform = %q, want coarse OS only", result.Platform)
+	if result.Platform != "go/"+runtime.GOOS+"/"+runtime.GOARCH {
+		t.Fatalf("platform = %q, want coarse OS/arch only", result.Platform)
 	}
 	if !containsRedacted(result.Message) || !containsRedacted(result.Exception[0].Type) || !containsRedacted(result.Exception[0].Value) {
 		t.Fatalf("expected surviving diagnostic strings to be scrubbed: %+v", result.Exception[0])
