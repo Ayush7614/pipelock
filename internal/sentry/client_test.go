@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -20,18 +21,26 @@ const testDSN = "https://examplePublicKey@o0.ingest.sentry.io/0"
 
 // mockTransport captures events sent through the Sentry SDK.
 type mockTransport struct {
-	mu     sync.Mutex
-	events []*sentry.Event
+	mu                    sync.Mutex
+	events                []*sentry.Event
+	flushCalls            int
+	flushWithContextCalls int
 }
 
 func (t *mockTransport) Configure(_ sentry.ClientOptions) {}
 func (t *mockTransport) Close()                           {}
 
 func (t *mockTransport) Flush(_ time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.flushCalls++
 	return true
 }
 
 func (t *mockTransport) FlushWithContext(_ context.Context) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.flushWithContextCalls++
 	return true
 }
 
@@ -49,11 +58,19 @@ func (t *mockTransport) Events() []*sentry.Event {
 	return cp
 }
 
+func (t *mockTransport) FlushCalls() (int, int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.flushCalls, t.flushWithContextCalls
+}
+
 // initTestClient creates an enabled client with a mock transport.
 func initTestClient(t *testing.T, dlpPatterns []config.DLPPattern) (*Client, *mockTransport) {
 	t.Helper()
 	transport := &mockTransport{}
 	cfg := config.Defaults()
+	enabled := true
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = testDSN
 	cfg.DLP.Patterns = dlpPatterns
 	c, err := initClient(cfg, "test-version", transport)
@@ -79,8 +96,42 @@ func TestInit_DisabledReturnsNoOp(t *testing.T) {
 	}
 }
 
-func TestInit_EmptyDSNReturnsNoOp(t *testing.T) {
+func TestInit_DisabledClearsStaleGlobalClient(t *testing.T) {
+	t.Cleanup(func() {
+		sentry.CurrentHub().BindClient(nil)
+	})
+
+	staleTransport := &mockTransport{}
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
+	cfg.Sentry.DSN = testDSN
+	if _, err := initClient(cfg, "test", staleTransport); err != nil {
+		t.Fatalf("enable stale client: %v", err)
+	}
+
+	disabled := false
+	cfg.Sentry.Enabled = &disabled
+	c, err := Init(cfg, "test")
+	if err != nil {
+		t.Fatalf("disabled init: %v", err)
+	}
+	if c.enabled {
+		t.Fatal("expected disabled client")
+	}
+
+	if id := sentry.CaptureMessage("must not reach stale transport"); id != nil {
+		t.Fatalf("package-level capture returned event id after disabled init: %s", *id)
+	}
+	if events := staleTransport.Events(); len(events) != 0 {
+		t.Fatalf("stale global client captured %d event(s) after disabled init", len(events))
+	}
+}
+
+func TestInit_EmptyDSNReturnsNoOp(t *testing.T) {
+	enabled := true
+	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = ""
 	// Ensure SENTRY_DSN env is not set for this test.
 	t.Setenv("SENTRY_DSN", "")
@@ -94,7 +145,9 @@ func TestInit_EmptyDSNReturnsNoOp(t *testing.T) {
 }
 
 func TestInit_EnvDSNUsedWhenConfigEmpty(t *testing.T) {
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = ""
 	// Set a valid-looking DSN via env. The Sentry SDK will accept it
 	// but won't actually connect in tests.
@@ -110,7 +163,9 @@ func TestInit_EnvDSNUsedWhenConfigEmpty(t *testing.T) {
 
 func TestInit_EnvDSNOverridesConfig(t *testing.T) {
 	envDSN := "https://envKey@o0.ingest.sentry.io/0"
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = "https://configKey@o0.ingest.sentry.io/0"
 	t.Setenv("SENTRY_DSN", envDSN)
 
@@ -169,20 +224,15 @@ func TestAddBreadcrumbEnabledClient(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("events = %d, want 1", len(events))
 	}
-	if len(events[0].Breadcrumbs) != 1 {
-		t.Fatalf("breadcrumbs = %d, want 1", len(events[0].Breadcrumbs))
-	}
-	crumb := events[0].Breadcrumbs[0]
-	if crumb.Category != "license" || crumb.Message != "expiry warning" || crumb.Level != sentry.Level("warn") {
-		t.Fatalf("breadcrumb = %+v, want license warning", crumb)
-	}
-	if crumb.Data["threshold_days"] != "7" || crumb.Data["days_remaining"] != "6" {
-		t.Fatalf("breadcrumb data = %+v, want warning band data", crumb.Data)
+	if len(events[0].Breadcrumbs) != 0 {
+		t.Fatalf("breadcrumbs = %d, want 0", len(events[0].Breadcrumbs))
 	}
 }
 
 func TestInit_InvalidDSNReturnsError(t *testing.T) {
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = "not-a-valid-dsn"
 	c, err := Init(cfg, "test")
 	if err == nil {
@@ -193,8 +243,38 @@ func TestInit_InvalidDSNReturnsError(t *testing.T) {
 	}
 }
 
-func TestInit_ScrubberPopulated(t *testing.T) {
+func TestInit_InvalidDSNClearsStaleGlobalClient(t *testing.T) {
+	t.Cleanup(func() {
+		sentry.CurrentHub().BindClient(nil)
+	})
+	t.Setenv("SENTRY_DSN", "")
+
+	staleTransport := &mockTransport{}
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
+	cfg.Sentry.DSN = testDSN
+	if _, err := initClient(cfg, "test", staleTransport); err != nil {
+		t.Fatalf("enable stale client: %v", err)
+	}
+
+	cfg.Sentry.DSN = "not-a-valid-dsn"
+	if c, err := Init(cfg, "test"); err == nil || c != nil {
+		t.Fatalf("invalid dsn init = (%+v, %v), want nil client and error", c, err)
+	}
+
+	if id := sentry.CaptureMessage("must not reach stale transport"); id != nil {
+		t.Fatalf("package-level capture returned event id after failed init: %s", *id)
+	}
+	if events := staleTransport.Events(); len(events) != 0 {
+		t.Fatalf("stale global client captured %d event(s) after failed init", len(events))
+	}
+}
+
+func TestInit_ScrubberPopulated(t *testing.T) {
+	enabled := true
+	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = testDSN
 	cfg.DLP.Patterns = testDLPPatterns()
 	c, err := Init(cfg, "test")
@@ -211,7 +291,9 @@ func TestInit_ScrubberPopulated(t *testing.T) {
 }
 
 func TestInit_EnvSecretsCollected(t *testing.T) {
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = testDSN
 	cfg.DLP.ScanEnv = true
 	t.Setenv("PIPELOCK_TEST_SECRET", "this-is-a-long-enough-secret")
@@ -225,7 +307,9 @@ func TestInit_EnvSecretsCollected(t *testing.T) {
 }
 
 func TestInit_EnvSecretsSkippedWhenScanEnvFalse(t *testing.T) {
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = testDSN
 	cfg.DLP.ScanEnv = false
 	c, err := Init(cfg, "test")
@@ -349,7 +433,9 @@ func TestInit_FileSecretsLoaded(t *testing.T) {
 	}
 
 	transport := &mockTransport{}
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = testDSN
 	cfg.DLP.ScanEnv = false
 	cfg.DLP.SecretsFile = secretsFile
@@ -387,7 +473,9 @@ func TestInit_FileSecretsLoaded(t *testing.T) {
 
 func TestInit_FileSecretsFileNotFound_WarnsAndContinues(t *testing.T) {
 	transport := &mockTransport{}
+	enabled := true
 	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
 	cfg.Sentry.DSN = testDSN
 	cfg.DLP.SecretsFile = "/nonexistent/secrets.txt"
 	c, err := initClient(cfg, "test", transport)
@@ -422,5 +510,169 @@ func TestBeforeSend_ScrubEventCalled(t *testing.T) {
 	}
 	if e.Request != nil {
 		t.Error("BeforeSend did not wipe Request")
+	}
+}
+
+func TestInit_DefaultOmittedDisabledEvenWithDSN(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Sentry.DSN = testDSN
+
+	c, err := Init(cfg, "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.enabled {
+		t.Error("expected disabled client when sentry.enabled is omitted")
+	}
+}
+
+func TestInit_ExplicitTrueWithDSNEnabled(t *testing.T) {
+	enabled := true
+	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
+	cfg.Sentry.DSN = testDSN
+
+	transport := &mockTransport{}
+	c, err := initClient(cfg, "test", transport)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.enabled {
+		t.Fatal("expected enabled client")
+	}
+}
+
+func TestInit_SampleRateZeroRejectedWhenEnabled(t *testing.T) {
+	enabled := true
+	zero := 0.0
+	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
+	cfg.Sentry.DSN = testDSN
+	cfg.Sentry.SampleRate = &zero
+
+	_, err := initClient(cfg, "test", &mockTransport{})
+	if err == nil || !strings.Contains(err.Error(), "sample_rate 0.0") {
+		t.Fatalf("expected sample_rate 0.0 rejection, got %v", err)
+	}
+}
+
+func TestInit_SampleRateZeroClearsStaleGlobalClient(t *testing.T) {
+	t.Cleanup(func() {
+		sentry.CurrentHub().BindClient(nil)
+	})
+
+	staleTransport := &mockTransport{}
+	enabled := true
+	cfg := config.Defaults()
+	cfg.Sentry.Enabled = &enabled
+	cfg.Sentry.DSN = testDSN
+	if _, err := initClient(cfg, "test", staleTransport); err != nil {
+		t.Fatalf("enable stale client: %v", err)
+	}
+
+	zero := 0.0
+	cfg.Sentry.SampleRate = &zero
+	if _, err := initClient(cfg, "test", &mockTransport{}); err == nil || !strings.Contains(err.Error(), "sample_rate 0.0") {
+		t.Fatalf("expected sample_rate 0.0 rejection, got %v", err)
+	}
+
+	if id := sentry.CaptureMessage("must not reach stale transport"); id != nil {
+		t.Fatalf("package-level capture returned event id after rejected init: %s", *id)
+	}
+	if events := staleTransport.Events(); len(events) != 0 {
+		t.Fatalf("stale global client captured %d event(s) after rejected init", len(events))
+	}
+}
+
+func TestEventTypes_DroppedBeforeTransport(t *testing.T) {
+	c, transport := initTestClient(t, nil)
+	defer c.Close()
+
+	sentry.CaptureEvent(&sentry.Event{
+		Type:        "transaction",
+		Transaction: "GET /private",
+		Spans:       []*sentry.Span{{Description: "https://api.vendor.example/private"}},
+	})
+	sentry.CaptureEvent(&sentry.Event{
+		Type: "log",
+		Logs: []sentry.Log{{Body: "log body that must not ship"}},
+	})
+	sentry.CaptureCheckIn(&sentry.CheckIn{
+		MonitorSlug: "private-monitor",
+		Status:      sentry.CheckInStatusOK,
+	}, nil)
+	_ = c.Flush(2 * time.Second)
+
+	if events := transport.Events(); len(events) != 0 {
+		t.Fatalf("expected transaction/log/check-in events to be dropped, got %d", len(events))
+	}
+}
+
+func TestTransportGuard_SanitizesNormalEvents(t *testing.T) {
+	transport := &mockTransport{}
+	guard := dropUnsafeEventTransport{
+		delegate: transport,
+		scrubber: NewScrubber(testDLPPatterns(), []string{
+			testEnvSecret,
+		}),
+	}
+
+	guard.SendEvent(&sentry.Event{
+		Message:    "failed for " + fakeURLWithUserinfo("user", testEnvSecret, "internal-host.example", "/private"),
+		ServerName: "agent-prod-01.internal",
+		User:       sentry.User{ID: "agent-user"},
+		Request:    &sentry.Request{URL: "https://internal-host.example/private"},
+		Breadcrumbs: []*sentry.Breadcrumb{
+			{Message: "visited /private"},
+		},
+		Exception: []sentry.Exception{{
+			Type:  "PathError",
+			Value: "open /home/agent/private.yaml: " + testAWSKeyID,
+		}},
+	})
+
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1 sanitized event", len(events))
+	}
+	event := events[0]
+	if event.ServerName != "" || event.User.ID != "" || event.Request != nil || len(event.Breadcrumbs) != 0 {
+		t.Fatalf("unsafe fields survived transport guard: %+v", event)
+	}
+	raw := fmt.Sprintf("%+v", event)
+	for _, forbidden := range []string{"user", testEnvSecret, "internal-host.example", "/private", "/home/agent", testAWSKeyID} {
+		if strings.Contains(raw, forbidden) {
+			t.Fatalf("transport guard leaked %q in %+v", forbidden, event)
+		}
+	}
+}
+
+func TestTransportGuard_FlushWithContextDelegates(t *testing.T) {
+	if !(dropUnsafeEventTransport{}).FlushWithContext(context.Background()) {
+		t.Fatal("nil delegate FlushWithContext should be a successful no-op")
+	}
+
+	transport := &mockTransport{}
+	guard := dropUnsafeEventTransport{delegate: transport}
+	if !guard.FlushWithContext(context.Background()) {
+		t.Fatal("expected delegated FlushWithContext to succeed")
+	}
+
+	flushCalls, flushWithContextCalls := transport.FlushCalls()
+	if flushCalls != 0 || flushWithContextCalls != 1 {
+		t.Fatalf("flush calls = %d, flush-with-context calls = %d; want 0 and 1", flushCalls, flushWithContextCalls)
+	}
+}
+
+func TestTransportGuard_DropsSanitizerPanic(t *testing.T) {
+	transport := &mockTransport{}
+	guard := dropUnsafeEventTransport{
+		delegate: transport,
+		scrubber: &Scrubber{patterns: []*regexp.Regexp{nil}},
+	}
+
+	guard.SendEvent(&sentry.Event{Message: "panic path"})
+	if events := transport.Events(); len(events) != 0 {
+		t.Fatalf("expected sanitizer panic to drop event, got %d", len(events))
 	}
 }

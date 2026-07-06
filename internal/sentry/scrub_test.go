@@ -1,8 +1,12 @@
 package plsentry
 
 import (
+	"encoding/json"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/getsentry/sentry-go"
 
@@ -24,7 +28,6 @@ func testDLPPatterns() []config.DLPPattern {
 }
 
 func TestScrubString_DLPPatterns(t *testing.T) {
-	// Build fake credentials at runtime for gosec G101.
 	tests := []struct {
 		name  string
 		input string
@@ -52,14 +55,8 @@ func TestScrubString_DLPPatterns(t *testing.T) {
 }
 
 func TestScrubString_DLPPatterns_CaseInsensitive(t *testing.T) {
-	// DLP patterns are auto-prefixed with (?i) so mixed-case variants must
-	// still be scrubbed. This mirrors the scanner.New() behavior.
 	s := NewScrubber(testDLPPatterns(), nil)
 
-	// "ghp_" token with the prefix chars in different case won't match the
-	// original regex literally, but the real vector is an agent upper-casing
-	// secrets. Use a Slack token variant since xox is case-sensitive in the
-	// regex but agents can uppercase.
 	mixedCase := "webhook " + "XOXb-" + "123456789012345"
 	result := s.ScrubString(mixedCase)
 	if result == mixedCase {
@@ -73,7 +70,6 @@ func TestScrubString_DLPPatterns_CaseInsensitive(t *testing.T) {
 func TestScrubString_SafetyNet_CaseInsensitive(t *testing.T) {
 	s := NewScrubber(nil, nil)
 
-	// Lowercase "bearer" and "authorization" must still be caught.
 	lower := "header: bearer " + "eyJhbGciOiJIUzI1NiJ9.test"
 	result := s.ScrubString(lower)
 	if result == lower {
@@ -94,7 +90,6 @@ func TestScrubString_NonSecretPassesThrough(t *testing.T) {
 	s := NewScrubber(testDLPPatterns(), nil)
 	input := "normal error message without secrets"
 	result := s.ScrubString(input)
-	// URL param scrubbing won't affect this since there are no URL params.
 	if result != input {
 		t.Errorf("expected unchanged string, got %q", result)
 	}
@@ -108,9 +103,8 @@ func TestScrubString_EmptyString(t *testing.T) {
 }
 
 func TestScrubString_EnvSecrets(t *testing.T) {
-	secret := testEnvSecret
-	s := NewScrubber(nil, []string{secret})
-	input := "error: env value was " + secret + " in context"
+	s := NewScrubber(nil, []string{testEnvSecret})
+	input := "error: env value was " + testEnvSecret + " in context"
 	result := s.ScrubString(input)
 	if result == input {
 		t.Error("expected env secret to be scrubbed")
@@ -120,109 +114,293 @@ func TestScrubString_EnvSecrets(t *testing.T) {
 	}
 }
 
-func TestScrubString_URLQueryParams(t *testing.T) {
+func TestScrubString_URLAuthorityAndPathDropped(t *testing.T) {
 	s := NewScrubber(nil, nil)
-	input := "error fetching https://example.com/api?token=secretvalue&user=admin" // pipelock:ignore Credential in URL
+	input := "mcp upstream failed: " + fakeURLWithUserinfo("user", "novel-secret", "internal-host.example", "/p?q=secret")
 	result := s.ScrubString(input)
-	if result == input {
-		t.Error("expected URL query params to be scrubbed")
+
+	for _, forbidden := range []string{"user", "novel-secret", "internal-host.example", "/p", "q=secret"} {
+		if strings.Contains(result, forbidden) {
+			t.Fatalf("URL component %q leaked in %q", forbidden, result)
+		}
+	}
+	if !strings.Contains(result, "wss://"+redacted) {
+		t.Fatalf("expected coarse redacted URL, got %q", result)
 	}
 }
 
-func TestScrubEvent_Message(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
-	event := &sentry.Event{
-		Message: "error with key " + awsKey,
+func TestScrubString_ProtocolRelativeURLPathDropped(t *testing.T) {
+	s := NewScrubber(nil, nil)
+	input := `parse "//internal-host.example/private-agent/token?key=secret": missing protocol scheme`
+	result := s.ScrubString(input)
+
+	for _, forbidden := range []string{"internal-host.example", "/private-agent", "token", "key=secret"} {
+		if strings.Contains(result, forbidden) {
+			t.Fatalf("protocol-relative URL component %q leaked in %q", forbidden, result)
+		}
 	}
-	result := s.ScrubEvent(event, nil)
-	if result.Message == event.Message {
-		// ScrubEvent modifies in-place, so compare against original value
-		t.Log("message was scrubbed in-place, checking for redaction")
-	}
-	if !containsRedacted(result.Message) {
-		t.Errorf("expected [REDACTED] in message %q", result.Message)
+	if !strings.Contains(result, "//"+redacted) {
+		t.Fatalf("expected coarse protocol-relative URL redaction, got %q", result)
 	}
 }
 
-func TestScrubEvent_Exception(t *testing.T) {
-	awsKey := testAWSKeyID
+func TestScrubString_DeploymentLocatorsDropped(t *testing.T) {
+	s := NewScrubber(nil, nil)
+	input := strings.Join([]string{
+		"open /home/agent/.config/pipelock/private.yaml: permission denied",
+		`open C:\Users\agent\AppData\Roaming\pipelock\private.yaml: access denied`,
+		`open \\fileserver\share\private.yaml: access denied`,
+		"dial tcp 10.0.0.12:8443: connect: connection refused",
+		"dial tcp 10.0.0.12:8443/private-token: connect: connection refused",
+		"lookup internal-host.example on 10.0.0.2:53: no such host",
+		"x509: certificate is valid for private.service.internal, not public.vendor.example",
+		"upstream private.service.internal/v1/secret refused",
+		"dial tcp [fd00::10]:443: connect: network unreachable",
+		"dial tcp [fd00::10]:443/private-token: network unreachable",
+		"proxy auth failed for deployer:novel-secret@private.service.internal:443/private-token",
+	}, "\n")
+
+	result := s.ScrubString(input)
+	for _, forbidden := range []string{
+		"/home/agent",
+		`C:\Users\agent`,
+		`\\fileserver\share`,
+		"10.0.0.12",
+		"10.0.0.2",
+		"internal-host.example",
+		"private.service.internal",
+		"public.vendor.example",
+		"fd00::10",
+		"private-token",
+		"/v1/secret",
+		"deployer",
+		"novel-secret",
+	} {
+		if strings.Contains(result, forbidden) {
+			t.Fatalf("deployment locator %q leaked in %q", forbidden, result)
+		}
+	}
+	if !containsRedacted(result) {
+		t.Fatalf("expected redaction marker in %q", result)
+	}
+}
+
+func TestRedactionPipeline_SharedStringAndCodeSurfaces(t *testing.T) {
+	s := NewScrubber(nil, []string{testEnvSecret})
+	input := "failed at " + fakeURLWithUserinfo("user", testEnvSecret, "internal-host.example", "/private") +
+		" api_key=novel-secret"
+
+	for name, scrub := range map[string]func(string) string{
+		"string": s.ScrubString,
+		"code":   s.safeScrubCodeString,
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := scrub(input)
+			for _, forbidden := range []string{"user", testEnvSecret, "internal-host.example", "/private", "novel-secret"} {
+				if strings.Contains(result, forbidden) {
+					t.Fatalf("%s surface leaked %q in %q", name, forbidden, result)
+				}
+			}
+			if !containsRedacted(result) {
+				t.Fatalf("%s surface result did not include redaction marker: %q", name, result)
+			}
+		})
+	}
+}
+
+func TestScrubEvent_AllowlistPayloadShape(t *testing.T) {
+	eventTime := time.Unix(1700000000, 0).UTC()
 	s := NewScrubber(testDLPPatterns(), nil)
 	event := &sentry.Event{
+		EventID:    "1234567890abcdef1234567890abcdef",
+		Timestamp:  eventTime,
+		Level:      sentry.LevelError,
+		Message:    "failed with " + testAWSKeyID,
+		Release:    "v1.2.3",
+		ServerName: "prod-secret-host-01.internal",
+		User:       sentry.User{ID: "user-123", IPAddress: "192.0.2.10"},
+		Request:    &sentry.Request{URL: "https://api.vendor.example/private", Method: "POST"},
+		Breadcrumbs: []*sentry.Breadcrumb{
+			{Message: "visited private path", Data: map[string]interface{}{"url": "https://api.vendor.example/private"}},
+		},
+		Tags:     map[string]string{"tenant": "acme-prod"},
+		Contexts: map[string]sentry.Context{"custom": {"hostname": "prod-secret-host-01.internal"}},
+		Modules:  map[string]string{"github.com/private/module": "v0.0.1"},
+		Attachments: []*sentry.Attachment{
+			{Filename: "secret.txt", Payload: []byte("secret")},
+		},
 		Exception: []sentry.Exception{
 			{
-				Value: "secret " + awsKey + " leaked",
+				Type:  "error at " + testAWSKeyID,
+				Value: "upstream failed with " + testAWSKeyID,
 				Stacktrace: &sentry.Stacktrace{
 					Frames: []sentry.Frame{
-						{Vars: map[string]interface{}{"key": awsKey}},
+						{
+							Function:    "github.com/luckyPipewrench/pipelock/internal/cli/runtime.runProxy",
+							Module:      "github.com/luckyPipewrench/pipelock/internal/cli/runtime",
+							Filename:    "/home/developer/project/internal/cli/runtime/mcp.go",
+							AbsPath:     "/home/developer/project/internal/cli/runtime/mcp.go",
+							Lineno:      1115,
+							ContextLine: "return upstreamURL.String()",
+							Vars:        map[string]interface{}{"upstream": fakeURLWithUserinfo("user", "secret", "host", "/p")},
+						},
 					},
 				},
 			},
 		},
 	}
+
 	result := s.ScrubEvent(event, nil)
-	if !containsRedacted(result.Exception[0].Value) {
-		t.Errorf("expected [REDACTED] in exception value %q", result.Exception[0].Value)
+	if result == nil {
+		t.Fatal("expected sanitized event")
 	}
-	if sv, ok := result.Exception[0].Stacktrace.Frames[0].Vars["key"].(string); !ok || !containsRedacted(sv) {
-		t.Errorf("expected [REDACTED] in frame vars")
+	if result.EventID != event.EventID || !result.Timestamp.Equal(eventTime) || result.Level != sentry.LevelError || result.Release != "v1.2.3" {
+		t.Fatalf("safe scalar fields not preserved: %+v", result)
+	}
+	if result.Platform != "go/"+runtime.GOOS {
+		t.Fatalf("platform = %q, want coarse OS only", result.Platform)
+	}
+	if !containsRedacted(result.Message) || !containsRedacted(result.Exception[0].Type) || !containsRedacted(result.Exception[0].Value) {
+		t.Fatalf("expected surviving diagnostic strings to be scrubbed: %+v", result.Exception[0])
+	}
+	if result.Request != nil || result.ServerName != "" || result.User.ID != "" || len(result.Breadcrumbs) != 0 ||
+		len(result.Tags) != 0 || len(result.Contexts) != 0 || len(result.Modules) != 0 || len(result.Attachments) != 0 {
+		t.Fatalf("unsafe event fields survived: %+v", result)
+	}
+
+	frame := result.Exception[0].Stacktrace.Frames[0]
+	if frame.Filename != "mcp.go" || frame.Lineno != 1115 || frame.Function != "runtime.runProxy" || frame.Module != "runtime" {
+		t.Fatalf("safe frame fields not preserved: %+v", frame)
+	}
+	if frame.AbsPath != "" || frame.ContextLine != "" || len(frame.PreContext) != 0 || len(frame.PostContext) != 0 || len(frame.Vars) != 0 {
+		t.Fatalf("unsafe frame fields survived: %+v", frame)
+	}
+
+	if result.DebugMeta != nil || len(result.Spans) != 0 || len(result.Logs) != 0 || len(result.Metrics) != 0 {
+		t.Fatalf("unsafe event type fields survived: %+v", result)
+	}
+
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal sanitized event: %v", err)
+	}
+	payload := string(raw)
+	for _, forbidden := range []string{"request", "user", "server_name", "breadcrumbs", "tags", "contexts", "modules", "debug_meta", "attachments", "vars", "abs_path", "context_line"} {
+		if strings.Contains(payload, forbidden) {
+			t.Fatalf("forbidden field %q survived in payload: %s", forbidden, payload)
+		}
 	}
 }
 
-func TestScrubEvent_Breadcrumbs(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
+func TestScrubEvent_UpstreamURLUserinfoHostPathDropped(t *testing.T) {
+	s := NewScrubber(nil, nil)
 	event := &sentry.Event{
-		Breadcrumbs: []*sentry.Breadcrumb{
-			{
-				Message: "fetching with " + awsKey,
-				Data:    map[string]interface{}{"url": "https://api.example.com?key=" + awsKey},
+		Exception: []sentry.Exception{{
+			Type:  "mcp upstream error",
+			Value: "connect failed for " + fakeURLWithUserinfo("urluser", "novel-secret", "internal-host.example", "/p"),
+		}},
+	}
+
+	result := s.ScrubEvent(event, nil)
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal sanitized event: %v", err)
+	}
+	payload := string(raw)
+	for _, forbidden := range []string{"urluser", "novel-secret", "internal-host.example", "/p"} {
+		if strings.Contains(payload, forbidden) {
+			t.Fatalf("forbidden URL component %q survived in payload: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestScrubEvent_ExceptionValueDropsPathsAndBareEndpoints(t *testing.T) {
+	s := NewScrubber(nil, nil)
+	event := &sentry.Event{
+		Exception: []sentry.Exception{{
+			Type:  "PathError",
+			Value: "open /home/agent/work/private.yaml: dial tcp 10.0.0.8:443: lookup private.internal.example on 10.0.0.2:53: no such host",
+		}},
+	}
+
+	result := s.ScrubEvent(event, nil)
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal sanitized event: %v", err)
+	}
+	payload := string(raw)
+	for _, forbidden := range []string{"/home/agent", "10.0.0.8", "private.internal.example", "10.0.0.2"} {
+		if strings.Contains(payload, forbidden) {
+			t.Fatalf("deployment locator %q survived in payload: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestScrubEvent_FrameFilenameWindowsBasenameOnly(t *testing.T) {
+	s := NewScrubber(nil, nil)
+	event := &sentry.Event{
+		Exception: []sentry.Exception{{
+			Stacktrace: &sentry.Stacktrace{
+				Frames: []sentry.Frame{{Filename: `C:\Users\agent\src\private.go`}},
 			},
-		},
+		}},
 	}
+
 	result := s.ScrubEvent(event, nil)
-	if !containsRedacted(result.Breadcrumbs[0].Message) {
-		t.Errorf("expected [REDACTED] in breadcrumb message %q", result.Breadcrumbs[0].Message)
+	frame := result.Exception[0].Stacktrace.Frames[0]
+	if frame.Filename != "private.go" {
+		t.Fatalf("filename = %q, want basename only", frame.Filename)
 	}
 }
 
-func TestScrubEvent_Tags(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
-	event := &sentry.Event{
-		Tags: map[string]string{"url": "https://api.example.com/" + awsKey},
+func TestSafeScrubFilename_UsesCrossPlatformLeaf(t *testing.T) {
+	s := NewScrubber(nil, nil)
+	key := "tok" + "en"
+	result := s.safeScrubFilename(`/home/agent/src/private.go?` + key + `=novel-secret`)
+	if strings.Contains(result, "/home/agent") || strings.Contains(result, "novel-secret") {
+		t.Fatalf("filename scrub leaked path or token payload in %q", result)
 	}
-	result := s.ScrubEvent(event, nil)
-	if !containsRedacted(result.Tags["url"]) {
-		t.Errorf("expected [REDACTED] in tag %q", result.Tags["url"])
+	if !strings.Contains(result, "private.go?"+key+"="+redacted) {
+		t.Fatalf("filename scrub = %q, want basename with redacted token value", result)
 	}
 }
 
-func TestScrubEvent_RequestWiped(t *testing.T) {
+func TestScrubEvent_FrameIdentifiersScrubQueryPayloads(t *testing.T) {
 	s := NewScrubber(nil, nil)
 	event := &sentry.Event{
-		Request: &sentry.Request{
-			URL:    "https://api.example.com/secret",
-			Method: "POST",
-		},
+		Exception: []sentry.Exception{{
+			Stacktrace: &sentry.Stacktrace{
+				Frames: []sentry.Frame{{
+					Function: "handler?" + "token=novel-secret",
+					Module:   "runtime&" + "api_key=novel-secret",
+					Filename: "/tmp/private-token=novel-secret.go?session=novel-secret",
+				}},
+			},
+		}},
 	}
+
 	result := s.ScrubEvent(event, nil)
-	if result.Request != nil {
-		t.Error("expected Request to be wiped")
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal sanitized event: %v", err)
+	}
+	payload := string(raw)
+	if strings.Contains(payload, "novel-secret") {
+		t.Fatalf("frame identifier query payload leaked in %s", payload)
+	}
+	frame := result.Exception[0].Stacktrace.Frames[0]
+	for _, field := range []string{frame.Function, frame.Module, frame.Filename} {
+		if !containsRedacted(field) {
+			t.Fatalf("frame field %q did not include redaction marker", field)
+		}
 	}
 }
 
-func TestScrubEvent_UserWiped(t *testing.T) {
-	s := NewScrubber(nil, nil)
-	event := &sentry.Event{
-		User: sentry.User{
-			ID:        "123",
-			IPAddress: "192.168.1.1",
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	if result.User.ID != "" || result.User.IPAddress != "" {
-		t.Error("expected User to be wiped")
+func TestScrubEvent_SanitizerPanicDropsEvent(t *testing.T) {
+	s := &Scrubber{patterns: []*regexp.Regexp{nil}}
+	result := s.ScrubEvent(&sentry.Event{Message: "panic path"}, nil)
+	if result != nil {
+		t.Fatalf("expected sanitizer panic to drop event, got %+v", result)
 	}
 }
 
@@ -240,14 +418,12 @@ func TestNewScrubber_InvalidPatternSkipped(t *testing.T) {
 		{Name: "Valid", Regex: `secret`, Severity: "high"},
 	}
 	s := NewScrubber(patterns, nil)
-	// Should not panic. Safety-net patterns + one valid = at least len(safetyNetPatterns)+1.
 	if len(s.patterns) < len(safetyNetPatterns)+1 {
 		t.Errorf("expected at least %d patterns, got %d", len(safetyNetPatterns)+1, len(s.patterns))
 	}
 }
 
 func TestScrubString_SafetyNetPatternsAlwaysApplied(t *testing.T) {
-	// Even with no config DLP patterns, safety-net patterns should work.
 	s := NewScrubber(nil, nil)
 	bearerInput := "header: Bearer " + "some-token-value-here"
 	result := s.ScrubString(bearerInput)
@@ -256,215 +432,10 @@ func TestScrubString_SafetyNetPatternsAlwaysApplied(t *testing.T) {
 	}
 }
 
-func TestScrubEvent_ServerNameWiped(t *testing.T) {
-	s := NewScrubber(nil, nil)
-	event := &sentry.Event{
-		ServerName: "prod-secret-host-01.internal.corp",
-	}
-	result := s.ScrubEvent(event, nil)
-	if result.ServerName != "" {
-		t.Errorf("expected ServerName to be wiped, got %q", result.ServerName)
-	}
-}
-
-func TestScrubEvent_ExceptionType(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
-	event := &sentry.Event{
-		Exception: []sentry.Exception{
-			{
-				Type:  "error at " + awsKey,
-				Value: "some value",
-			},
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	if !containsRedacted(result.Exception[0].Type) {
-		t.Errorf("expected [REDACTED] in exception type %q", result.Exception[0].Type)
-	}
-}
-
-func TestScrubEvent_Transaction(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
-	event := &sentry.Event{
-		Transaction: "/api/fetch?key=" + awsKey,
-	}
-	result := s.ScrubEvent(event, nil)
-	if !containsRedacted(result.Transaction) {
-		t.Errorf("expected [REDACTED] in transaction %q", result.Transaction)
-	}
-}
-
-func TestScrubEvent_Fingerprint(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
-	event := &sentry.Event{
-		Fingerprint: []string{"error-group", "key=" + awsKey},
-	}
-	result := s.ScrubEvent(event, nil)
-	if !containsRedacted(result.Fingerprint[1]) {
-		t.Errorf("expected [REDACTED] in fingerprint %q", result.Fingerprint[1])
-	}
-}
-
-func TestScrubEvent_BreadcrumbDataNonStringDeleted(t *testing.T) {
-	s := NewScrubber(nil, nil)
-	event := &sentry.Event{
-		Breadcrumbs: []*sentry.Breadcrumb{
-			{
-				Message: "test",
-				Data: map[string]interface{}{
-					"safe":      "value",
-					"dangerous": map[string]interface{}{"nested": "secret"},
-				},
-			},
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	if _, ok := result.Breadcrumbs[0].Data["dangerous"]; ok {
-		t.Error("expected non-string breadcrumb data to be deleted (fail-closed)")
-	}
-	if _, ok := result.Breadcrumbs[0].Data["safe"]; !ok {
-		t.Error("expected string breadcrumb data to be preserved")
-	}
-}
-
-func TestScrubEvent_ContextsStringScrubbed(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
-	event := &sentry.Event{
-		Contexts: map[string]sentry.Context{
-			"custom": {"url": "https://api.example.com/" + awsKey},
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	sv, ok := result.Contexts["custom"]["url"].(string)
-	if !ok {
-		t.Fatal("expected context value to remain string")
-	}
-	if !containsRedacted(sv) {
-		t.Errorf("expected [REDACTED] in context value %q", sv)
-	}
-}
-
-func TestScrubEvent_ContextsNonStringDeleted(t *testing.T) {
-	s := NewScrubber(nil, nil)
-	event := &sentry.Event{
-		Contexts: map[string]sentry.Context{
-			"custom": {
-				"safe":      "value",
-				"dangerous": []byte("secret bytes"),
-				"number":    42,
-			},
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	if _, ok := result.Contexts["custom"]["dangerous"]; ok {
-		t.Error("expected non-string Context value to be deleted (fail-closed)")
-	}
-	if _, ok := result.Contexts["custom"]["number"]; ok {
-		t.Error("expected non-string Context value to be deleted (fail-closed)")
-	}
-	if _, ok := result.Contexts["custom"]["safe"]; !ok {
-		t.Error("expected string Context value to be preserved")
-	}
-}
-
-func TestScrubEvent_VarsNonStringDeleted(t *testing.T) {
-	s := NewScrubber(nil, nil)
-	event := &sentry.Event{
-		Exception: []sentry.Exception{
-			{
-				Value: "error",
-				Stacktrace: &sentry.Stacktrace{
-					Frames: []sentry.Frame{
-						{Vars: map[string]interface{}{
-							"safe":      "value",
-							"dangerous": []string{"nested"},
-						}},
-					},
-				},
-			},
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	vars := result.Exception[0].Stacktrace.Frames[0].Vars
-	if _, ok := vars["dangerous"]; ok {
-		t.Error("expected non-string Vars value to be deleted (fail-closed)")
-	}
-	if _, ok := vars["safe"]; !ok {
-		t.Error("expected string Vars value to be preserved")
-	}
-}
-
-func TestScrubEvent_ThreadsVarsScrubbed(t *testing.T) {
-	awsKey := testAWSKeyID
-	s := NewScrubber(testDLPPatterns(), nil)
-	event := &sentry.Event{
-		Threads: []sentry.Thread{
-			{
-				ID:   "1",
-				Name: "main",
-				Stacktrace: &sentry.Stacktrace{
-					Frames: []sentry.Frame{
-						{Vars: map[string]interface{}{"key": awsKey, "safe": "hello"}},
-					},
-				},
-			},
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	sv, ok := result.Threads[0].Stacktrace.Frames[0].Vars["key"].(string)
-	if !ok || !containsRedacted(sv) {
-		t.Errorf("expected [REDACTED] in thread frame vars, got %v", result.Threads[0].Stacktrace.Frames[0].Vars["key"])
-	}
-	if _, ok := result.Threads[0].Stacktrace.Frames[0].Vars["safe"]; !ok {
-		t.Error("expected safe string var to be preserved in thread")
-	}
-}
-
-func TestScrubEvent_ThreadsVarsNonStringDeleted(t *testing.T) {
-	s := NewScrubber(nil, nil)
-	event := &sentry.Event{
-		Threads: []sentry.Thread{
-			{
-				ID: "1",
-				Stacktrace: &sentry.Stacktrace{
-					Frames: []sentry.Frame{
-						{Vars: map[string]interface{}{
-							"safe":      "value",
-							"dangerous": 42,
-						}},
-					},
-				},
-			},
-		},
-	}
-	result := s.ScrubEvent(event, nil)
-	vars := result.Threads[0].Stacktrace.Frames[0].Vars
-	if _, ok := vars["dangerous"]; ok {
-		t.Error("expected non-string thread var to be deleted (fail-closed)")
-	}
-	if _, ok := vars["safe"]; !ok {
-		t.Error("expected string thread var to be preserved")
-	}
-}
-
-func TestScrubEvent_ThreadsNilStacktrace(t *testing.T) {
-	s := NewScrubber(nil, nil)
-	event := &sentry.Event{
-		Threads: []sentry.Thread{
-			{ID: "1", Stacktrace: nil},
-		},
-	}
-	// Should not panic on nil stacktrace.
-	result := s.ScrubEvent(event, nil)
-	if len(result.Threads) != 1 {
-		t.Errorf("expected 1 thread, got %d", len(result.Threads))
-	}
-}
-
 func containsRedacted(s string) bool {
 	return strings.Contains(s, redacted)
+}
+
+func fakeURLWithUserinfo(user, pass, host, path string) string {
+	return "wss://" + user + ":" + pass + "@" + host + path
 }
