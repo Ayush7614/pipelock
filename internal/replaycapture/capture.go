@@ -45,6 +45,13 @@ const policyHashLabelPrefix = "sha256:"
 // the synthetic AWS example key is detected. Public-rule-id-by-construction.
 const awsKeyPatternName = "AWS Access Key ID"
 
+var (
+	afterEarlyRecorderCloseForTest  func()
+	afterRecorderConstructedForTest func(*recorder.Recorder)
+	beforeProxyConstructedForTest   func(*config.Config)
+	beforeDriveScenarioForTest      func(*Scenario)
+)
+
 // CapturedScenario is the genuine result of driving one scenario through a real
 // Pipelock proxy: the signed receipt chain plus the metadata needed to assemble
 // an Audit Packet and a replay manifest.
@@ -113,7 +120,7 @@ func (e *Engine) PublicKeyHex() string { return e.pubKeyHex }
 // Capture drives one scenario's synthetic request(s) through a real proxy and
 // returns the captured, signed receipt chain. The verdict comes entirely from
 // the real scanner pipeline; nothing here simulates a decision.
-func (e *Engine) Capture(s Scenario) (*CapturedScenario, error) {
+func (e *Engine) Capture(s Scenario) (_ *CapturedScenario, err error) {
 	evidenceDir := filepath.Join(e.workDir, s.ID)
 	if err := os.MkdirAll(evidenceDir, 0o750); err != nil {
 		return nil, fmt.Errorf("scenario %s: evidence dir: %w", s.ID, err)
@@ -138,6 +145,21 @@ func (e *Engine) Capture(s Scenario) (*CapturedScenario, error) {
 	if err != nil {
 		return nil, fmt.Errorf("scenario %s: recorder: %w", s.ID, err)
 	}
+	// Close the recorder on any early-error return before it is closed on the
+	// success path below; without this, a failure after construction (emitter,
+	// session_open, proxy, or drive) leaks the recorder's open file handle.
+	recClosed := false
+	defer func() {
+		if err != nil && !recClosed {
+			_ = rec.Close()
+			if afterEarlyRecorderCloseForTest != nil {
+				afterEarlyRecorderCloseForTest()
+			}
+		}
+	}()
+	if afterRecorderConstructedForTest != nil {
+		afterRecorderConstructedForTest(rec)
+	}
 
 	policyHash := configHash(cfg)
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
@@ -150,7 +172,13 @@ func (e *Engine) Capture(s Scenario) (*CapturedScenario, error) {
 	if emitter == nil {
 		return nil, fmt.Errorf("scenario %s: emitter construction failed", s.ID)
 	}
+	if err := emitter.EmitSessionOpen(); err != nil {
+		return nil, fmt.Errorf("scenario %s: session_open receipt: %w", s.ID, err)
+	}
 
+	if beforeProxyConstructedForTest != nil {
+		beforeProxyConstructedForTest(cfg)
+	}
 	p, err := proxy.New(cfg, audit.NewNop(), sc, metrics.New(),
 		proxy.WithRecorder(rec),
 		proxy.WithReceiptEmitter(emitter),
@@ -163,11 +191,15 @@ func (e *Engine) Capture(s Scenario) (*CapturedScenario, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), captureTimeout)
 	defer cancel()
 
+	if beforeDriveScenarioForTest != nil {
+		beforeDriveScenarioForTest(&s)
+	}
 	if err := driveScenario(ctx, s, p.Handler()); err != nil {
 		return nil, fmt.Errorf("scenario %s: drive: %w", s.ID, err)
 	}
 
-	if err := rec.Close(); err != nil {
+	recClosed = true
+	if err = rec.Close(); err != nil {
 		return nil, fmt.Errorf("scenario %s: recorder close: %w", s.ID, err)
 	}
 

@@ -10,6 +10,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +94,14 @@ const (
 	// reload between ServeHTTP and RoundTrip could flip signing on/off
 	// mid-request - a TOCTOU race flagged by CodeRabbit on PR #403.
 	ctxKeyReverseEnvelopeEmitter
+	// ctxKeyReverseActionID carries the reverse-proxy admission action_id
+	// into ModifyResponse so required response passthrough allow receipts can
+	// reuse the same action identity before client egress.
+	ctxKeyReverseActionID
+	// ctxKeyReverseOutcome carries the per-request reverse-proxy outcome
+	// tracker. httputil.ReverseProxy completes through callbacks, so ServeHTTP
+	// owns final emission while callbacks only record status/bytes/reason.
+	ctxKeyReverseOutcome
 
 	// ctxKeyEnvelopeEmitter snapshots the fetch/forward envelope emitter
 	// decision, including an explicit nil when signing was off at
@@ -997,6 +1007,9 @@ func requiredReceiptBlockMetricReason(err error) string {
 	if errors.Is(err, errReceiptEmitterUnavailable) {
 		return receipt.FailReasonUnavailable
 	}
+	if errors.Is(err, recorder.ErrDurability) {
+		return "durability"
+	}
 	return "emit_error"
 }
 
@@ -1010,11 +1023,54 @@ func (p *Proxy) emitRequiredReceipt(opts receipt.EmitOpts) error {
 		p.recordRequiredReceiptBlock(err, opts.Transport)
 		return err
 	}
-	if err := p.emitReceiptWithEmitter(opts, e); err != nil {
+	if err := p.emitRequiredReceiptWithEmitter(opts, e); err != nil {
 		p.recordRequiredReceiptBlock(err, opts.Transport)
 		return err
 	}
 	return nil
+}
+
+func (p *Proxy) emitRequiredReceiptWithEmitter(opts receipt.EmitOpts, e *receipt.Emitter) error {
+	if e == nil {
+		return nil
+	}
+	opts.DecisionPhase = receipt.DecisionPhaseIntent
+	if err := e.EmitDurable(opts); err != nil {
+		p.logReceiptEmissionFailure(opts, err)
+		// v1 stays authoritative: skip v2 when v1 failed to record, so a
+		// proxy_decision never outlives its action_receipt sibling.
+		return err
+	}
+	// Dual-emit the v2 proxy_decision receipt (expand phase; v1 stays live).
+	p.emitV2Receipt(opts)
+	return nil
+}
+
+const receiptOutcomeLayer = "outcome"
+
+func receiptOutcomePattern(status string, bytesTransferred int64, reason string) string {
+	if status == "" {
+		status = "unknown"
+	}
+	if reason == "" {
+		reason = "complete"
+	}
+	bytesValue := "unknown"
+	if bytesTransferred >= 0 {
+		bytesValue = strconv.FormatInt(bytesTransferred, 10)
+	}
+	return fmt.Sprintf("status=%s bytes=%s reason=%s", status, bytesValue, reason)
+}
+
+func (p *Proxy) emitOutcomeReceipt(cfg *config.Config, opts receipt.EmitOpts, status string, bytesTransferred int64, reason string) {
+	if cfg == nil || !cfg.FlightRecorder.RequireReceipts {
+		return
+	}
+	opts.DecisionPhase = receipt.DecisionPhaseOutcome
+	opts.Verdict = config.ActionAllow
+	opts.Layer = receiptOutcomeLayer
+	opts.Pattern = receiptOutcomePattern(status, bytesTransferred, reason)
+	_ = p.emitReceipt(withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash()))
 }
 
 func (p *Proxy) emitReceiptWithEmitter(opts receipt.EmitOpts, e *receipt.Emitter) error {
@@ -1077,6 +1133,10 @@ type receiptEmitterStage struct {
 	// key as emitter and dual-emitted with it. nil when receipts are
 	// disabled. Published to p.v2EmitterPtr alongside emitter.
 	v2 *proxydecision.Emitter
+	// reuseExisting is true when the staged v1 emitter is the already-live
+	// emitter for the same signing key. Publish must update its config hash but
+	// must not emit a second session_open.
+	reuseExisting bool
 	// keyPath is the signing key path that was actually loaded, or ""
 	// when receipts are disabled. The caller assigns this to
 	// p.receiptKeyPath at publish time.
@@ -1124,6 +1184,28 @@ func (p *Proxy) buildReceiptEmitter(cfg *config.Config) (receiptEmitterStage, er
 	// (e.g. key rotation). Cross-restart the chain restarts at genesis; the
 	// recorder's outer hash chain provides tamper-evidence across restarts.
 	resumeSeq, resumePrev := p.v2EmitterPtr.Load().ChainState()
+	currentKeyHex := fmt.Sprintf("%x", privKey.Public().(ed25519.PublicKey))
+	if current := p.receiptEmitterPtr.Load(); current != nil && current.InitError() == nil && current.SignerKeyHex() == currentKeyHex {
+		v2 := p.v2EmitterPtr.Load()
+		if v2 == nil {
+			v2 = proxydecision.NewEmitter(proxydecision.EmitterConfig{
+				Recorder:       p.recorder,
+				Signer:         proxydecision.NewKeyedSigner(privKey),
+				Sanitize:       proxydecision.SanitizeFromRedactor(p.recorder.ReceiptRedactor()),
+				Principal:      "local",
+				Actor:          "pipelock",
+				ResumeSeq:      resumeSeq,
+				ResumePrevHash: resumePrev,
+			})
+		}
+		return receiptEmitterStage{
+			emitter:       current,
+			v2:            v2,
+			reuseExisting: true,
+			keyPath:       keyPath,
+		}, nil
+	}
+
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
 		Recorder:   p.recorder,
 		PrivKey:    privKey,
@@ -1556,6 +1638,23 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		p.v2EmitterPtr.Store(nil)
 		p.receiptKeyPath = ""
 	} else if p.recorder != nil {
+		// A rebuilt emitter has a fresh run_nonce and may represent a signer
+		// rotation segment. Emit the signed open synchronously before publishing
+		// the pointer so no request can be attested under the new emitter before
+		// its run window is recorded.
+		if receiptStage.reuseExisting {
+			receiptStage.emitter.UpdateConfigHash(cfg.Hash())
+		} else if receiptStage.emitter != nil {
+			if err := receiptStage.emitter.EmitSessionOpen(); err != nil {
+				p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
+					fmt.Errorf("session_open receipt emit failed, keeping old config: %w", err))
+				sc.Close()
+				if newEd != nil {
+					newEd.Close()
+				}
+				return false
+			}
+		}
 		p.receiptEmitterPtr.Store(receiptStage.emitter)
 		p.v2EmitterPtr.Store(receiptStage.v2)
 		p.receiptKeyPath = receiptStage.keyPath
@@ -1646,9 +1745,9 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 	}
 	p.updateCEEStats()
 
-	// Receipt emitter hash is updated by the receipt emitter build above.
-	// No separate UpdateConfigHash needed - emitter is always (re)created
-	// with the current cfg.Hash() when a signing key is configured.
+	// Receipt emitter hash is updated by the receipt emitter publish above.
+	// Same-key reloads reuse the live v1/v2 emitters to avoid stale-pointer
+	// chain forks; signer rotations still create a new segment.
 	return true
 }
 
@@ -4096,6 +4195,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	outcomeStatus := "unknown"
+	outcomeBytes := int64(-1)
+	outcomeReason := "incomplete"
+	defer func() {
+		p.emitOutcomeReceipt(cfg, fetchAllowReceipt, outcomeStatus, outcomeBytes, outcomeReason)
+	}()
 
 	resp, err := p.client.Do(req) //nolint:gosec // G704: URL validated by scanner pipeline before reaching here
 	if err != nil {
@@ -4132,6 +4237,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			writeBlockedJSON(w,
 				redirectBlockedInfo(blockedErr),
 				http.StatusForbidden, resp)
+			outcomeStatus = strconv.Itoa(http.StatusForbidden)
+			outcomeReason = blockedErr.layer
 			return
 		}
 		log.LogError(actx, err)
@@ -4140,6 +4247,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent: agent,
 			Error: fmt.Sprintf("fetch failed: %v", err),
 		})
+		outcomeStatus = strconv.Itoa(http.StatusBadGateway)
+		outcomeReason = "fetch_failed"
 		return
 	}
 	defer safeClose(resp.Body, "resp.Body", p.logger)
@@ -4173,6 +4282,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				Blocked:     true,
 				BlockReason: "compressed response cannot be scanned",
 			})
+		outcomeStatus = strconv.Itoa(http.StatusForbidden)
+		outcomeReason = "compressed_response"
 		return
 	}
 
@@ -4198,6 +4309,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent: agent,
 			Error: fmt.Sprintf("reading response: %v", err),
 		})
+		outcomeStatus = strconv.Itoa(http.StatusBadGateway)
+		outcomeReason = "response_read_error"
 		return
 	}
 	if int64(len(body)) > maxBytes {
@@ -4227,6 +4340,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 					Blocked:     true,
 					BlockReason: reason,
 				})
+			outcomeStatus = strconv.Itoa(http.StatusBadGateway)
+			outcomeReason = "response_size"
 			return
 		}
 		// Budget was the limiter: return 429.
@@ -4253,6 +4368,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				Blocked:     true,
 				BlockReason: reason,
 			})
+		outcomeStatus = strconv.Itoa(http.StatusTooManyRequests)
+		outcomeBytes = int64(len(body))
+		outcomeReason = "budget"
 		return
 	}
 
@@ -4286,6 +4404,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				URL: displayURL, Agent: agent, Blocked: true,
 				BlockReason: "response body exceeds browser shield size limit",
 			})
+		outcomeStatus = strconv.Itoa(http.StatusForbidden)
+		outcomeBytes = int64(len(body))
+		outcomeReason = "shield_oversize"
 		return
 	}
 
@@ -4320,6 +4441,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				URL: displayURL, Agent: agent, Blocked: true,
 				BlockReason: mediaVerdict.BlockReason,
 			})
+		outcomeStatus = strconv.Itoa(http.StatusForbidden)
+		outcomeBytes = int64(len(body))
+		outcomeReason = "media_policy"
 		return
 	}
 	if mediaVerdict.StripResult != nil && mediaVerdict.StripResult.Changed() {
@@ -4349,6 +4473,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			// Exempt domains: scan for visibility but pin to warn, no adaptive scoring.
 			blocked, _, found := p.filterAndActOnResponseScan(w, rawResult, content, displayURL, agent, clientIP, requestID, actionID, sc, cfg, log, recEscalationLevel(fetchRec), responseScanExempt)
 			if blocked {
+				outcomeStatus = strconv.Itoa(http.StatusForbidden)
+				outcomeBytes = int64(len(body))
+				outcomeReason = "response_scan"
 				return
 			}
 			if found {
@@ -4397,6 +4524,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			blockInfoFor(blockreason.PromptInjection, ""),
 			http.StatusForbidden,
 			FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
+		outcomeStatus = strconv.Itoa(http.StatusForbidden)
+		outcomeBytes = int64(len(body))
+		outcomeReason = "response_scan"
 		return
 	}
 
@@ -4444,6 +4574,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		}
 		if blocked {
 			p.metrics.RecordBlocked(parsed.Hostname(), "response_scan", time.Since(start), agentLabel)
+			outcomeStatus = strconv.Itoa(http.StatusForbidden)
+			outcomeBytes = int64(len(body))
+			outcomeReason = "response_scan"
 			return
 		}
 		content = newContent
@@ -4484,6 +4617,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		Content:     content,
 		Blocked:     false,
 	})
+	outcomeStatus = strconv.Itoa(resp.StatusCode)
+	outcomeBytes = int64(len(body))
+	outcomeReason = "complete"
 }
 
 func recordSuppressedResponseScanExempts(m *metrics.Metrics, matches []scanner.ResponseMatch, transport string) {

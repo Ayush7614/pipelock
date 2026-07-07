@@ -591,16 +591,26 @@ func TestMcpProxyCmd_EmitsSignedReceipts_StdioSubprocess(t *testing.T) {
 	if len(receipts) == 0 {
 		t.Fatalf("expected at least one action receipt in %s", evidenceDir)
 	}
+	if receipts[0].ActionRecord.SessionControl == nil ||
+		receipts[0].ActionRecord.SessionControl.Kind != receipt.SessionControlOpen {
+		t.Fatalf("first receipt session_control = %+v, want session_open before MCP stdio egress", receipts[0].ActionRecord.SessionControl)
+	}
 
 	var blockFound bool
-	for _, rcpt := range receipts {
+	for i, rcpt := range receipts {
 		if err := receipt.VerifyWithKey(rcpt, pubHex); err != nil {
 			t.Fatalf("VerifyWithKey(receipt): %v", err)
+		}
+		if rcpt.ActionRecord.SessionControl != nil {
+			continue
 		}
 		if rcpt.ActionRecord.Transport != "mcp_stdio" {
 			t.Fatalf("transport = %q, want mcp_stdio", rcpt.ActionRecord.Transport)
 		}
 		if rcpt.ActionRecord.Verdict == config.ActionBlock {
+			if i == 0 {
+				t.Fatal("block receipt appeared before session_open")
+			}
 			blockFound = true
 		}
 	}
@@ -727,16 +737,26 @@ func TestMcpProxyCmd_EmitsSignedReceipts_HTTPUpstream(t *testing.T) {
 	if len(receipts) == 0 {
 		t.Fatalf("expected at least one action receipt in %s", evidenceDir)
 	}
+	if receipts[0].ActionRecord.SessionControl == nil ||
+		receipts[0].ActionRecord.SessionControl.Kind != receipt.SessionControlOpen {
+		t.Fatalf("first receipt session_control = %+v, want session_open before MCP HTTP egress", receipts[0].ActionRecord.SessionControl)
+	}
 
 	var blockFound bool
-	for _, rcpt := range receipts {
+	for i, rcpt := range receipts {
 		if err := receipt.VerifyWithKey(rcpt, pubHex); err != nil {
 			t.Fatalf("VerifyWithKey(receipt): %v", err)
+		}
+		if rcpt.ActionRecord.SessionControl != nil {
+			continue
 		}
 		if rcpt.ActionRecord.Transport != "mcp_http_upstream" {
 			t.Fatalf("transport = %q, want mcp_http_upstream", rcpt.ActionRecord.Transport)
 		}
 		if rcpt.ActionRecord.Verdict == config.ActionBlock {
+			if i == 0 {
+				t.Fatal("block receipt appeared before session_open")
+			}
 			blockFound = true
 		}
 	}

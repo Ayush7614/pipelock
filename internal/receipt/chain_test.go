@@ -239,6 +239,187 @@ func TestVerifyChain_InvalidSignature(t *testing.T) {
 	}
 }
 
+func TestVerifyChainIntegrityOnlyNoOpen(t *testing.T) {
+	t.Parallel()
+
+	pub, priv := generateTestKey(t)
+	keyHex := hex.EncodeToString(pub)
+	ar := ActionRecord{
+		Version:       ActionRecordVersion,
+		ActionID:      NewActionID(),
+		ActionType:    ActionUnclassified,
+		Timestamp:     time.Date(2026, 7, 6, 14, 0, 0, 0, time.UTC),
+		Target:        "pipelock://session/heartbeat",
+		Verdict:       testVerdict,
+		Transport:     "session_control",
+		ChainPrevHash: GenesisHash,
+		ChainSeq:      0,
+		RunNonce:      "run-no-open-integrity",
+		SessionControl: &SessionControl{
+			Kind: SessionControlHeartbeat,
+			Heartbeat: &SessionHeartbeat{
+				RunNonce:         "run-no-open-integrity",
+				OpenNonce:        "open-no-open-integrity",
+				Beat:             1,
+				HeartbeatTime:    time.Date(2026, 7, 6, 14, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+				DurabilityBlocks: 1,
+			},
+		},
+	}
+	r, err := Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	chain := []Receipt{r}
+
+	result := VerifyChain(chain, keyHex)
+	if result.Valid {
+		t.Fatal("chain with run_nonce and no session_open should be invalid")
+	}
+	if result.FailureKind != ChainFailureLifecycleOpen || !result.IntegrityVerified {
+		t.Fatalf("result kind/integrity = %q/%t, want %q/true: %#v",
+			result.FailureKind, result.IntegrityVerified, ChainFailureLifecycleOpen, result)
+	}
+	if integrity := VerifyChainIntegrity(chain, keyHex); !integrity.Valid {
+		t.Fatalf("integrity-only verification failed: %s", integrity.Error)
+	}
+
+	chain[0].ActionRecord.Target = "https://api.vendor.example/forged-no-open"
+	result = VerifyChain(chain, keyHex)
+	if result.Valid || result.FailureKind != ChainFailureIntegrity || result.IntegrityVerified {
+		t.Fatalf("forged no-open result = valid %t kind %q integrity %t, want integrity failure: %#v",
+			result.Valid, result.FailureKind, result.IntegrityVerified, result)
+	}
+}
+
+func TestVerifyChainFailureKindsDoNotOverDowngrade(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 7, 6, 15, 0, 0, 0, time.UTC)
+
+	t.Run("forged_first_receipt", func(t *testing.T) {
+		t.Parallel()
+		pub, priv := generateTestKey(t)
+		chain := []Receipt{signBoundOpen(t, priv, base)}
+		chain[0].ActionRecord.Target = "https://api.vendor.example/forged-first"
+
+		requireChainFailure(t, VerifyChain(chain, hex.EncodeToString(pub)), ChainFailureIntegrity)
+	})
+
+	t.Run("forged_mid_chain_receipt", func(t *testing.T) {
+		t.Parallel()
+		pub, priv := generateTestKey(t)
+		open := signBoundOpen(t, priv, base)
+		action := signRunReceipt(t, priv, 1, mustHash(t, open), sessionOpenTestRunA, base.Add(time.Second))
+		action.ActionRecord.Target = "https://api.vendor.example/forged-mid"
+
+		requireChainFailure(t, VerifyChain([]Receipt{open, action}, hex.EncodeToString(pub)), ChainFailureIntegrity)
+	})
+
+	t.Run("forged_heartbeat_in_open_chain", func(t *testing.T) {
+		t.Parallel()
+		pub, priv := generateTestKey(t)
+		open := signBoundOpen(t, priv, base)
+		heartbeat := signHeartbeatReceipt(t, priv, 1, mustHash(t, open), sessionOpenTestRunA, "open-a", base.Add(time.Second))
+		heartbeat.ActionRecord.Target = "https://api.vendor.example/forged-heartbeat"
+
+		requireChainFailure(t, VerifyChain([]Receipt{open, heartbeat}, hex.EncodeToString(pub)), ChainFailureIntegrity)
+	})
+
+	t.Run("forged_close_in_open_chain", func(t *testing.T) {
+		t.Parallel()
+		pub, priv := generateTestKey(t)
+		open := signBoundOpen(t, priv, base)
+		closeReceipt := signCloseReceipt(t, priv, 1, mustHash(t, open), sessionOpenTestRunA, "open-a", base.Add(time.Second))
+		closeReceipt.ActionRecord.Target = "https://api.vendor.example/forged-close"
+
+		requireChainFailure(t, VerifyChain([]Receipt{open, closeReceipt}, hex.EncodeToString(pub)), ChainFailureIntegrity)
+	})
+
+	t.Run("untrusted_signer_key", func(t *testing.T) {
+		t.Parallel()
+		pubA, privA := generateTestKey(t)
+		pubB, privB := generateTestKey(t)
+		open := signBoundOpen(t, privA, base)
+		priorHash := mustHash(t, open)
+		marker := &KeyTransition{
+			PriorSignerKey: hex.EncodeToString(pubA),
+			PriorChainSeq:  open.ActionRecord.ChainSeq,
+			PriorChainHash: priorHash,
+		}
+		rotated := signRestartOpen(t, privB, 0, priorHash, open.ActionRecord.ChainSeq, sessionOpenTestRunB, base.Add(time.Second), marker)
+
+		requireChainFailure(t, VerifyChainTrusted([]Receipt{open, rotated}, []string{hex.EncodeToString(pubA)}), ChainFailureTrust)
+		requireChainFailure(t, VerifyChainIntegrityTrusted([]Receipt{open, rotated}, []string{hex.EncodeToString(pubA)}), ChainFailureTrust)
+		if res := VerifyChainTrusted([]Receipt{open, rotated}, []string{hex.EncodeToString(pubA), hex.EncodeToString(pubB)}); !res.Valid {
+			t.Fatalf("trusted rotation should verify: %s", res.Error)
+		}
+	})
+
+	t.Run("duplicate_open_lifecycle_failure", func(t *testing.T) {
+		t.Parallel()
+		pub, priv := generateTestKey(t)
+		open := signBoundOpen(t, priv, base)
+		priorHash := mustHash(t, open)
+		duplicate := signRestartOpen(t, priv, 1, priorHash, open.ActionRecord.ChainSeq, sessionOpenTestRunA, base.Add(time.Second), nil)
+
+		requireChainFailure(t, VerifyChain([]Receipt{open, duplicate}, hex.EncodeToString(pub)), ChainFailureLifecycle)
+		if integrity := VerifyChainIntegrity([]Receipt{open, duplicate}, hex.EncodeToString(pub)); !integrity.Valid {
+			t.Fatalf("integrity-only duplicate-open chain should verify structurally: %s", integrity.Error)
+		}
+	})
+
+	t.Run("wrong_open_nonce_lifecycle_failure", func(t *testing.T) {
+		t.Parallel()
+		pub, priv := generateTestKey(t)
+		open := signBoundOpen(t, priv, base)
+		heartbeat := signHeartbeatReceipt(t, priv, 1, mustHash(t, open), sessionOpenTestRunA, "wrong-open", base.Add(time.Second))
+
+		requireChainFailure(t, VerifyChain([]Receipt{open, heartbeat}, hex.EncodeToString(pub)), ChainFailureLifecycle)
+		if integrity := VerifyChainIntegrity([]Receipt{open, heartbeat}, hex.EncodeToString(pub)); !integrity.Valid {
+			t.Fatalf("integrity-only wrong-open-nonce chain should verify structurally: %s", integrity.Error)
+		}
+	})
+}
+
+func signHeartbeatReceipt(t *testing.T, priv ed25519.PrivateKey, seq uint64, prevHash, runNonce, openNonce string, ts time.Time) Receipt {
+	t.Helper()
+	return signSessionReceipt(t, priv, seq, prevHash, ts, runNonce, &SessionControl{
+		Kind: SessionControlHeartbeat,
+		Heartbeat: &SessionHeartbeat{
+			RunNonce:         runNonce,
+			OpenNonce:        openNonce,
+			Beat:             1,
+			HeartbeatTime:    ts.Format(time.RFC3339Nano),
+			DurabilityBlocks: 1,
+		},
+	}, nil)
+}
+
+func signCloseReceipt(t *testing.T, priv ed25519.PrivateKey, seq uint64, prevHash, runNonce, openNonce string, ts time.Time) Receipt {
+	t.Helper()
+	return signSessionReceipt(t, priv, seq, prevHash, ts, runNonce, &SessionControl{
+		Kind: SessionControlClose,
+		Close: &SessionClose{
+			RunNonce:         runNonce,
+			OpenNonce:        openNonce,
+			FinalSeq:         seq - 1,
+			RootHash:         prevHash,
+			ReceiptCount:     seq,
+			CloseReason:      "normal",
+			DurabilityBlocks: 1,
+		},
+	}, nil)
+}
+
+func requireChainFailure(t *testing.T, res ChainResult, want ChainFailureKind) {
+	t.Helper()
+	if res.Valid || res.FailureKind != want || res.IntegrityVerified {
+		t.Fatalf("result = valid %t kind %q integrity %t, want invalid %q integrity false: %#v",
+			res.Valid, res.FailureKind, res.IntegrityVerified, want, res)
+	}
+}
+
 func TestVerifyChain_NoKeyPinning(t *testing.T) {
 	t.Parallel()
 
@@ -358,6 +539,7 @@ func TestExtractReceipts_HappyPath(t *testing.T) {
 		ConfigHash: "testhash",
 		Principal:  "test-principal",
 	})
+	emitSessionOpenForTest(t, e)
 
 	for i := 0; i < 3; i++ {
 		if err := e.Emit(EmitOpts{
@@ -388,8 +570,8 @@ func TestExtractReceipts_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractReceipts: %v", err)
 	}
-	if len(receipts) != 3 {
-		t.Fatalf("expected 3 receipts, got %d", len(receipts))
+	if len(receipts) != 4 {
+		t.Fatalf("expected 4 receipts, got %d", len(receipts))
 	}
 
 	// Verify the extracted chain
@@ -711,6 +893,7 @@ func TestResume_AfterTranscriptRoot_DoesNotBrick(t *testing.T) {
 	// Run 1: emit 2 receipts, seal with a transcript root, shut down.
 	rec1 := newTestRecorder(t, dir, priv)
 	e1 := NewEmitter(EmitterConfig{Recorder: rec1, PrivKey: priv, ConfigHash: testConfigHash, Principal: testPrincipal, Actor: testActor})
+	emitSessionOpenForTest(t, e1)
 	for range 2 {
 		if err := emit(e1); err != nil {
 			t.Fatalf("run1 Emit: %v", err)
@@ -732,6 +915,7 @@ func TestResume_AfterTranscriptRoot_DoesNotBrick(t *testing.T) {
 	if err := e2.InitError(); err != nil {
 		t.Fatalf("resume after sealed shutdown errored (should resume cleanly): %v", err)
 	}
+	emitSessionOpenForTest(t, e2)
 	// The post-seal restart MUST emit (not be bricked by ErrChainSealed).
 	for range 2 {
 		if err := emit(e2); err != nil {
@@ -742,7 +926,8 @@ func TestResume_AfterTranscriptRoot_DoesNotBrick(t *testing.T) {
 		t.Fatalf("close rec2: %v", err)
 	}
 
-	// All 4 action receipts (2 per run) form one continuous, verifiable chain.
+	// All 6 action receipts (session_open + 2 decisions per run) form one
+	// continuous, verifiable chain.
 	entries := readAllEntriesFromDir(t, dir)
 	var receipts []Receipt
 	for i := range entries {
@@ -755,15 +940,15 @@ func TestResume_AfterTranscriptRoot_DoesNotBrick(t *testing.T) {
 		}
 		receipts = append(receipts, *r)
 	}
-	if len(receipts) != 4 {
-		t.Fatalf("expected 4 action receipts across both runs, got %d", len(receipts))
+	if len(receipts) != 6 {
+		t.Fatalf("expected 6 action receipts across both runs, got %d", len(receipts))
 	}
 	res := VerifyChain(receipts, "")
 	if !res.Valid {
 		t.Fatalf("post-seal chain failed to verify: %s", res.Error)
 	}
-	if res.ReceiptCount != 4 {
-		t.Errorf("ReceiptCount = %d, want 4 (seq must continue across the seal, not reset)", res.ReceiptCount)
+	if res.ReceiptCount != 6 {
+		t.Errorf("ReceiptCount = %d, want 6 (seq must continue across the seal, not reset)", res.ReceiptCount)
 	}
 }
 
@@ -857,6 +1042,7 @@ func TestEmitter_ChainState(t *testing.T) {
 		Principal:  testPrincipal,
 		Actor:      testActor,
 	})
+	emitSessionOpenForTest(t, e)
 
 	const chainLen = 5
 	for range chainLen {
@@ -878,14 +1064,14 @@ func TestEmitter_ChainState(t *testing.T) {
 
 	// Read all receipts and verify chain integrity.
 	receipts := readAllReceiptsFromDir(t, dir, pub)
-	if len(receipts) != chainLen {
-		t.Fatalf("expected %d receipts, got %d", chainLen, len(receipts))
+	if len(receipts) != chainLen+1 {
+		t.Fatalf("expected %d receipts, got %d", chainLen+1, len(receipts))
 	}
 
-	// First receipt should have genesis prev_hash.
-	if receipts[0].ActionRecord.ChainPrevHash != GenesisHash {
-		t.Errorf("first receipt chain_prev_hash = %q, want %q",
-			receipts[0].ActionRecord.ChainPrevHash, GenesisHash)
+	// First receipt should have a bound session-open genesis prev_hash.
+	if !strings.HasPrefix(receipts[0].ActionRecord.ChainPrevHash, genesisSessionOpenPrefix) {
+		t.Errorf("first receipt chain_prev_hash = %q, want %q prefix",
+			receipts[0].ActionRecord.ChainPrevHash, genesisSessionOpenPrefix)
 	}
 
 	// Each receipt's seq should increment by 1.
@@ -914,8 +1100,8 @@ func TestEmitter_ChainState(t *testing.T) {
 	if !result.Valid {
 		t.Fatalf("VerifyChain failed: %s", result.Error)
 	}
-	if result.ReceiptCount != chainLen {
-		t.Errorf("VerifyChain receipt_count = %d, want %d", result.ReceiptCount, chainLen)
+	if result.ReceiptCount != chainLen+1 {
+		t.Errorf("VerifyChain receipt_count = %d, want %d", result.ReceiptCount, chainLen+1)
 	}
 }
 
@@ -1030,6 +1216,7 @@ func TestEmitter_ResumesChainAfterRestart(t *testing.T) {
 		if e == nil {
 			t.Fatal("NewEmitter() returned nil")
 		}
+		emitSessionOpenForTest(t, e)
 		return rec, e
 	}
 
@@ -1067,8 +1254,8 @@ func TestEmitter_ResumesChainAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QuerySession(): %v", err)
 	}
-	if len(result.Entries) != 3 {
-		t.Fatalf("receipt entry count = %d, want 3", len(result.Entries))
+	if len(result.Entries) != 5 {
+		t.Fatalf("receipt entry count = %d, want 5", len(result.Entries))
 	}
 
 	receipts := make([]Receipt, 0, len(result.Entries))
@@ -1116,6 +1303,7 @@ func TestExtractReceiptsWithSessionID_HappyPath(t *testing.T) {
 		ConfigHash: testConfigHash,
 		Principal:  testPrincipal,
 	})
+	emitSessionOpenForTest(t, e)
 
 	for i := 0; i < 3; i++ {
 		if err := e.Emit(EmitOpts{
@@ -1147,8 +1335,8 @@ func TestExtractReceiptsWithSessionID_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractReceiptsWithSessionID: %v", err)
 	}
-	if len(receipts) != 3 {
-		t.Fatalf("expected 3 receipts, got %d", len(receipts))
+	if len(receipts) != 4 {
+		t.Fatalf("expected 4 receipts, got %d", len(receipts))
 	}
 	if sessionID == "" {
 		t.Fatal("expected non-empty session ID")

@@ -6,13 +6,17 @@ package replaycapture
 import (
 	"context"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
@@ -114,6 +118,81 @@ func TestCapture_AllScenarios(t *testing.T) {
 			t.Logf("scenario %s: %d receipt(s), decisive verdict=%s layer=%q pattern=%q target=%q",
 				s.ID, got.ReceiptCount, decisive.ActionRecord.Verdict,
 				decisive.ActionRecord.Layer, decisive.ActionRecord.Pattern, decisive.ActionRecord.Target)
+		})
+	}
+}
+
+func TestCapture_EarlyErrorAfterRecorderConstructionClosesRecorder(t *testing.T) {
+	cases := map[string]struct {
+		configure func(*Engine)
+		wantErr   string
+	}{
+		"emitter construction": {
+			configure: func(eng *Engine) {
+				eng.privKey = nil
+			},
+			wantErr: "emitter construction failed",
+		},
+		"session open": {
+			configure: func(_ *Engine) {
+				afterRecorderConstructedForTest = func(rec *recorder.Recorder) {
+					_ = rec.Close()
+				}
+			},
+			wantErr: "session_open receipt",
+		},
+		"proxy construction": {
+			configure: func(_ *Engine) {
+				beforeProxyConstructedForTest = func(cfg *config.Config) {
+					cfg.MediationEnvelope.Enabled = true
+					cfg.MediationEnvelope.Sign = true
+					cfg.MediationEnvelope.SigningKeyPath = filepath.Join(t.TempDir(), "missing-envelope.key")
+				}
+			},
+			wantErr: "proxy:",
+		},
+		"drive": {
+			configure: func(_ *Engine) {
+				beforeDriveScenarioForTest = func(s *Scenario) {
+					s.ID = "unknown-after-proxy"
+				}
+			},
+			wantErr: "drive:",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			afterRecorderConstructedForTest = nil
+			beforeProxyConstructedForTest = nil
+			beforeDriveScenarioForTest = nil
+			closed := make(chan struct{}, 1)
+			afterEarlyRecorderCloseForTest = func() {
+				closed <- struct{}{}
+			}
+			t.Cleanup(func() {
+				afterEarlyRecorderCloseForTest = nil
+				afterRecorderConstructedForTest = nil
+				beforeProxyConstructedForTest = nil
+				beforeDriveScenarioForTest = nil
+			})
+
+			eng := newTestEngine(t)
+			tc.configure(eng)
+
+			_, err := eng.Capture(DefaultScenarios()[0])
+			if err == nil {
+				t.Fatalf("Capture unexpectedly succeeded for %s", name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Capture error = %q, want %q", err, tc.wantErr)
+			}
+
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("recorder close hook was not invoked on early Capture error")
+			}
 		})
 	}
 }
