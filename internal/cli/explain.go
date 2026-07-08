@@ -18,6 +18,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/evidence/display"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
@@ -42,6 +43,12 @@ const (
 
 	explainFileReadLimitBytes = 1 << 20
 	explainSummaryMaxBytes    = 240
+)
+
+const (
+	explainResponseScanExemptNarrowAdvice = "response_scanning.exempt_domains configured: prefer narrower knobs first - use `response_scanning.size_exempt_domains` for large-response false positives, or `dlp.patterns[].exempt_domains` for one noisy DLP pattern."
+	explainResponseScanExemptDisabled     = "With `response_scanning.enabled=false`, the full-trust streaming bypass is inactive; immutable core response findings may still be treated as trusted/warn-only for matching hosts."
+	explainResponseScanExemptBlastRadius  = "Use `response_scanning.exempt_domains` only when the whole host is trusted: responses are fully unscanned for injection, including oversized over-cap responses that stream unscanned."
 )
 
 // explainReport is the structured form of an `explain` verdict. It mirrors the
@@ -99,6 +106,8 @@ func explainCmd() *cobra.Command {
 	var toolName string
 	var toolInput string
 	var filePath string
+	var showRaw bool
+	var hexdump bool
 
 	cmd := &cobra.Command{
 		Use:   "explain <url> [--command <command> | --tool <name> --input <json> | --file <path>]",
@@ -155,7 +164,7 @@ Examples:
 					return fmt.Errorf("encode explain report JSON: %w", err)
 				}
 			} else {
-				printExplainReport(cmd.OutOrStdout(), report)
+				printExplainReport(cmd.OutOrStdout(), report, explainPrintOptions{ShowRaw: showRaw, Hexdump: hexdump})
 			}
 			// A blocked verdict exits non-zero so scripts can branch on it,
 			// matching `pipelock check --url`'s contract.
@@ -176,6 +185,8 @@ Examples:
 	cmd.Flags().StringVar(&toolName, "tool", "", "explain a tool-use hook verdict for this tool name")
 	cmd.Flags().StringVar(&toolInput, "input", "", "JSON tool input for --tool")
 	cmd.Flags().StringVar(&filePath, "file", "", "explain a file-write hook verdict by scanning this file's content")
+	cmd.Flags().BoolVar(&showRaw, "show-raw", false, "append raw field bytes in human output")
+	cmd.Flags().BoolVar(&hexdump, "hexdump", false, "append canonical raw field hexdumps in human output")
 
 	// `explain mcp-response` explains an MCP response block and names the
 	// per-server suppress knob (the stdio MCP equivalent of a URL verdict).
@@ -422,6 +433,7 @@ func buildExplainReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, rawURL
 		})
 	}
 	report.PatternName = explainPatternName(result)
+	report.Notes = append(report.Notes, explainResponseScanExemptNotes(cfg, report.Host)...)
 
 	if result.Allowed {
 		// Even an allowed verdict can depend on DNS: if the hostname-based
@@ -437,6 +449,26 @@ func buildExplainReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, rawURL
 
 	report.Remediation = explainRemediationFor(result)
 	return report, nil
+}
+
+func explainResponseScanExemptNotes(cfg *config.Config, host string) []string {
+	if cfg == nil || len(cfg.ResponseScanning.ExemptDomains) == 0 {
+		return nil
+	}
+	if !cfg.ResponseScanning.Enabled {
+		return []string{explainResponseScanExemptNarrowAdvice + " " + explainResponseScanExemptDisabled}
+	}
+	notes := []string{explainResponseScanExemptNarrowAdvice + " " + explainResponseScanExemptBlastRadius}
+	if host == "" {
+		return notes
+	}
+	for _, domain := range cfg.ResponseScanning.ExemptDomains {
+		if scanner.MatchDomain(host, domain) {
+			notes = append(notes, fmt.Sprintf("this host matches `response_scanning.exempt_domains` (%s): responses are fully unscanned for injection, including oversized over-cap responses that stream unscanned", domain))
+			return notes
+		}
+	}
+	return notes
 }
 
 func buildExplainSurfaceReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, surface, blockedAction string, action decide.Action) explainReport {
@@ -676,21 +708,26 @@ func explainRemediationFor(result scanner.Result) *explainRemediation {
 	}
 }
 
-func printExplainReport(w io.Writer, report explainReport) {
+type explainPrintOptions struct {
+	ShowRaw bool
+	Hexdump bool
+}
+
+func printExplainReport(w io.Writer, report explainReport, opts explainPrintOptions) {
 	_, _ = fmt.Fprintln(w, "Pipelock Explain")
 	_, _ = fmt.Fprintln(w, "================")
 	if report.Surface != "" {
-		_, _ = fmt.Fprintf(w, "Surface: %s\n", report.Surface)
+		printExplainField(w, "Surface", report.Surface, false, opts)
 		if report.BlockedAction != "" {
-			_, _ = fmt.Fprintf(w, "Action:  %s\n", report.BlockedAction)
+			printExplainField(w, "Action", report.BlockedAction, false, opts)
 		}
 	} else {
-		_, _ = fmt.Fprintf(w, "URL:     %s\n", report.URL)
+		printExplainField(w, "URL", report.URL, true, opts)
 	}
-	_, _ = fmt.Fprintf(w, "Config:  %s\n", report.ConfigFile)
-	_, _ = fmt.Fprintf(w, "Mode:    %s\n", report.Mode)
+	printExplainField(w, "Config", report.ConfigFile, false, opts)
+	printExplainField(w, "Mode", report.Mode, false, opts)
 	if report.Host != "" {
-		_, _ = fmt.Fprintf(w, "Host:    %s\n", report.Host)
+		printExplainField(w, "Host", report.Host, true, opts)
 	}
 	_, _ = fmt.Fprintln(w)
 
@@ -698,46 +735,96 @@ func printExplainReport(w io.Writer, report explainReport) {
 		_, _ = fmt.Fprintln(w, "Verdict: ALLOWED")
 		_, _ = fmt.Fprintf(w, "Score:   %.2f\n", report.Score)
 		for _, note := range report.Notes {
-			_, _ = fmt.Fprintf(w, "note: %s\n", note)
+			printExplainField(w, "note", note, false, opts)
 		}
 		return
 	}
 
 	_, _ = fmt.Fprintln(w, "Verdict: BLOCKED")
-	_, _ = fmt.Fprintf(w, "Scanner: %s\n", report.Scanner)
-	_, _ = fmt.Fprintf(w, "Layer:   %s\n", report.Layer)
+	printExplainField(w, "Scanner", report.Scanner, false, opts)
+	printExplainField(w, "Layer", report.Layer, false, opts)
 	if report.TargetView != "" {
-		_, _ = fmt.Fprintf(w, "Target:  %s\n", report.TargetView)
+		printExplainField(w, "Target", report.TargetView, true, opts)
 	}
 	if report.PatternName != "" {
-		_, _ = fmt.Fprintf(w, "Pattern: %s\n", report.PatternName)
+		printExplainField(w, "Pattern", report.PatternName, false, opts)
 	}
 	if report.Reason != "" {
-		_, _ = fmt.Fprintf(w, "Reason:  %s\n", report.Reason)
+		printExplainField(w, "Reason", report.Reason, false, opts)
 	}
 	_, _ = fmt.Fprintf(w, "Score:   %.2f\n", report.Score)
 
 	if len(report.WarnMatches) > 0 {
 		_, _ = fmt.Fprintln(w, "Warn matches:")
 		for _, m := range report.WarnMatches {
-			_, _ = fmt.Fprintf(w, "  - %s (%s)\n", m.PatternName, m.Severity)
+			printExplainField(w, "  -", fmt.Sprintf("%s (%s)", m.PatternName, m.Severity), false, opts)
 		}
 	}
 
 	if report.Remediation != nil {
 		_, _ = fmt.Fprintln(w)
 		_, _ = fmt.Fprintln(w, "Remediation:")
-		_, _ = fmt.Fprintf(w, "  %s\n", report.Remediation.Knob)
+		printExplainField(w, "  ", report.Remediation.Knob, false, opts)
 		if report.Remediation.Broader != "" {
-			_, _ = fmt.Fprintf(w, "  broader: %s\n", report.Remediation.Broader)
+			printExplainField(w, "  broader", report.Remediation.Broader, false, opts)
 		}
 	}
 	if report.AgentReason != "" {
 		_, _ = fmt.Fprintln(w)
 		_, _ = fmt.Fprintln(w, "Agent reason:")
-		_, _ = fmt.Fprintf(w, "  %s\n", report.AgentReason)
+		printExplainField(w, "  ", report.AgentReason, false, opts)
 	}
 	for _, note := range report.Notes {
-		_, _ = fmt.Fprintf(w, "note: %s\n", note)
+		printExplainField(w, "note", note, false, opts)
 	}
+}
+
+func printExplainField(w io.Writer, label, raw string, hostAware bool, opts explainPrintOptions) {
+	res := display.Sanitize(raw)
+	if hostAware {
+		if host := explainDisplayHost(raw); host != "" {
+			hostRes := display.SanitizeHost(host)
+			res.Annotations = append(res.Annotations, hostRes.Annotations...)
+			res.PunycodeASCII = hostRes.PunycodeASCII
+			res.PunycodeUnicode = hostRes.PunycodeUnicode
+			res.Suspicious = res.Suspicious || hostRes.Suspicious
+		} else {
+			res = display.SanitizeHost(raw)
+		}
+	}
+	switch {
+	case label == "note":
+		_, _ = fmt.Fprintf(w, "note: %s\n", res.Safe)
+	case label == "  -":
+		_, _ = fmt.Fprintf(w, "  - %s\n", res.Safe)
+	case strings.TrimSpace(label) == "":
+		_, _ = fmt.Fprintf(w, "  %s\n", res.Safe)
+	default:
+		_, _ = fmt.Fprintf(w, "%-8s %s\n", label+":", res.Safe)
+	}
+	if res.Suspicious {
+		for _, ann := range res.Annotations {
+			_, _ = fmt.Fprintf(w, "  ⚠ display anomaly: %s at byte %d: %s\n", ann.Class, ann.Offset, ann.Detail)
+		}
+		if res.PunycodeASCII != "" && res.PunycodeASCII != res.PunycodeUnicode {
+			_, _ = fmt.Fprintf(w, "  punycode: ASCII %s / Unicode %s\n", res.PunycodeASCII, res.PunycodeUnicode)
+		}
+	}
+	if opts.ShowRaw {
+		_, _ = fmt.Fprintf(w, "  raw: %q\n", raw)
+	}
+	if opts.Hexdump {
+		_, _ = fmt.Fprintf(w, "  hexdump:\n%s\n", display.Hexdump(raw))
+	}
+}
+
+func explainDisplayHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
+	}
+	if strings.Contains(raw, ".") || strings.HasPrefix(strings.ToLower(raw), "xn--") {
+		return raw
+	}
+	return ""
 }

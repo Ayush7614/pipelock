@@ -97,13 +97,14 @@ type Metrics struct {
 	killSwitchDenials *prometheus.CounterVec
 
 	// Browser shield + response scan exemption (shield.go).
-	shieldRewrites          *prometheus.CounterVec
-	shieldBytesStripped     *prometheus.CounterVec
-	shieldShimsInjected     *prometheus.CounterVec
-	shieldSkipped           *prometheus.CounterVec
-	shieldOversizeScanHead  *prometheus.CounterVec
-	shieldLatency           *prometheus.HistogramVec
-	responseScanExemptTotal *prometheus.CounterVec
+	shieldRewrites                          *prometheus.CounterVec
+	shieldBytesStripped                     *prometheus.CounterVec
+	shieldShimsInjected                     *prometheus.CounterVec
+	shieldSkipped                           *prometheus.CounterVec
+	shieldOversizeScanHead                  *prometheus.CounterVec
+	shieldLatency                           *prometheus.HistogramVec
+	responseScanExemptTotal                 *prometheus.CounterVec
+	responseScanExemptOverCapUnscannedTotal *prometheus.CounterVec
 
 	// Capture (capture.go).
 	CaptureDropped              prometheus.Counter
@@ -139,6 +140,22 @@ type Metrics struct {
 	requiredReceiptBlockings *prometheus.CounterVec
 	receiptEmitFailureCounts map[string]int64
 	requiredReceiptBlocks    map[string]int64
+
+	// Evidence health (evidence.go).
+	evidenceSequenceGaps        *prometheus.CounterVec
+	evidenceHeartbeatInterval   prometheus.Gauge
+	evidenceLastAnchorTimestamp prometheus.Gauge
+	evidenceAnchoredFinalSeq    prometheus.Gauge
+	evidenceFsyncErrors         *prometheus.CounterVec
+	evidenceAELRequirements     *prometheus.GaugeVec
+	evidenceSelfAuditOK         prometheus.Gauge
+	evidenceSelfAuditFailures   *prometheus.CounterVec
+	evidenceSequenceGapCounts   map[string]int64
+	evidenceFsyncErrorCounts    map[string]int64
+	evidenceSelfAuditFailCounts map[string]int64
+	evidenceRequirementValues   map[string]bool
+	evidenceHealthFunc          func() (EvidenceHealthStats, bool)
+	evidenceCollector           *evidenceCollector
 
 	// Stats endpoint state (stats_handler.go).
 	mu                     sync.Mutex
@@ -179,14 +196,18 @@ func New() *Metrics {
 	reg := prometheus.NewRegistry()
 
 	m := &Metrics{
-		registry:                 reg,
-		startTime:                time.Now(),
-		topBlockedDomains:        make(map[string]int64),
-		topScannerHits:           make(map[string]int64),
-		topAnomalyTypes:          make(map[string]int64),
-		agentStats:               make(map[string]*agentCounters),
-		receiptEmitFailureCounts: make(map[string]int64),
-		requiredReceiptBlocks:    make(map[string]int64),
+		registry:                    reg,
+		startTime:                   time.Now(),
+		topBlockedDomains:           make(map[string]int64),
+		topScannerHits:              make(map[string]int64),
+		topAnomalyTypes:             make(map[string]int64),
+		agentStats:                  make(map[string]*agentCounters),
+		receiptEmitFailureCounts:    make(map[string]int64),
+		requiredReceiptBlocks:       make(map[string]int64),
+		evidenceSequenceGapCounts:   make(map[string]int64),
+		evidenceFsyncErrorCounts:    make(map[string]int64),
+		evidenceSelfAuditFailCounts: make(map[string]int64),
+		evidenceRequirementValues:   make(map[string]bool),
 	}
 
 	m.registerProxyMetrics(reg)
@@ -205,6 +226,7 @@ func New() *Metrics {
 	m.registerLearnMetrics(reg)
 	m.registerEnvelopeMetrics(reg)
 	m.registerReceiptMetrics(reg)
+	m.registerEvidenceMetrics(reg)
 
 	// Built-in Go runtime + process collectors. These expose
 	// go_memstats_heap_alloc_bytes, go_goroutines, process_resident_memory_bytes,
