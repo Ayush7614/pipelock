@@ -404,11 +404,69 @@ func TestLogResponseScanExempt_JSONFormat(t *testing.T) {
 	if entry["reason"] != "exempt_domains match" {
 		t.Errorf("expected reason=exempt_domains match, got %v", entry["reason"])
 	}
+	if _, ok := entry["effect"]; ok {
+		t.Errorf("generic response scan exempt log must not claim full-trust effect: %v", entry["effect"])
+	}
 	if entry["agent"] != testAgentName {
 		t.Errorf("expected agent=%s, got %v", testAgentName, entry["agent"])
 	}
 	if entry["level"] != "info" {
 		t.Errorf("expected level=info, got %v", entry["level"])
+	}
+}
+
+// TestEmit_ResponseScanExempt_FullTrustAndOverCap exercises the full-trust and
+// over-cap exempt log helpers with every optional LogContext field populated
+// (including target and resource) so the conditional field branches and the
+// emitter path in both helpers are covered, and asserts the full-trust effect
+// discriminator is present on both.
+func TestEmit_ResponseScanExempt_FullTrustAndOverCap(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	ctx := LogContext{
+		method:    testMethodGet,
+		url:       "https://api.vendor.example/v1/data",
+		target:    "api.vendor.example:443",
+		resource:  "resource-1",
+		clientIP:  testClientIP,
+		requestID: "req-exempt-full",
+		agent:     testAgentName,
+	}
+	wantFields := []string{"url", "target", "resource", "client_ip", "request_id", "agent"}
+
+	logger.LogResponseScanExemptFullTrust(ctx, "api.vendor.example")
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted full-trust exempt event")
+	}
+	if ev.Fields["effect"] != responseScanExemptFullTrustEffect {
+		t.Errorf("full-trust effect = %v, want the full-trust valve string", ev.Fields["effect"])
+	}
+	for _, k := range wantFields {
+		if _, present := ev.Fields[k]; !present {
+			t.Errorf("full-trust exempt emitted fields missing %q", k)
+		}
+	}
+
+	logger.LogResponseScanExemptOverCapUnscanned(ctx, "api.vendor.example", "forward", 2048, 1024)
+	ev2, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted over-cap exempt event")
+	}
+	if ev2.Fields["effect"] != responseScanExemptFullTrustEffect {
+		t.Errorf("over-cap effect = %v, want the full-trust valve string", ev2.Fields["effect"])
+	}
+	if ev2.Fields["transport"] != "forward" {
+		t.Errorf("over-cap transport = %v, want forward", ev2.Fields["transport"])
+	}
+	if ev2.Fields["bytes_written"] != int64(2048) || ev2.Fields["scan_cap_bytes"] != int64(1024) {
+		t.Errorf("over-cap byte fields = %v/%v, want 2048/1024", ev2.Fields["bytes_written"], ev2.Fields["scan_cap_bytes"])
+	}
+	for _, k := range wantFields {
+		if _, present := ev2.Fields[k]; !present {
+			t.Errorf("over-cap exempt emitted fields missing %q", k)
+		}
 	}
 }
 
@@ -2412,8 +2470,60 @@ func TestEmit_LogResponseScanExempt(t *testing.T) {
 	if ev.Fields["reason"] != "exempt_domains match" {
 		t.Errorf("fields[reason] = %v, want exempt_domains match", ev.Fields["reason"])
 	}
+	if _, ok := ev.Fields["effect"]; ok {
+		t.Errorf("generic response scan exempt event must not claim full-trust effect: %v", ev.Fields["effect"])
+	}
 	if ev.Fields["agent"] != testAgentName {
 		t.Errorf("fields[agent] = %v, want %s", ev.Fields["agent"], testAgentName)
+	}
+}
+
+func TestEmit_LogResponseScanExemptFullTrust(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanExemptFullTrust(LogContext{method: testMethodGet, url: "https://api.openai.com/v1/chat", clientIP: testClientIP, requestID: "req-exempt-full-trust", agent: testAgentName}, "api.openai.com")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanExempt) {
+		t.Errorf("type = %q, want %s", ev.Type, EventResponseScanExempt)
+	}
+	effect, _ := ev.Fields["effect"].(string)
+	if !strings.Contains(effect, "injection scanning is disabled for ALL responses") ||
+		!strings.Contains(effect, "oversized over-cap responses that stream unscanned") {
+		t.Errorf("fields[effect] = %q, want full-trust over-cap warning", effect)
+	}
+}
+
+func TestEmit_LogResponseScanExemptOverCapUnscanned(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanExemptOverCapUnscanned(
+		LogContext{method: testMethodGet, url: "https://api.vendor.example/download", clientIP: testClientIP, requestID: "req-exempt-overcap", agent: testAgentName},
+		"api.vendor.example", "forward", 2048, 1024,
+	)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanExempt) {
+		t.Errorf("type = %q, want %s", ev.Type, EventResponseScanExempt)
+	}
+	if ev.Fields["reason"] != "exempt_domains over-cap response streamed unscanned" {
+		t.Errorf("fields[reason] = %v, want over-cap unscanned reason", ev.Fields["reason"])
+	}
+	if ev.Fields["transport"] != "forward" {
+		t.Errorf("fields[transport] = %v, want forward", ev.Fields["transport"])
+	}
+	effect, _ := ev.Fields["effect"].(string)
+	if !strings.Contains(effect, "injection scanning is disabled for ALL responses") ||
+		!strings.Contains(effect, "oversized over-cap responses that stream unscanned") {
+		t.Errorf("fields[effect] = %q, want full-trust over-cap warning", effect)
 	}
 }
 
