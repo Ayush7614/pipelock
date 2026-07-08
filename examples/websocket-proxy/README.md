@@ -77,7 +77,7 @@ Agent connection URL shape:
 ws://127.0.0.1:8888/ws?url=wss://stream.api.vendor.example/events
 ```
 
-See `docs/guides/transport-modes.md` for the full transport matrix.
+See `../../docs/guides/transport-modes.md` for the full transport matrix.
 
 ## Config Notes
 
