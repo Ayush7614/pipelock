@@ -106,12 +106,12 @@ fi
 # -- Test 3: Direct canary exfiltration blocked --------------------------------
 step "Test 3: canary in URL path is blocked"
 run_check "direct canary in URL" yes \
-  "https://example.com/exfil/${CANARY_VALUE}"
+  "https://api.vendor.example/exfil/${CANARY_VALUE}"
 
 # -- Test 4: Clean URL allowed ------------------------------------------------
 step "Test 4: URL without canary is allowed"
 run_check "clean URL allowed" no \
-  "https://example.com/"
+  "https://api.vendor.example/"
 
 # -- Test 5: Base64-encoded canary blocked -------------------------------------
 step "Test 5: base64-encoded canary is blocked"
@@ -121,7 +121,7 @@ print(base64.b64encode(sys.argv[1].encode()).decode())
 PY
 )"
 run_check "base64 canary in URL" yes \
-  "https://example.com/payload?data=${ENC_CANARY}"
+  "https://api.vendor.example/payload?data=${ENC_CANARY}"
 
 # -- Test 6: Separator-split canary blocked ------------------------------------
 step "Test 6: separator-split canary is blocked"
@@ -132,7 +132,7 @@ print(".".join(value[i:i + 4] for i in range(0, len(value), 4)))
 PY
 )"
 run_check "split canary in URL" yes \
-  "https://${SPLIT_CANARY}.example.com/ping"
+  "https://${SPLIT_CANARY}.api.vendor.example/ping"
 
 # -- Summary ------------------------------------------------------------------
 printf '\n\033[1m=== Results: %s passed, %s failed ===\033[0m\n\n' "$PASS" "$FAIL"

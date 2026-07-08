@@ -12,7 +12,7 @@ fetch_proxy:
 dlp:
   include_defaults: true
 
-# Offline check URLs should not fail closed on DNS for example.com.
+# Offline check URLs should not fail closed on DNS for api.vendor.example.
 internal: []
 
 canary_tokens:
