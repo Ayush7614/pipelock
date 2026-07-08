@@ -19,5 +19,4 @@ canary_tokens:
   enabled: true
   tokens:
     - name: demo_canary
-      value: "${DEMO_CANARY_VALUE}"
-      env_var: DEMO_CANARY_VALUE
+      value: "canary-REPLACE_ME"

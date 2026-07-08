@@ -73,8 +73,8 @@ src, dst, value = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 lines = src.read_text().splitlines()
 out = []
 for line in lines:
-    if "${DEMO_CANARY_VALUE}" in line:
-        out.append(line.replace("${DEMO_CANARY_VALUE}", value))
+    if "canary-REPLACE_ME" in line:
+        out.append(line.replace("canary-REPLACE_ME", value))
     else:
         out.append(line)
 dst.write_text("\n".join(out) + "\n")
@@ -86,10 +86,10 @@ write_config
 
 # -- Test 1: canary CLI emits snippet -----------------------------------------
 step "Test 1: pipelock canary prints config snippet"
-CANARY_SNIPPET="$("$PIPELOCK" canary --name demo_canary --env-var DEMO_CANARY_VALUE 2>/dev/null)"
+CANARY_SNIPPET="$("$PIPELOCK" canary --name demo_canary --literal 2>/dev/null)"
 if printf '%s' "$CANARY_SNIPPET" | grep -q 'canary_tokens:' \
   && printf '%s' "$CANARY_SNIPPET" | grep -q 'demo_canary' \
-  && printf '%s' "$CANARY_SNIPPET" | grep -q '\${DEMO_CANARY_VALUE}'; then
+  && printf '%s' "$CANARY_SNIPPET" | grep -q 'value:'; then
   pass "canary snippet has expected structure"
 else
   fail "canary snippet missing expected fields"

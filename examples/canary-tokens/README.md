@@ -46,31 +46,25 @@ Exit code `0` means all checks passed. The script:
 
 ## Generate a Snippet
 
-Default snippet (value references an env var placeholder):
-
 ```bash
-pipelock canary --name demo_canary --env-var DEMO_CANARY_VALUE
+pipelock canary --name demo_canary --literal
 ```
 
-Paste the output into your `pipelock.yaml`, then inject the real value into the
-agent environment:
+Paste the output into your `pipelock.yaml`.
+
+Note: `canary_tokens.tokens[].value` is not expanded from environment variables
+at config load time. If you want to source the value from an env var in your
+deployment, use your own config templating step to write the literal value into
+`value:` before starting Pipelock.
 
 ```bash
-export DEMO_CANARY_VALUE="canary-$(openssl rand -hex 16)"
 pipelock run --config pipelock.yaml --listen 127.0.0.1:8888
-```
-
-For local testing only, print the literal value:
-
-```bash
-pipelock canary --name demo_canary --env-var DEMO_CANARY_VALUE --literal
-# warning: --literal prints the canary token value to stdout
 ```
 
 ## Example Config
 
 `pipelock.yaml` is a template. `verify.sh` substitutes a runtime-generated value
-in place of `${DEMO_CANARY_VALUE}`.
+in place of `canary-REPLACE_ME`.
 
 ```yaml
 canary_tokens:
@@ -84,7 +78,7 @@ canary_tokens:
 Unlike regex DLP, canary matching is **exact** after normalization — no false
 positives from substring collisions.
 
-See `docs/guides/canary-tokens.md` for normalization passes and deployment
+See `../../docs/guides/canary-tokens.md` for normalization passes and deployment
 patterns.
 
 ## Manual Check
@@ -93,7 +87,7 @@ After exporting a canary value and updating config:
 
 ```bash
 pipelock check --config pipelock.yaml \
-  --url "https://collector.vendor.example/?token=$DEMO_CANARY_VALUE"
+  --url "https://collector.vendor.example/exfil/<your-canary-value>"
 ```
 
 Expected: `BLOCKED` with pattern `Canary Token (demo_canary)`.
