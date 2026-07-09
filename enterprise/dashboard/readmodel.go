@@ -5,6 +5,7 @@
 package dashboard
 
 import (
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,8 @@ const (
 
 	pipUntampered = "U"
 )
+
+const fleetRedactionKeySize = 32
 
 // FilterSpec describes a bounded filter for the agent/session list. Unknown
 // non-empty enum values fail closed to no matches.
@@ -63,6 +66,7 @@ type Options struct {
 	// request (role, method, path, session, remote address). Viewing evidence is
 	// itself an audited action. Nil disables the access log.
 	AuditWriter      io.Writer
+	FleetSource      FleetDataSource
 	ReceiptReadLimit int
 	TimelineLimit    int
 	// FilterPresets maps named presets to bounded filter specs. Loaded from
@@ -79,14 +83,16 @@ type Options struct {
 
 // ReadModel builds dashboard views over recorder sessions and receipts.
 type ReadModel struct {
-	receiptDir       string
-	trustedKeys      map[string]TrustedKey
-	cfg              *config.Config
-	receiptReadLimit int
-	timelineLimit    int
-	filterPresets    map[string]FilterSpec
-	exemptionStore   *ExemptionStore
-	now              func() time.Time
+	receiptDir        string
+	trustedKeys       map[string]TrustedKey
+	cfg               *config.Config
+	receiptReadLimit  int
+	timelineLimit     int
+	filterPresets     map[string]FilterSpec
+	fleetSource       FleetDataSource
+	fleetRedactionKey [fleetRedactionKeySize]byte
+	exemptionStore    *ExemptionStore
+	now               func() time.Time
 }
 
 // NewReadModel creates a dashboard read model from Options.
@@ -99,19 +105,25 @@ func NewReadModel(opts Options) *ReadModel {
 	if timelineLimit <= 0 {
 		timelineLimit = dashboardTimelineLimit
 	}
+	var fleetRedactionKey [fleetRedactionKeySize]byte
+	if _, err := rand.Read(fleetRedactionKey[:]); err != nil {
+		panic(fmt.Errorf("generate dashboard fleet redaction key: %w", err))
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
 	}
 	return &ReadModel{
-		receiptDir:       opts.ReceiptDir,
-		trustedKeys:      cloneTrustedKeys(opts.TrustedKeys),
-		cfg:              opts.Config,
-		receiptReadLimit: receiptReadLimit,
-		timelineLimit:    timelineLimit,
-		filterPresets:    opts.FilterPresets,
-		exemptionStore:   opts.ExemptionStore,
-		now:              now,
+		receiptDir:        opts.ReceiptDir,
+		trustedKeys:       cloneTrustedKeys(opts.TrustedKeys),
+		cfg:               opts.Config,
+		receiptReadLimit:  receiptReadLimit,
+		timelineLimit:     timelineLimit,
+		filterPresets:     opts.FilterPresets,
+		fleetSource:       opts.FleetSource,
+		fleetRedactionKey: fleetRedactionKey,
+		exemptionStore:    opts.ExemptionStore,
+		now:               now,
 	}
 }
 

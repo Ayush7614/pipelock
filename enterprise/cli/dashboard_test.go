@@ -272,6 +272,55 @@ func TestDashboardServe_FailsClosedWithoutAgentsFeature(t *testing.T) {
 	}
 }
 
+func TestVerifyDashboardLicenseWithOptionsAcceptsAgentsOrFleet(t *testing.T) {
+	tests := []struct {
+		name        string
+		features    []string
+		wantErr     error
+		wantFeature string
+	}{
+		{
+			name:        "agents",
+			features:    []string{license.FeatureAgents},
+			wantFeature: license.FeatureAgents,
+		},
+		{
+			name:        "fleet",
+			features:    []string{license.FeatureFleet},
+			wantFeature: license.FeatureFleet,
+		},
+		{
+			name:     "neither",
+			features: []string{license.FeatureAssess},
+			wantErr:  license.ErrAgentsLicenseRequired,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub, priv := newDashKeyPair(t)
+			setDashLicenseEnv(t, issueDashLicense(t, priv, tt.features), hex.EncodeToString(pub))
+			got, err := verifyDashboardLicenseWithOptions(license.FleetVerifyInputs{})
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error = %v, want %v", err, tt.wantErr)
+				}
+				for _, want := range []string{"dashboard", license.FeatureAgents, license.FeatureFleet} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error = %v, want message containing %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("verifyDashboardLicenseWithOptions() error = %v", err)
+			}
+			if !got.HasFeature(tt.wantFeature) {
+				t.Fatalf("license features = %v, want %q", got.Features, tt.wantFeature)
+			}
+		})
+	}
+}
+
 func TestDashboardServe_RefusesNonLoopbackWithoutTLS(t *testing.T) {
 	pub, priv := newDashKeyPair(t)
 	setDashLicenseEnv(t, issueDashLicense(t, priv, []string{license.FeatureAgents}), hex.EncodeToString(pub))
