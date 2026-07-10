@@ -93,10 +93,10 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: Verify dependencies
-        run: go mod verify
+        run: bash scripts/ci-retry.sh go mod verify
 
       - name: Download dependencies
-        run: go mod download
+        run: bash scripts/ci-retry.sh go mod download
 
       - name: Replay harness (deterministic regression)
         run: make test-replay-harness
@@ -137,10 +137,10 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: Verify dependencies
-        run: go mod verify
+        run: bash scripts/ci-retry.sh go mod verify
 
       - name: Download dependencies
-        run: go mod download
+        run: bash scripts/ci-retry.sh go mod download
 
       - name: Run tests (enterprise with coverage)
         if: matrix.go-version == '1.25'

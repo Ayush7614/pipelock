@@ -32,7 +32,7 @@ jobs:
           test "$got" = "go1.25.12"
 
       - name: Verify dependencies
-        run: go mod verify
+        run: bash scripts/ci-retry.sh go mod verify
 
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep

@@ -44,10 +44,10 @@ jobs:
           go-version: '1.25'
 
       - name: Verify dependencies
-        run: go mod verify
+        run: bash scripts/ci-retry.sh go mod verify
 
       - name: Download dependencies
-        run: go mod download
+        run: bash scripts/ci-retry.sh go mod download
 
       - name: Run runtime-critical packages
         run: make test-runtime-critical
