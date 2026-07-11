@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -723,6 +724,50 @@ func TestDashboardAuthorizeFunc(t *testing.T) {
 	}
 }
 
+func TestDashboardGlobalAuthorizationScopesComplianceToken(t *testing.T) {
+	operatorAuthorized := func(r *http.Request) bool {
+		return dashboardTokenMatches(r, dashTestToken)
+	}
+	complianceAuthorized := func(r *http.Request) bool {
+		return dashboardTokenMatches(r, "auditor-token")
+	}
+	authorized := dashboardGlobalAuthorized(operatorAuthorized, complianceAuthorized)
+
+	for _, tc := range []struct {
+		name       string
+		path       string
+		token      string
+		wantStatus int
+	}{
+		{name: "operator reaches non-compliance route", path: "/", token: dashTestToken, wantStatus: http.StatusNoContent},
+		{name: "compliance reaches compliance route", path: "/compliance", token: "auditor-token", wantStatus: http.StatusNoContent},
+		{name: "compliance rejected before non-compliance handler", path: "/", token: "auditor-token", wantStatus: http.StatusUnauthorized},
+		{name: "compliance rejected from compliance subpath", path: "/compliance/export", token: "auditor-token", wantStatus: http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			handler := dashboardAuthHandler(authorized, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, tc.wantStatus)
+			}
+			wantCalled := tc.wantStatus == http.StatusNoContent
+			if called != wantCalled {
+				t.Fatalf("inner handler called = %v, want %v", called, wantCalled)
+			}
+			if err := dashboardAuthorizeFunc(authorized)(req); (err == nil) != wantCalled {
+				t.Fatalf("global Authorize error = %v, allowed = %v", err, wantCalled)
+			}
+		})
+	}
+}
+
 func TestDashboardServe_RejectsReceiptDirThatIsAFile(t *testing.T) {
 	pub, priv := newDashKeyPair(t)
 	setDashLicenseEnv(t, issueDashLicense(t, priv, []string{license.FeatureAgents}), hex.EncodeToString(pub))
@@ -924,6 +969,7 @@ func TestDashboardAuthorizePermissionFunc(t *testing.T) {
 	authorize := dashboardAuthorizePermissionFunc(
 		func(r *http.Request) bool { return dashboardTokenMatches(r, dashTestToken) },
 		func(r *http.Request) bool { return dashboardTokenMatches(r, "raw-"+dashTestToken) },
+		func(*http.Request) bool { return false },
 	)
 
 	for _, permission := range []dashboard.Permission{
@@ -950,6 +996,30 @@ func TestDashboardAuthorizePermissionFunc(t *testing.T) {
 	}
 }
 
+func TestDashboardAuthorizePermissionFunc_ComplianceAuditorIsReadOnly(t *testing.T) {
+	auditorReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1/compliance", nil)
+	if err != nil {
+		t.Fatalf("NewRequest auditor: %v", err)
+	}
+	auditorReq.Header.Set("Authorization", "Bearer auditor-token")
+	authorize := dashboardAuthorizePermissionFunc(
+		func(*http.Request) bool { return false },
+		func(*http.Request) bool { return false },
+		func(r *http.Request) bool { return dashboardTokenMatches(r, "auditor-token") },
+	)
+	if err := authorize(auditorReq, dashboard.PermissionComplianceRead); err != nil {
+		t.Fatalf("auditor denied compliance read: %v", err)
+	}
+	for _, permission := range dashboard.AllPermissions() {
+		if permission == dashboard.PermissionComplianceRead {
+			continue
+		}
+		if err := authorize(auditorReq, permission); err == nil {
+			t.Fatalf("auditor unexpectedly granted %s", permission)
+		}
+	}
+}
+
 // TestDashboardAuthorizePermissionFunc_MapsEveryPermission fails when a new
 // dashboard route permission is added without updating the CLI token mapping.
 // An unmapped permission fails closed in dashboardAuthorizePermissionFunc, so
@@ -962,6 +1032,7 @@ func TestDashboardAuthorizePermissionFunc_MapsEveryPermission(t *testing.T) {
 	authorize := dashboardAuthorizePermissionFunc(
 		func(*http.Request) bool { return true },
 		func(*http.Request) bool { return true },
+		func(*http.Request) bool { return false },
 	)
 	for _, permission := range dashboard.AllPermissions() {
 		if err := authorize(req, permission); err != nil {
