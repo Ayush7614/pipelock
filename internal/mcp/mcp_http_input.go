@@ -17,6 +17,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/deferred"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/a2amethods"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
@@ -125,25 +126,27 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 		emitActionID := actionID
 		emitTarget := toolName
 		emitVerdict := receiptVerdict
-		if emitActionID == "" && IsA2AMethod(mcpMethod) {
-			switch {
-			case receiptVerdict != "":
-				// A2A block path: mint an actionID here so the block still leaves a
-				// policy-hash-bearing receipt, matching the other applicable block
-				// surfaces. tools/call already carries its own actionID, so that
-				// path never reaches this branch.
-				emitActionID = receipt.NewActionID()
-			case requireReceipts && result.Blocked == nil:
-				// A clean A2A allow otherwise leaves both actionID and receiptVerdict
-				// empty, so emitMCPToolReceipt drops the emission (ActionID == "") and
-				// the request forwards with no receipt. Under require_receipts that is
-				// a hole in the every-allow-is-provable guarantee, so mint an actionID
-				// and record an explicit allow verdict. The emission-failure guard
-				// below then fails closed before the caller forwards. When
-				// require_receipts is off this branch is skipped, preserving the
-				// default of no receipt on a clean A2A allow (no receipt spam).
-				emitActionID = receipt.NewActionID()
-				emitVerdict = config.ActionAllow
+		if IsA2AMethod(mcpMethod) {
+			if emitActionID == "" {
+				switch {
+				case receiptVerdict != "":
+					// A2A block path: mint an actionID here so the block still leaves a
+					// policy-hash-bearing receipt, matching the other applicable block
+					// surfaces. tools/call already carries its own actionID, so that
+					// path never reaches this branch.
+					emitActionID = receipt.NewActionID()
+				case requireReceipts && result.Blocked == nil:
+					// A clean A2A allow otherwise leaves both actionID and receiptVerdict
+					// empty, so emitMCPToolReceipt drops the emission (ActionID == "") and
+					// the request forwards with no receipt. Under require_receipts that is
+					// a hole in the every-allow-is-provable guarantee, so mint an actionID
+					// and record an explicit allow verdict. The emission-failure guard
+					// below then fails closed before the caller forwards. When
+					// require_receipts is off this branch is skipped, preserving the
+					// default of no receipt on a clean A2A allow (no receipt spam).
+					emitActionID = receipt.NewActionID()
+					emitVerdict = config.ActionAllow
+				}
 			}
 			// A2A frames carry no tool name, but the receipt record requires a
 			// non-empty target. Use the A2A method name (e.g. SendMessage) as the
@@ -295,7 +298,9 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 		// block path (pre-redaction content scan, redaction error) still
 		// attributes the receipt to the A2A method; the deferred emitter
 		// assigns the actionID lazily when the request is actually blocked.
-		mcpMethod = frame.Method
+		if canonical, ok := a2amethods.Canonical(frame.Method); ok {
+			mcpMethod = canonical
+		}
 	}
 	if scanEnabled && redactionCfg.Matcher != nil {
 		originalVerdict := scanRequestForAgent(inputScanCtx, msg, sc, action, onParseError, opts.addressProtectionAgent())
@@ -358,6 +363,10 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 	receiptLayer, receiptPattern, receiptSeverity = pickAttribution(eval)
 
 	mcpMethod = verdict.Method
+	if canonical, ok := a2amethods.Canonical(mcpMethod); ok {
+		mcpMethod = canonical
+		verdict.Method = canonical
+	}
 	if verdict.Method == methodToolsCall {
 		if actionID == "" {
 			actionID = receipt.NewActionID()
@@ -737,6 +746,9 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 				errMsg = "pipelock: MCP request blocked by behavioral baseline"
 			}
 		}
+	}
+	if effectiveAction == config.ActionDefer && actionID == "" && IsA2AMethod(verdict.Method) {
+		actionID = receipt.NewActionID()
 	}
 
 	// Capture: record DLP/injection input verdict before action dispatch so

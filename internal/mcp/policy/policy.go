@@ -16,11 +16,17 @@ import (
 	"unicode/utf8"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/a2amethods"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
 	"github.com/luckyPipewrench/pipelock/internal/normalize"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
 )
 
-const uninspectableJSONDepthRule = "uninspectable_json_depth"
+const (
+	uninspectableJSONDepthRule = "uninspectable_json_depth"
+	duplicateJSONKeyRule       = "duplicate_json_object_key"
+	malformedA2AParamsRule     = "malformed_a2a_params"
+)
 
 // shellExpansionRe matches shell variable expansions used as whitespace substitutes.
 // Attackers use ${IFS} or $IFS to replace spaces: "rm${IFS}-rf" expands to "rm -rf"
@@ -645,7 +651,7 @@ func canonicalStructuralValue(value interface{}) (string, bool) {
 }
 
 // CheckRequest evaluates a JSON-RPC request (single or batch) against policy.
-// Returns a clean verdict for non-tools/call methods and unparseable messages.
+// Returns a clean verdict for non-callable methods and unparseable messages.
 func (pc *Config) CheckRequest(line []byte) Verdict {
 	if pc == nil {
 		return Verdict{}
@@ -666,7 +672,15 @@ func (pc *Config) CheckRequest(line []byte) Verdict {
 
 // checkSingle parses one JSON-RPC request and checks it against policy.
 func (pc *Config) checkSingle(line []byte) Verdict {
-	tc := parseToolCall(line)
+	if err := redact.NoDuplicateJSONKeys(bytes.TrimSpace(line)); err != nil {
+		if redact.IsDuplicateKeyBlock(err) {
+			return duplicateJSONKeyVerdict()
+		}
+	}
+	if hasMalformedA2AParams(line) {
+		return malformedA2AParamsVerdict()
+	}
+	tc := parsePolicyCallable(line)
 	if tc == nil {
 		return Verdict{}
 	}
@@ -706,6 +720,47 @@ func uninspectableJSONDepthVerdict() Verdict {
 		Action:  config.ActionBlock,
 		Rules:   []string{uninspectableJSONDepthRule},
 	}
+}
+
+// duplicateJSONKeyVerdict is a defense-in-depth fail-closed result for direct
+// policy callers. The transport gates already block duplicate-key frames before
+// policy evaluation; keeping policy block-capable prevents future callers from
+// reintroducing a last-wins policy view against a first-wins upstream parser.
+func duplicateJSONKeyVerdict() Verdict {
+	return Verdict{
+		Matched: true,
+		Action:  config.ActionBlock,
+		Rules:   []string{duplicateJSONKeyRule},
+	}
+}
+
+// malformedA2AParamsVerdict is a fail-closed result for known A2A methods with
+// present, non-null params that are not a JSON object. A2A policy rules inspect
+// object params; scalar and array params are malformed enough that skipping
+// policy would be fail-open.
+func malformedA2AParamsVerdict() Verdict {
+	return Verdict{
+		Matched: true,
+		Action:  config.ActionBlock,
+		Rules:   []string{malformedA2AParamsRule},
+	}
+}
+
+func hasMalformedA2AParams(line []byte) bool {
+	var rpc struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(line, &rpc); err != nil {
+		return false
+	}
+	if _, ok := a2amethods.Canonical(rpc.Method); !ok {
+		return false
+	}
+	if len(rpc.Params) == 0 || bytes.Equal(bytes.TrimSpace(rpc.Params), []byte(jsonrpc.Null)) {
+		return false
+	}
+	return !redact.IsJSONObject(rpc.Params)
 }
 
 func uninspectableStructuralArgsVerdict(ruleName string) Verdict {
@@ -775,10 +830,11 @@ type toolCallParams struct {
 	Arguments json.RawMessage
 }
 
-// parseToolCall extracts tool name and arguments from a tools/call JSON-RPC request.
-// Returns nil if the method is not "tools/call", params don't contain a name field,
-// or the message can't be parsed.
-func parseToolCall(line []byte) *toolCallParams {
+// parsePolicyCallable extracts the callable name and arguments from a JSON-RPC
+// request. tools/call returns params.name and params.arguments; A2A methods
+// return the method name and params object. Returns nil when the method is not a
+// policy-scoped callable or the message cannot be parsed.
+func parsePolicyCallable(line []byte) *toolCallParams {
 	var rpc struct {
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
@@ -787,7 +843,14 @@ func parseToolCall(line []byte) *toolCallParams {
 		return nil
 	}
 	if rpc.Method != "tools/call" {
-		return nil
+		canonical, ok := a2amethods.Canonical(rpc.Method)
+		if !ok {
+			return nil
+		}
+		return &toolCallParams{
+			Name:      canonical,
+			Arguments: rpc.Params,
+		}
 	}
 	if len(rpc.Params) == 0 || string(rpc.Params) == jsonrpc.Null {
 		return nil
@@ -808,6 +871,10 @@ func parseToolCall(line []byte) *toolCallParams {
 		Name:      params.Name,
 		Arguments: params.Arguments,
 	}
+}
+
+func parseToolCall(line []byte) *toolCallParams {
+	return parsePolicyCallable(line)
 }
 
 // actionRank maps action strings to strictness levels for comparison.

@@ -12,10 +12,11 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 )
 
-// applyMCPToolCallRedaction rewrites tools/call params.arguments through the
-// shared redaction engine. A nil matcher disables the feature. Fail-closed:
-// malformed JSON-RPC envelopes or arguments that cannot be safely rewritten
-// return a *redact.BlockError.
+// applyMCPToolCallRedaction rewrites callable request params through the shared
+// redaction engine. tools/call rewrites params.arguments; A2A methods rewrite
+// params. A nil matcher disables the feature. Fail-closed: malformed JSON-RPC
+// envelopes or callable params that cannot be safely rewritten return a
+// *redact.BlockError.
 func applyMCPToolCallRedaction(line []byte, opts MCPProxyOpts) ([]byte, *redact.Report, error) {
 	return applyMCPToolCallRedactionWithConfig(line, opts.redactionConfig())
 }
@@ -47,7 +48,7 @@ func applyMCPToolCallRedactionWithConfig(line []byte, cfg MCPRedactionConfig) ([
 	// differential. external review C-1. Only block on actual duplicate-key
 	// matches; let malformed-JSON errors flow through to the existing
 	// parse-error path so the BlockError reason stays attributable.
-	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && isDuplicateKeyBlock(err) {
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
 		return nil, nil, err
 	}
 
@@ -70,7 +71,7 @@ func applyMCPToolCallRedactionWithConfig(line []byte, cfg MCPRedactionConfig) ([
 	if err := json.Unmarshal(methodRaw, &method); err != nil {
 		return line, nil, nil
 	}
-	if method != methodToolsCall {
+	if method != methodToolsCall && !IsA2AMethod(method) {
 		return line, nil, nil
 	}
 
@@ -79,9 +80,34 @@ func applyMCPToolCallRedactionWithConfig(line []byte, cfg MCPRedactionConfig) ([
 		return line, nil, nil
 	}
 
+	if IsA2AMethod(method) {
+		rewrittenParams, report, _, err := rewriteRedactableJSON(paramsRaw, cfg, "A2A params", false)
+		if err != nil {
+			return nil, nil, err
+		}
+		env["params"] = rewrittenParams
+
+		rewrittenLine, err := marshalMCPMessage(env)
+		if err != nil {
+			return nil, nil, &redact.BlockError{
+				Reason:             redact.ReasonRemarshalFailed,
+				MatchesBeforeBlock: reportTotal(report),
+				Detail:             fmt.Sprintf("marshal rewritten A2A message: %v", err),
+			}
+		}
+		if len(prefix) == 0 && len(suffix) == 0 {
+			return rewrittenLine, report, nil
+		}
+		var rewritten bytes.Buffer
+		_, _ = rewritten.Write(prefix)
+		_, _ = rewritten.Write(rewrittenLine)
+		_, _ = rewritten.Write(suffix)
+		return rewritten.Bytes(), report, nil
+	}
+
 	// Same dup-key trap on params: a duplicate `arguments` could hide
 	// secret-bearing args behind a benign sibling that wins last-wins.
-	if err := redact.NoDuplicateJSONKeys(paramsRaw); err != nil && isDuplicateKeyBlock(err) {
+	if err := redact.NoDuplicateJSONKeys(paramsRaw); err != nil && redact.IsDuplicateKeyBlock(err) {
 		return nil, nil, err
 	}
 
@@ -97,13 +123,13 @@ func applyMCPToolCallRedactionWithConfig(line []byte, cfg MCPRedactionConfig) ([
 	if !ok || len(argsRaw) == 0 || string(argsRaw) == jsonrpc.Null {
 		return line, nil, nil
 	}
-	if !isJSONObjectRawMessage(argsRaw) {
-		return line, nil, nil
-	}
 
-	rewrittenArgs, report, err := redact.RewriteJSON(argsRaw, cfg.Matcher, redact.NewRedactor(), cfg.Limits)
+	rewrittenArgs, report, didRewrite, err := rewriteRedactableJSON(argsRaw, cfg, "tools/call arguments", true)
 	if err != nil {
 		return nil, nil, err
+	}
+	if !didRewrite {
+		return line, nil, nil
 	}
 	params["arguments"] = rewrittenArgs
 
@@ -135,6 +161,26 @@ func applyMCPToolCallRedactionWithConfig(line []byte, cfg MCPRedactionConfig) ([
 	return rewritten.Bytes(), report, nil
 }
 
+func rewriteRedactableJSON(raw json.RawMessage, cfg MCPRedactionConfig, objectKind string, skipOnNonObject bool) ([]byte, *redact.Report, bool, error) {
+	if err := redact.NoDuplicateJSONKeys(raw); err != nil && redact.IsDuplicateKeyBlock(err) {
+		return nil, nil, false, err
+	}
+	if !redact.IsJSONObject(raw) {
+		if skipOnNonObject {
+			return raw, nil, false, nil
+		}
+		return nil, nil, false, &redact.BlockError{
+			Reason: redact.ReasonBodyUnparseable,
+			Detail: fmt.Sprintf("invalid %s object: expected JSON object", objectKind),
+		}
+	}
+	rewritten, report, err := redact.RewriteJSON(raw, cfg.Matcher, redact.NewRedactor(), cfg.Limits)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return rewritten, report, true, nil
+}
+
 func marshalMCPMessage(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -154,9 +200,4 @@ func reportTotal(report *redact.Report) int {
 
 func isNullRawMessage(raw json.RawMessage) bool {
 	return len(raw) != 0 && bytes.Equal(bytes.TrimSpace(raw), []byte(jsonrpc.Null))
-}
-
-func isJSONObjectRawMessage(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) != 0 && trimmed[0] == '{'
 }

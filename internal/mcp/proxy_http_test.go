@@ -1021,6 +1021,124 @@ func TestScanHTTPInputDecision_PolicyDeferEmitsReceipt(t *testing.T) {
 	}
 }
 
+func TestScanHTTPInputDecision_A2APolicyDeferStoresRedactedParams(t *testing.T) {
+	sc := testScannerForHTTP(t)
+	secret := mcpRedactionSecret()
+	msg := []byte(`{"jsonrpc":"2.0","id":71,"method":"SendMessage","params":{"message":{"parts":[{"kind":"text","text":"use ` + secret + ` to deploy"}]}}}`)
+	resolutionPolicy := config.DeferResolutionPolicy{
+		AllowOn: config.DeferAllowOn{PolicyPermits: true},
+	}
+	policyCfg := &policy.Config{
+		Action: config.ActionWarn,
+		Rules: []*policy.CompiledRule{{
+			Name:             "defer-redacted-a2a",
+			ToolPattern:      regexp.MustCompile(`^SendMessage$`),
+			ArgPattern:       regexp.MustCompile(regexp.QuoteMeta(mcpPlaceholderAWS)),
+			Action:           config.ActionDefer,
+			ResolutionPolicy: resolutionPolicy,
+		}},
+	}
+	manager := deferred.NewManager(deferred.Config{
+		Enabled:              true,
+		Timeout:              time.Second,
+		MaxPending:           4,
+		MaxPendingPerSession: 4,
+		MaxPendingBytes:      4096,
+	})
+	receiptEmitter, receiptRecorder, _ := newTestReceiptEmitter(t)
+
+	decision := scanHTTPInputDecision(msg, io.Discard, "sess", "orig", MCPProxyOpts{
+		Scanner:        sc,
+		PolicyCfg:      policyCfg,
+		RedactMatcher:  testRedactionMatcher(),
+		RedactLimits:   redact.DefaultLimits().ToLimits(),
+		DeferManager:   manager,
+		ReceiptEmitter: receiptEmitter,
+		Transport:      deferred.SurfaceMCPHTTPUpstream,
+	})
+	if err := receiptRecorder.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	if decision.Blocked != nil {
+		t.Fatalf("A2A defer decision blocked: %+v", decision.Blocked)
+	}
+	if decision.Deferred == nil {
+		t.Fatal("expected deferred A2A request")
+	}
+	if decision.Deferred.DeferID == "" {
+		t.Fatal("A2A deferred request has empty DeferID")
+	}
+	if decision.Deferred.Method != "SendMessage" {
+		t.Fatalf("deferred method = %q, want SendMessage", decision.Deferred.Method)
+	}
+	if strings.Contains(decision.Deferred.Arguments, secret) {
+		t.Fatalf("deferred A2A arguments leaked secret: %s", decision.Deferred.Arguments)
+	}
+	if !strings.Contains(decision.Deferred.Arguments, mcpPlaceholderAWS) {
+		t.Fatalf("deferred A2A arguments missing redaction placeholder: %s", decision.Deferred.Arguments)
+	}
+	forwardMessage := string(decision.Deferred.ForwardMessage)
+	if strings.Contains(forwardMessage, secret) {
+		t.Fatalf("deferred A2A forward message leaked secret: %s", forwardMessage)
+	}
+	if !strings.Contains(forwardMessage, mcpPlaceholderAWS) {
+		t.Fatalf("deferred A2A forward message missing redaction placeholder: %s", forwardMessage)
+	}
+}
+
+func TestScanHTTPInputDecision_A2AReceiptUsesCanonicalMethod(t *testing.T) {
+	sc := testScannerForHTTP(t)
+	msg := []byte(`{"jsonrpc":"2.0","id":72,"method":"sendmessage","params":{"message":{"parts":[{"kind":"text","text":"deploy"}]}}}`)
+	resolutionPolicy := config.DeferResolutionPolicy{
+		AllowOn: config.DeferAllowOn{PolicyPermits: true},
+	}
+	policyCfg := &policy.Config{
+		Action: config.ActionWarn,
+		Rules: []*policy.CompiledRule{{
+			Name:             "defer-canonical-a2a",
+			ToolPattern:      regexp.MustCompile(`^SendMessage$`),
+			Action:           config.ActionDefer,
+			ResolutionPolicy: resolutionPolicy,
+		}},
+	}
+	manager := deferred.NewManager(deferred.Config{
+		Enabled:              true,
+		Timeout:              time.Second,
+		MaxPending:           4,
+		MaxPendingPerSession: 4,
+		MaxPendingBytes:      4096,
+	})
+	receiptEmitter, receiptRecorder, receiptDir := newTestReceiptEmitter(t)
+
+	decision := scanHTTPInputDecision(msg, io.Discard, "sess", "orig", MCPProxyOpts{
+		Scanner:        sc,
+		PolicyCfg:      policyCfg,
+		DeferManager:   manager,
+		ReceiptEmitter: receiptEmitter,
+		Transport:      deferred.SurfaceMCPHTTPUpstream,
+	})
+	if err := receiptRecorder.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	if decision.Blocked != nil {
+		t.Fatalf("A2A defer decision blocked: %+v", decision.Blocked)
+	}
+	if decision.Deferred == nil {
+		t.Fatal("expected deferred A2A request")
+	}
+	if decision.Deferred.Method != "SendMessage" {
+		t.Fatalf("deferred method = %q, want SendMessage", decision.Deferred.Method)
+	}
+	if decision.Deferred.BaselineIdentity != "a2a:SendMessage" {
+		t.Fatalf("deferred baseline identity = %q, want a2a:SendMessage", decision.Deferred.BaselineIdentity)
+	}
+
+	record := findActionReceiptHTTP(t, readReceiptEntriesHTTP(t, receiptDir)).ActionRecord
+	if record.Target != "SendMessage" {
+		t.Fatalf("receipt target = %q, want SendMessage", record.Target)
+	}
+}
+
 func TestScanHTTPInput_PolicyRedirectMissingProfileBlocks(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Internal = nil
@@ -1105,6 +1223,65 @@ func TestScanHTTPInput_PolicyRedirectSuccess(t *testing.T) {
 	}
 	if !strings.Contains(resp.Result.Content[0].Text, "safe output") {
 		t.Errorf("content = %q, want to contain 'safe output'", resp.Result.Content[0].Text)
+	}
+}
+
+func TestScanHTTPInputDecision_A2APolicyRedirectReceivesRedactedParams(t *testing.T) {
+	if runtime.GOOS == osWindows {
+		t.Skip("exec test requires unix shell")
+	}
+	sc := testScannerForHTTP(t)
+	secret := mcpRedactionSecret()
+	msg := []byte(`{"jsonrpc":"2.0","id":72,"method":"SendMessage","params":{"message":{"parts":[{"kind":"text","text":"use ` + secret + ` to deploy"}]}}}`)
+	policyCfg := &policy.Config{
+		Action: config.ActionWarn,
+		RedirectProfiles: map[string]config.RedirectProfile{
+			"echo-args": {
+				Exec:         []string{"/bin/sh", "-c", `printf %s "$1"`, "pipelock-test"},
+				Reason:       "audited",
+				PreserveArgv: true,
+			},
+		},
+		Rules: []*policy.CompiledRule{{
+			Name:            "redirect-redacted-a2a",
+			ToolPattern:     regexp.MustCompile(`^SendMessage$`),
+			ArgPattern:      regexp.MustCompile(regexp.QuoteMeta(mcpPlaceholderAWS)),
+			Action:          config.ActionRedirect,
+			RedirectProfile: "echo-args",
+		}},
+	}
+
+	decision := scanHTTPInputDecision(msg, io.Discard, "sess", "orig", MCPProxyOpts{
+		Scanner:       sc,
+		PolicyCfg:     policyCfg,
+		RedactMatcher: testRedactionMatcher(),
+		RedactLimits:  redact.DefaultLimits().ToLimits(),
+	})
+	if decision.Blocked == nil {
+		t.Fatal("expected A2A redirect synthetic response")
+	}
+	if decision.Blocked.SyntheticResponse == nil {
+		t.Fatalf("expected synthetic response, got block: %+v", decision.Blocked)
+	}
+	var resp struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(decision.Blocked.SyntheticResponse, &resp); err != nil {
+		t.Fatalf("invalid synthetic response: %v", err)
+	}
+	if len(resp.Result.Content) == 0 {
+		t.Fatal("expected redirect content")
+	}
+	text := resp.Result.Content[0].Text
+	if strings.Contains(text, secret) {
+		t.Fatalf("redirect handler received leaked secret: %s", text)
+	}
+	if !strings.Contains(text, mcpPlaceholderAWS) {
+		t.Fatalf("redirect handler output missing redaction placeholder: %s", text)
 	}
 }
 
