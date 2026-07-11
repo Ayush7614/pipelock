@@ -174,6 +174,12 @@ the server is running stops serving.
   roles grant bounded dashboard permissions. With mutual TLS enabled, every
   connection must present a verified certificate mapped to a role. Missing or
   invalid authentication gets no evidence.
+- **Embedded handlers fail closed without an auth boundary.** The
+  `pipelock dashboard serve` command wires its configured token, OIDC, or mTLS
+  auth boundary into the dashboard handler. Go embedders that construct the
+  dashboard handler directly and authenticate in an outer router must explicitly
+  set `TrustedOuterAuth`; otherwise, leaving both authorization callbacks nil
+  returns `403` for every route instead of serving unauthenticated.
 - **Cleartext refusal.** Without TLS the listener only accepts loopback
   addresses; serving a non-loopback address over plain HTTP is refused at
   startup because the operator token would transit in cleartext.

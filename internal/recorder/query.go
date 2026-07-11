@@ -4,7 +4,10 @@
 package recorder
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,6 +30,9 @@ type QueryFilter struct {
 	// MaxEntriesRead is a hard ceiling on parsed recorder entries for callers
 	// that render evidence in an online UI. Zero means unbounded.
 	MaxEntriesRead int
+	// MaxDirectoryEntries is a hard ceiling on evidence directory entries read
+	// before filtering to one session. Zero means unbounded.
+	MaxDirectoryEntries int
 }
 
 // QueryResult holds the results of an evidence query.
@@ -41,7 +47,7 @@ type QueryResult struct {
 // QuerySession reads evidence files for a session and applies filters.
 func QuerySession(dir, sessionID string, filter *QueryFilter) (*QueryResult, error) {
 	dir = filepath.Clean(dir)
-	dirEntries, err := os.ReadDir(dir)
+	dirEntries, err := readDirectoryEntries(dir, maxDirectoryEntries(filter))
 	if err != nil {
 		return nil, fmt.Errorf("reading evidence directory: %w", err)
 	}
@@ -106,8 +112,14 @@ func QuerySession(dir, sessionID string, filter *QueryFilter) (*QueryResult, err
 
 // ListSessions returns the unique session IDs found in evidence files.
 func ListSessions(dir string) ([]string, error) {
+	return ListSessionsBounded(dir, 0)
+}
+
+// ListSessionsBounded returns unique session IDs while enforcing a hard ceiling
+// on directory entries read. Zero means unbounded.
+func ListSessionsBounded(dir string, maxEntries int) ([]string, error) {
 	dir = filepath.Clean(dir)
-	dirEntries, err := os.ReadDir(dir)
+	dirEntries, err := readDirectoryEntries(dir, maxEntries)
 	if err != nil {
 		return nil, fmt.Errorf("reading evidence directory: %w", err)
 	}
@@ -133,6 +145,38 @@ func ListSessions(dir string) ([]string, error) {
 	}
 	sort.Strings(sessions)
 	return sessions, nil
+}
+
+func maxDirectoryEntries(filter *QueryFilter) int {
+	if filter == nil {
+		return 0
+	}
+	return filter.MaxDirectoryEntries
+}
+
+func readDirectoryEntries(dir string, maxEntries int) ([]os.DirEntry, error) {
+	if maxEntries <= 0 {
+		return os.ReadDir(dir)
+	}
+	directory, err := os.Open(filepath.Clean(dir))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = directory.Close() }()
+	// maxEntries+1 would overflow to a negative value at math.MaxInt, and a
+	// non-positive count makes ReadDir read the whole directory unbounded.
+	readLimit := maxEntries
+	if readLimit < math.MaxInt {
+		readLimit++
+	}
+	entries, err := directory.ReadDir(readLimit)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if len(entries) > maxEntries {
+		return nil, fmt.Errorf("directory entry count exceeds %d", maxEntries)
+	}
+	return entries, nil
 }
 
 func evidenceFileSessionID(name string) (string, bool) {
