@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -114,7 +115,7 @@ func TestDashboardCmd_Tree(t *testing.T) {
 	if err != nil || serve.Use != "serve" {
 		t.Fatalf("dashboard serve subcommand not found: %v", err)
 	}
-	for _, flag := range []string{"listen", "receipt-dir", "config", "auth-token-file", "raw-token-file", "runtime-snapshot-file", "trusted-signer", "license-crl-file", "tls-cert", "tls-key"} {
+	for _, flag := range []string{"listen", "receipt-dir", "config", "auth-token-file", "raw-token-file", "runtime-snapshot-file", "trusted-signer", "license-crl-file", "anchor-expected", "anchor-local-log", "rekor-log-key", "tls-cert", "tls-key"} {
 		if serve.Flags().Lookup(flag) == nil {
 			t.Errorf("serve is missing --%s", flag)
 		}
@@ -985,6 +986,12 @@ func TestDashboardAuthorizePermissionFunc(t *testing.T) {
 			t.Fatalf("metadata token denied %s: %v", permission, err)
 		}
 	}
+	if err := authorize(metaReq, dashboard.PermissionTrustKeysRead); err == nil {
+		t.Fatal("metadata token unexpectedly granted trust and keys permission")
+	}
+	if err := authorize(rawReq, dashboard.PermissionTrustKeysRead); err != nil {
+		t.Fatalf("raw token denied trust and keys permission: %v", err)
+	}
 	if err := authorize(metaReq, dashboard.PermissionRawRead); err == nil {
 		t.Fatal("metadata token unexpectedly granted raw permission")
 	}
@@ -1075,6 +1082,109 @@ func TestValidateDashboardListen(t *testing.T) {
 	}
 }
 
+func TestDashboardTrustCRLSource(t *testing.T) {
+	originalEmbedded := license.PublicKeyHex
+	license.PublicKeyHex = ""
+	t.Cleanup(func() { license.PublicKeyHex = originalEmbedded })
+	t.Setenv(license.EnvLicenseCRLFile, "")
+	t.Setenv(license.EnvLicensePublicKey, "")
+
+	t.Run("not configured", func(t *testing.T) {
+		source, err := dashboardTrustCRLSource("")
+		if err != nil || source != nil {
+			t.Fatalf("source configured=%t err=%v, want false nil", source != nil, err)
+		}
+	})
+
+	t.Run("configured without root fails closed", func(t *testing.T) {
+		_, err := dashboardTrustCRLSource(filepath.Join(t.TempDir(), "crl.json"))
+		if err == nil || !strings.Contains(err.Error(), "no license root") {
+			t.Fatalf("error = %v, want missing root", err)
+		}
+	})
+
+	t.Run("malformed root fails closed", func(t *testing.T) {
+		t.Setenv(license.EnvLicensePublicKey, "not-a-key")
+		_, err := dashboardTrustCRLSource(filepath.Join(t.TempDir(), "crl.json"))
+		if err == nil || !strings.Contains(err.Error(), "parse license root") {
+			t.Fatalf("error = %v, want root parse failure", err)
+		}
+	})
+
+	t.Run("verified then corrupt reload", func(t *testing.T) {
+		pub, priv := newDashKeyPair(t)
+		t.Setenv(license.EnvLicensePublicKey, hex.EncodeToString(pub))
+		now := time.Now().UTC()
+		crl, err := license.SignCRL(license.CRLPayload{
+			Version: license.CRLVersion, IssuedAt: now.Unix(), ExpiresAt: now.Add(time.Hour).Unix(),
+			Revoked: []license.RevokedLicense{},
+		}, priv)
+		if err != nil {
+			t.Fatalf("SignCRL: %v", err)
+		}
+		data, err := json.Marshal(crl)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		path := filepath.Join(t.TempDir(), "crl.json")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		source, err := dashboardTrustCRLSource(path)
+		if err != nil {
+			t.Fatalf("dashboardTrustCRLSource: %v", err)
+		}
+		loaded, err := source()
+		if err != nil || loaded == nil || loaded.SHA256 == "" {
+			t.Fatalf("loaded=%+v err=%v", loaded, err)
+		}
+		if err := os.WriteFile(path, []byte("corrupt"), 0o600); err != nil {
+			t.Fatalf("corrupt CRL: %v", err)
+		}
+		if _, err := source(); err == nil || !strings.Contains(err.Error(), "verify license CRL") {
+			t.Fatalf("corrupt reload error = %v", err)
+		}
+	})
+}
+
+func TestRunDashboardServe_TrustVerifierStartupFailures(t *testing.T) {
+	t.Setenv(license.EnvLicenseCRLFile, "")
+	t.Setenv(license.EnvLicensePublicKey, "")
+	originalEmbedded := license.PublicKeyHex
+	license.PublicKeyHex = ""
+	t.Cleanup(func() { license.PublicKeyHex = originalEmbedded })
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte(dashTestToken), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	base := dashboardServeOptions{
+		listen: dashboardDefaultListen, receiptDir: dir, authTokenFile: tokenPath,
+	}
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+
+	t.Run("invalid Rekor key", func(t *testing.T) {
+		opts := base
+		opts.rekorLogKeys = []string{"not-a-key"}
+		err := runDashboardServe(cmd, opts, license.License{})
+		if err == nil || !strings.Contains(err.Error(), "anchor verifier") {
+			t.Fatalf("error = %v, want anchor verifier failure", err)
+		}
+	})
+
+	t.Run("CRL without root", func(t *testing.T) {
+		opts := base
+		opts.licenseCRLFile = filepath.Join(dir, "crl.json")
+		err := runDashboardServe(cmd, opts, license.License{})
+		if err == nil || !strings.Contains(err.Error(), "no license root") {
+			t.Fatalf("error = %v, want CRL root failure", err)
+		}
+	})
+}
+
 func TestParseTrustedSigners(t *testing.T) {
 	pub, _ := newDashKeyPair(t)
 	keyHex := hex.EncodeToString(pub)
@@ -1095,7 +1205,7 @@ func TestParseTrustedSigners(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		if got[keyHex] != (dashboard.TrustedKey{Source: "ops runbook"}) {
+		if got[keyHex] != (dashboard.TrustedKey{Source: "ops runbook", ProvenanceKind: "static inline", Location: "--trusted-signer"}) {
 			t.Fatalf("got %+v", got)
 		}
 	})
@@ -1115,7 +1225,7 @@ func TestParseTrustedSigners(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		if got[keyHex] != (dashboard.TrustedKey{Source: signingflag.DefaultSource}) {
+		if got[keyHex] != (dashboard.TrustedKey{Source: signingflag.DefaultSource, ProvenanceKind: "imported file", Location: keyFile}) {
 			t.Fatalf("got %+v", got)
 		}
 	})
