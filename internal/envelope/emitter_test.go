@@ -643,6 +643,72 @@ func TestEmitter_InjectAndSign_OverCapUnknownLengthPreservesBody(t *testing.T) {
 	}
 }
 
+func TestBufferRequestBodyZeroMaxFailsClosedOverDefaultCap(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Repeat("Z", defaultBufferRequestBodyMaxBytes+1)
+	req := newTestRequest(t, http.MethodPost, "https://upstream.example/api", strings.NewReader(body))
+
+	_, err := bufferRequestBody(req, 0)
+	if !errors.Is(err, ErrRequestBodyReadLimitExceeded) {
+		t.Fatalf("bufferRequestBody error = %v, want ErrRequestBodyReadLimitExceeded", err)
+	}
+}
+
+func TestBufferRequestBodyZeroMaxFailsClosedAfterReadOverDefaultCap(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Repeat("Z", defaultBufferRequestBodyMaxBytes+1)
+	origBody := &trackingReadCloser{Reader: strings.NewReader(body)}
+	req := newTestRequest(t, http.MethodPost, "https://upstream.example/api", nil)
+	req.Body = origBody
+	req.ContentLength = -1
+	req.GetBody = nil
+
+	_, err := bufferRequestBody(req, 0)
+	if !errors.Is(err, ErrRequestBodyReadLimitExceeded) {
+		t.Fatalf("bufferRequestBody error = %v, want ErrRequestBodyReadLimitExceeded", err)
+	}
+	drained, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("reading preserved body after fail-closed overflow: %v", err)
+	}
+	if got := string(drained); got != body {
+		t.Fatalf("preserved body after fail-closed overflow = %q, want %q", got, body)
+	}
+	if req.ContentLength != -1 {
+		t.Fatalf("ContentLength after fail-closed overflow = %d, want -1", req.ContentLength)
+	}
+	if req.GetBody == nil {
+		t.Fatal("GetBody after fail-closed overflow = nil, want replay-error sentinel")
+	}
+	if _, err := req.GetBody(); !errors.Is(err, ErrOverCapRedirectReplay) {
+		t.Fatalf("GetBody after fail-closed overflow error = %v, want ErrOverCapRedirectReplay", err)
+	}
+	if err := req.Body.Close(); err != nil {
+		t.Fatalf("closing preserved fail-closed body: %v", err)
+	}
+	if !origBody.closed {
+		t.Fatal("closing preserved fail-closed body did not close original body")
+	}
+}
+
+func TestBufferRequestBodyZeroMaxAcceptsBodyExactlyAtDefaultCap(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Repeat("Z", defaultBufferRequestBodyMaxBytes)
+	req := newTestRequest(t, http.MethodPost, "https://upstream.example/api", strings.NewReader(body))
+	req.ContentLength = -1
+
+	got, err := bufferRequestBody(req, 0)
+	if err != nil {
+		t.Fatalf("bufferRequestBody at cap error = %v, want nil", err)
+	}
+	if len(got) != defaultBufferRequestBodyMaxBytes {
+		t.Fatalf("bufferRequestBody at cap returned %d bytes, want %d", len(got), defaultBufferRequestBodyMaxBytes)
+	}
+}
+
 // assertOverCapSignatureVerifies reconstructs the RFC 9421 signature
 // base from the signed request (without content-digest, which is what
 // the over-cap path drops) and runs ed25519.Verify against the

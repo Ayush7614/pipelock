@@ -291,21 +291,30 @@ func requestHasBody(req *http.Request) bool {
 // GetBody is set to a closure that returns a fresh reader so the
 // stdlib redirect machinery can replay the body on 307/308.
 //
-// maxBytes == 0 means "no cap" - read until EOF. A positive maxBytes
-// reads one extra byte past the cap to detect overflow; on overflow
-// the function returns nil and no error, signaling "signable without
-// content-digest" to the caller. Crucially, the original request body
-// is preserved for the upstream transport - oversize requests lose
-// only Content-Digest coverage, not their payload.
+// maxBytes <= 0 falls back to defaultBufferRequestBodyMaxBytes. A positive
+// caller-provided maxBytes reads one extra byte past the cap to detect
+// overflow; on overflow the function returns nil and no error, signaling
+// "signable without content-digest" to the caller. Crucially, the original
+// request body is preserved for the upstream transport - oversize requests lose
+// only Content-Digest coverage, not their payload. A non-positive maxBytes is a
+// defensive fallback for direct callers and fails closed above the default cap.
 func bufferRequestBody(req *http.Request, maxBytes int) ([]byte, error) {
 	if req.Body == nil || req.Body == http.NoBody {
 		return nil, nil
+	}
+
+	failClosedOnOverflow := maxBytes <= 0
+	if maxBytes <= 0 {
+		maxBytes = defaultBufferRequestBodyMaxBytes
 	}
 
 	// Known oversize: skip buffering entirely and let the request
 	// flow with its original body. The signer will omit
 	// content-digest because it receives nil body bytes.
 	if maxBytes > 0 && req.ContentLength > int64(maxBytes) {
+		if failClosedOnOverflow {
+			return nil, fmt.Errorf("%w: request body exceeds %d bytes", ErrRequestBodyReadLimitExceeded, maxBytes)
+		}
 		return nil, nil
 	}
 
@@ -314,17 +323,8 @@ func bufferRequestBody(req *http.Request, maxBytes int) ([]byte, error) {
 	origContentLength := req.ContentLength
 
 	// Read maxBytes + 1 so we can distinguish "fits exactly" from
-	// "overflowed" without a second syscall. maxBytes == 0 uses the
-	// io.ReadAll path to mean "no limit".
-	var (
-		data []byte
-		err  error
-	)
-	if maxBytes > 0 {
-		data, err = io.ReadAll(io.LimitReader(origBody, int64(maxBytes)+1))
-	} else {
-		data, err = io.ReadAll(origBody)
-	}
+	// "overflowed" without a second syscall.
+	data, err := io.ReadAll(io.LimitReader(origBody, int64(maxBytes)+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading request body: %w", err)
 	}
@@ -356,6 +356,9 @@ func bufferRequestBody(req *http.Request, maxBytes int) ([]byte, error) {
 		} else {
 			req.GetBody = overCapGetBody
 		}
+		if failClosedOnOverflow {
+			return nil, fmt.Errorf("%w: request body exceeds %d bytes", ErrRequestBodyReadLimitExceeded, maxBytes)
+		}
 		return nil, nil
 	}
 
@@ -373,6 +376,15 @@ func bufferRequestBody(req *http.Request, maxBytes int) ([]byte, error) {
 	}
 	return data, nil
 }
+
+// defaultBufferRequestBodyMaxBytes is the defensive fallback cap when
+// bufferRequestBody is called without an explicit positive maxBytes.
+// Keep this in parity with config.DefaultEnvelopeSignMaxBodyBytes.
+const defaultBufferRequestBodyMaxBytes = 1 << 20
+
+// ErrRequestBodyReadLimitExceeded marks a fail-closed defensive body-buffer cap
+// hit when bufferRequestBody is called without an explicit positive cap.
+var ErrRequestBodyReadLimitExceeded = fmt.Errorf("envelope: request body read limit exceeded")
 
 // readPreservingCloser wraps a Reader and delegates Close to the
 // original request body so overflow preservation does not leak the
