@@ -29,7 +29,24 @@ func TestIncident_ScopePromptWhenEmpty(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{incidentClaim, incidentNonClaim, "Supply", "never kills an agent"} {
+	for _, want := range []string{
+		"Fleet &middot; Incident",
+		"Incident Cockpit",
+		"Read-only; this cockpit correlates sources and has no kill, publish, or fleet mutation path.",
+		incidentClaim,
+		incidentNonClaim,
+		`<form class="scope-form" method="get" action="/incident">`,
+		`name="org_id" value=""`,
+		`name="fleet_id" value=""`,
+		`name="artifact_hash" value=""`,
+		`<button type="submit">Submit</button>`,
+		"This tool correlates one conductor decision",
+		"It is awaiting input, not missing data",
+		"org_id",
+		"fleet_id",
+		"artifact_hash",
+		"never kills an agent",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("incident body missing %q: %s", want, body)
 		}
@@ -48,7 +65,19 @@ func TestIncident_UnconfiguredSourcesRenderAbsence(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"No conductor decision source configured", "No conductor fleet source configured"} {
+	for _, want := range []string{
+		"No conductor decision source configured",
+		"Decision replay proves how the conductor would resolve this artifact",
+		"--conductor-url",
+		"No conductor fleet source configured",
+		"Applied-state correlation proves follower report counts",
+		"--conductor-org",
+		"--conductor-fleet",
+		"--conductor-token-file",
+		"--conductor-tls-cert",
+		"--conductor-tls-key",
+		"--conductor-server-ca",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("incident body missing %q: %s", want, body)
 		}
@@ -83,9 +112,13 @@ func TestIncident_CorrelatesDecisionAndAppliedSummary(t *testing.T) {
 	body := rec.Body.String()
 	// testFleetFollowers(): 1 verified, 1 signed-unverified, 1 unsigned.
 	for _, want := range []string{
+		"followers in the correlated applied-state counts",
 		"Rollback", "Divergence",
 		"verified applied", "signed, unverified", "unsigned/self-reported",
 		"followers",
+		`name="org_id" value="` + wbTestOrgID + `"`,
+		`name="fleet_id" value="` + wbTestFleetID + `"`,
+		`name="artifact_hash" value="` + wbTestArtifactHash + `"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("incident body missing %q: %s", want, body)

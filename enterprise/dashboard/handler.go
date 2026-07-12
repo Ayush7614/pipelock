@@ -7,8 +7,10 @@ package dashboard
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -27,27 +29,35 @@ import (
 const (
 	contentSecurityPolicy = "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
 	contentTypeHTML       = "text/html; charset=utf-8"
+	contentTypeSVG        = "image/svg+xml; charset=utf-8"
 	contentTypeText       = "text/plain; charset=utf-8"
 	auditSessionMaxBytes  = 128
 )
 
-//go:embed evidence.tmpl.html exemptions.tmpl.html agents.tmpl.html investigator.tmpl.html fleetoverview.tmpl.html workbench.tmpl.html incident.tmpl.html budgets.tmpl.html trustkeys.tmpl.html compliance.tmpl.html
+const dashboardFaviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#09090b"/><path d="M20 30v-8c0-7 5-12 12-12s12 5 12 12v8" fill="none" stroke="#00e5a0" stroke-width="6" stroke-linecap="round"/><rect x="16" y="28" width="32" height="24" rx="5" fill="#00e5a0"/><circle cx="32" cy="40" r="4" fill="#09090b"/></svg>`
+
+//go:embed nav.tmpl.html overview.tmpl.html evidence.tmpl.html exemptions.tmpl.html agents.tmpl.html investigator.tmpl.html fleetoverview.tmpl.html workbench.tmpl.html incident.tmpl.html budgets.tmpl.html trustkeys.tmpl.html
 var templateFS embed.FS
 
 var (
-	evidenceTemplate      = template.Must(template.ParseFS(templateFS, "evidence.tmpl.html"))
-	exemptionsTemplate    = template.Must(template.ParseFS(templateFS, "exemptions.tmpl.html"))
-	agentsTemplate        = template.Must(template.ParseFS(templateFS, "agents.tmpl.html"))
-	investigatorTemplate  = template.Must(template.ParseFS(templateFS, "investigator.tmpl.html"))
-	fleetoverviewTemplate = template.Must(template.ParseFS(templateFS, "fleetoverview.tmpl.html"))
-	workbenchTemplate     = template.Must(template.ParseFS(templateFS, "workbench.tmpl.html"))
-	incidentTemplate      = template.Must(template.ParseFS(templateFS, "incident.tmpl.html"))
-	budgetsTemplate       = template.Must(template.ParseFS(templateFS, "budgets.tmpl.html"))
-	trustKeysTemplate     = template.Must(template.ParseFS(templateFS, "trustkeys.tmpl.html"))
-	complianceTemplate    = template.Must(template.ParseFS(templateFS, "compliance.tmpl.html"))
+	overviewTemplate      = parseDashboardTemplate("overview.tmpl.html")
+	evidenceTemplate      = parseDashboardTemplate("evidence.tmpl.html")
+	exemptionsTemplate    = parseDashboardTemplate("exemptions.tmpl.html")
+	agentsTemplate        = parseDashboardTemplate("agents.tmpl.html")
+	investigatorTemplate  = parseDashboardTemplate("investigator.tmpl.html")
+	fleetoverviewTemplate = parseDashboardTemplate("fleetoverview.tmpl.html")
+	workbenchTemplate     = parseDashboardTemplate("workbench.tmpl.html")
+	incidentTemplate      = parseDashboardTemplate("incident.tmpl.html")
+	budgetsTemplate       = parseDashboardTemplate("budgets.tmpl.html")
+	trustKeysTemplate     = parseDashboardTemplate("trustkeys.tmpl.html")
 )
 
+func parseDashboardTemplate(name string) *template.Template {
+	return template.Must(template.ParseFS(templateFS, name, "nav.tmpl.html"))
+}
+
 type pageData struct {
+	Nav             NavContext
 	Sessions        []SessionSummary
 	SelectedSession string
 	Evidence        SessionEvidence
@@ -57,7 +67,25 @@ type pageData struct {
 }
 
 type exemptionsPageData struct {
+	Nav       NavContext
 	Inventory ExemptionInventory
+}
+
+// NavContext is the shared, authorization-filtered dashboard navigation state.
+type NavContext struct {
+	Active      string
+	ActiveLabel string
+	Entries     []NavEntry
+	ScriptNonce string
+}
+
+// NavEntry is one top-level dashboard link the current request is allowed to
+// follow.
+type NavEntry struct {
+	Key    string
+	Label  string
+	Path   string
+	Active bool
 }
 
 // Permission is the bounded dashboard route/action vocabulary consumed by the
@@ -75,7 +103,6 @@ const (
 	PermissionSignedActionRead Permission = "dashboard:signed_action:read"
 	PermissionIncidentRead     Permission = "dashboard:incident:read"
 	PermissionTrustKeysRead    Permission = "dashboard:trust_keys:read"
-	PermissionComplianceRead   Permission = "dashboard:compliance:read"
 )
 
 const (
@@ -91,13 +118,35 @@ type routeSpec struct {
 	handler          func(*dashboardHandler) http.Handler
 }
 
-// CompliancePath is the single source of truth for the compliance route, shared
-// by the route table and the auditor-token authorization gate so the auth
-// boundary cannot drift from the route if the path changes.
-const CompliancePath = "/compliance"
+type navRouteSpec struct {
+	key     string
+	label   string
+	pattern string
+}
 
-func dashboardRouteSpecs() []routeSpec {
-	return []routeSpec{
+var dashboardNavRouteSpecs = []navRouteSpec{
+	{key: "overview", label: "Overview", pattern: "/overview"},
+	{key: "evidence", label: "Evidence", pattern: "/"},
+	{key: "exemptions", label: "Exemptions", pattern: "/exemptions"},
+	{key: "agents", label: "Agents", pattern: "/agents"},
+	{key: "budgets", label: "Budgets", pattern: "/budgets"},
+	{key: "trust-keys", label: "Trust & Keys", pattern: "/trust-keys"},
+	{key: "fleet", label: "Fleet", pattern: "/fleet"},
+	{key: "workbench", label: "Workbench", pattern: "/workbench"},
+	{key: "incident", label: "Incident", pattern: "/incident"},
+}
+
+var (
+	dashboardRouteSpecList = []routeSpec{
+		{
+			pattern:          "/overview",
+			feature:          license.FeatureAgents,
+			forbiddenMessage: agentsFeatureForbidden,
+			permission:       PermissionEvidenceRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleOverview)
+			},
+		},
 		{
 			pattern:          "/",
 			feature:          license.FeatureAgents,
@@ -162,15 +211,6 @@ func dashboardRouteSpecs() []routeSpec {
 			},
 		},
 		{
-			pattern:          CompliancePath,
-			feature:          license.FeatureAgents,
-			forbiddenMessage: agentsFeatureForbidden,
-			permission:       PermissionComplianceRead,
-			handler: func(d *dashboardHandler) http.Handler {
-				return http.HandlerFunc(d.handleCompliance)
-			},
-		},
-		{
 			pattern:          "/fleet",
 			feature:          license.FeatureFleet,
 			forbiddenMessage: fleetFeatureForbidden,
@@ -225,6 +265,19 @@ func dashboardRouteSpecs() []routeSpec {
 			},
 		},
 	}
+	dashboardRouteSpecsByPattern = routeSpecsByPattern(dashboardRouteSpecList)
+)
+
+func routeSpecsByPattern(specs []routeSpec) map[string]routeSpec {
+	out := make(map[string]routeSpec, len(specs))
+	for _, spec := range specs {
+		out[spec.pattern] = spec
+	}
+	return out
+}
+
+func dashboardRouteSpecs() []routeSpec {
+	return dashboardRouteSpecList
 }
 
 // AllPermissions returns the complete bounded permission vocabulary: every
@@ -235,7 +288,7 @@ func dashboardRouteSpecs() []routeSpec {
 func AllPermissions() []Permission {
 	seen := map[Permission]struct{}{PermissionRawRead: {}}
 	all := []Permission{PermissionRawRead}
-	for _, spec := range dashboardRouteSpecs() {
+	for _, spec := range dashboardRouteSpecList {
 		if _, ok := seen[spec.permission]; ok {
 			continue
 		}
@@ -267,11 +320,28 @@ func New(opts Options) http.Handler {
 		authorizeFleetScope: opts.AuthorizeFleetScope,
 		trustedOuterAuth:    opts.TrustedOuterAuth,
 		auditWriter:         opts.AuditWriter,
+		defaultFleetScope:   normalizeDecisionScope(opts.DefaultFleetScope),
 	}
-	for _, spec := range dashboardRouteSpecs() {
+	mux.HandleFunc("/favicon.ico", handleFavicon)
+	for _, spec := range dashboardRouteSpecList {
 		mux.Handle(spec.pattern, d.routeGate(spec, spec.handler(d)))
 	}
 	return mux
+}
+
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeSVG)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write([]byte(dashboardFaviconSVG))
 }
 
 type dashboardHandler struct {
@@ -284,11 +354,33 @@ type dashboardHandler struct {
 	trustedOuterAuth    bool
 	auditWriter         io.Writer
 	auditMu             sync.Mutex
+	// defaultFleetScope is the org/fleet the fleet view falls back to when a
+	// request supplies neither org_id nor fleet_id (a plain "Fleet" nav click).
+	// Only a fully-empty scope is defaulted; a partial scope stays an error.
+	defaultFleetScope DecisionScope
 }
 
 type rawAllowedContextKey struct{}
 
+type navContextKey struct{}
+
 type authAuditInfoContextKey struct{}
+
+type routeAuthorizationCache struct {
+	identityChecked bool
+	identityErr     error
+	permissions     map[Permission]error
+}
+
+type routeAccessResult struct {
+	status           int
+	body             string
+	permissionDenied bool
+}
+
+func (r routeAccessResult) allowed() bool {
+	return r.status == 0
+}
 
 // AuthAuditInfo is the bounded identity metadata appended to dashboard access
 // logs. Callers must pass only sanitized values, never bearer tokens or raw
@@ -323,6 +415,11 @@ func (d *dashboardHandler) rawAllowed(r *http.Request) bool {
 func rawAllowedFromContext(r *http.Request) bool {
 	raw, _ := r.Context().Value(rawAllowedContextKey{}).(bool)
 	return raw
+}
+
+func navFromContext(r *http.Request) NavContext {
+	nav, _ := r.Context().Value(navContextKey{}).(NavContext)
+	return nav
 }
 
 func authAuditInfoFromRequest(r *http.Request) AuthAuditInfo {
@@ -506,51 +603,151 @@ func (d *dashboardHandler) authorizeFleetScopeRequest(w http.ResponseWriter, r *
 
 func (d *dashboardHandler) routeGate(spec routeSpec, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		scriptNonce, err := newDashboardScriptNonce()
+		if err != nil {
+			http.Error(w, "could not initialize dashboard response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Security-Policy", dashboardContentSecurityPolicy(scriptNonce))
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if !knownPermission(spec.permission) {
-			w.Header().Set("Content-Type", contentTypeText)
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte("forbidden\n"))
-			return
-		}
-		if d.hasFeature == nil || !d.hasFeature(spec.feature) {
-			w.Header().Set("Content-Type", contentTypeText)
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(spec.forbiddenMessage))
-			return
-		}
-		// Authentication boundary. The license check above is entitlement, not
-		// identity; fail closed when a configured authorizer rejects the request.
-		if d.authorize == nil && d.authorizePermission == nil && !d.trustedOuterAuth {
-			w.Header().Set("Content-Type", contentTypeText)
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte("dashboard authentication required\n"))
-			return
-		}
-		if d.authorize != nil {
-			if err := d.authorize(r); err != nil {
-				w.Header().Set("Content-Type", contentTypeText)
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = w.Write([]byte("forbidden\n"))
-				return
-			}
-		}
-		if d.authorizePermission != nil {
-			if err := d.authorizePermission(r, spec.permission); err != nil {
+		authCache := &routeAuthorizationCache{}
+		access := d.authorizeRoute(r, spec, authCache)
+		if !access.allowed() {
+			if access.permissionDenied {
 				d.recordPermissionDeniedAudit(r, spec.permission)
-				w.Header().Set("Content-Type", contentTypeText)
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = w.Write([]byte("forbidden\n"))
-				return
 			}
+			w.Header().Set("Content-Type", contentTypeText)
+			w.WriteHeader(access.status)
+			_, _ = w.Write([]byte(access.body))
+			return
 		}
 		raw := d.rawAllowed(r)
+		nav := d.navContext(r, authCache, scriptNonce)
 		d.recordAudit(r, raw, spec.permission)
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), rawAllowedContextKey{}, raw)))
+		ctx := context.WithValue(r.Context(), rawAllowedContextKey{}, raw)
+		ctx = context.WithValue(ctx, navContextKey{}, nav)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func newDashboardScriptNonce() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(nonce[:]), nil
+}
+
+func dashboardContentSecurityPolicy(scriptNonce string) string {
+	if scriptNonce == "" {
+		return contentSecurityPolicy
+	}
+	return contentSecurityPolicy + "; script-src 'self' 'nonce-" + scriptNonce + "'"
+}
+
+func (d *dashboardHandler) authorizeRoute(r *http.Request, spec routeSpec, cache *routeAuthorizationCache) routeAccessResult {
+	if !knownPermission(spec.permission) {
+		return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n"}
+	}
+	if d.hasFeature == nil || !d.hasFeature(spec.feature) {
+		return routeAccessResult{status: http.StatusForbidden, body: spec.forbiddenMessage}
+	}
+	if d.authorize == nil && d.authorizePermission == nil && !d.trustedOuterAuth {
+		return routeAccessResult{status: http.StatusForbidden, body: "dashboard authentication required\n"}
+	}
+	if d.authorize != nil {
+		if cache != nil && cache.identityChecked {
+			if cache.identityErr != nil {
+				return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n"}
+			}
+		} else {
+			err := d.authorize(r)
+			if cache != nil {
+				cache.identityChecked = true
+				cache.identityErr = err
+			}
+			if err != nil {
+				return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n"}
+			}
+		}
+	}
+	if d.authorizePermission != nil {
+		err, ok := error(nil), false
+		if cache != nil {
+			if cache.permissions == nil {
+				cache.permissions = make(map[Permission]error)
+			}
+			err, ok = cache.permissions[spec.permission]
+		}
+		if !ok {
+			err = d.authorizePermission(r, spec.permission)
+			if cache != nil {
+				cache.permissions[spec.permission] = err
+			}
+		}
+		if err != nil {
+			return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n", permissionDenied: true}
+		}
+	}
+	return routeAccessResult{}
+}
+
+func (d *dashboardHandler) navContext(r *http.Request, cache *routeAuthorizationCache, scriptNonce string) NavContext {
+	active := activeNavKey(r.URL.Path)
+	nav := NavContext{
+		Active:      active,
+		ActiveLabel: navLabel(active),
+		ScriptNonce: scriptNonce,
+	}
+	for _, navSpec := range dashboardNavRouteSpecs {
+		route, ok := dashboardRouteSpecsByPattern[navSpec.pattern]
+		if !ok || !d.authorizeRoute(r, route, cache).allowed() {
+			continue
+		}
+		nav.Entries = append(nav.Entries, NavEntry{
+			Key:    navSpec.key,
+			Label:  navSpec.label,
+			Path:   navSpec.pattern,
+			Active: navSpec.key == active,
+		})
+	}
+	return nav
+}
+
+func activeNavKey(path string) string {
+	switch {
+	case path == "/overview":
+		return "overview"
+	case path == "/", strings.HasPrefix(path, "/session/"):
+		return "evidence"
+	case path == "/exemptions":
+		return "exemptions"
+	case path == "/agents", strings.HasPrefix(path, "/agent/"):
+		return "agents"
+	case path == "/budgets":
+		return "budgets"
+	case path == "/trust-keys":
+		return "trust-keys"
+	case path == "/fleet", strings.HasPrefix(path, "/fleet/"):
+		return "fleet"
+	case path == "/workbench", strings.HasPrefix(path, "/workbench/"):
+		return "workbench"
+	case path == "/incident", strings.HasPrefix(path, "/incident/"):
+		return "incident"
+	default:
+		return ""
+	}
+}
+
+func navLabel(key string) string {
+	for _, spec := range dashboardNavRouteSpecs {
+		if spec.key == key {
+			return spec.label
+		}
+	}
+	return "Dashboard"
 }
 
 func knownPermission(permission Permission) bool {
@@ -562,32 +759,30 @@ func knownPermission(permission Permission) bool {
 	return false
 }
 
-func (d *dashboardHandler) handleCompliance(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != CompliancePath {
+func (d *dashboardHandler) handleOverview(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/overview" {
 		http.NotFound(w, r)
 		return
 	}
 	if !requireGet(w, r) {
 		return
 	}
-	orgID := r.URL.Query().Get("org_id")
-	fleetID := r.URL.Query().Get("fleet_id")
-	_, sourceConfigured := d.model.complianceFleetSource()
-	if !d.authorizeFleetScopeRequest(w, r, DecisionScope{OrgID: orgID, FleetID: fleetID}, sourceConfigured, false) {
-		return
-	}
-	page, err := d.model.Compliance(r.Context(), orgID, fleetID)
-	if err != nil {
-		if errors.Is(err, errInvalidFleetScope) {
-			http.Error(w, "invalid fleet scope", http.StatusBadRequest)
+	scope := d.model.defaultFleetScope
+	if d.hasFeature != nil && d.hasFeature(license.FeatureFleet) &&
+		d.model.fleetSource != nil && scope.OrgID != "" && scope.FleetID != "" {
+		if !d.authorizeFleetScopeRequest(w, r, scope, true, rawAllowedFromContext(r)) {
 			return
 		}
-		http.Error(w, "could not build compliance read model", http.StatusInternalServerError)
+	}
+	page, err := d.model.Overview(r.Context(), rawAllowedFromContext(r))
+	if err != nil {
+		http.Error(w, "could not build overview", http.StatusInternalServerError)
 		return
 	}
+	page.Nav = navFromContext(r)
 	var buf bytes.Buffer
-	if err := complianceTemplate.Execute(&buf, page); err != nil {
-		http.Error(w, "could not render compliance console", http.StatusInternalServerError)
+	if err := overviewTemplate.Execute(&buf, page); err != nil {
+		http.Error(w, "could not render overview", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", contentTypeHTML)
@@ -613,7 +808,7 @@ func (d *dashboardHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if selected == "" && len(sessions) > 0 {
 		selected = sessions[0].ID
 	}
-	d.render(w, sessions, selected, rawAllowedFromContext(r))
+	d.render(w, r, sessions, selected, rawAllowedFromContext(r))
 }
 
 func (d *dashboardHandler) handleExemptions(w http.ResponseWriter, r *http.Request) {
@@ -633,7 +828,7 @@ func (d *dashboardHandler) handleExemptions(w http.ResponseWriter, r *http.Reque
 	if !rawAllowedFromContext(r) {
 		inventory = redactExemptions(inventory)
 	}
-	data := exemptionsPageData{Inventory: inventory}
+	data := exemptionsPageData{Nav: navFromContext(r), Inventory: inventory}
 	var buf bytes.Buffer
 	if err := exemptionsTemplate.Execute(&buf, data); err != nil {
 		http.Error(w, "could not render exemptions", http.StatusInternalServerError)
@@ -653,12 +848,14 @@ func requireGet(w http.ResponseWriter, r *http.Request) bool {
 }
 
 type agentsPageData struct {
+	Nav        NavContext
 	Groups     []evidenceview.AgentGroup
 	Filter     FilterSpec
 	RawAllowed bool
 }
 
 type investigatorPageData struct {
+	Nav         NavContext
 	SessionID   string
 	Seq         uint64
 	Explanation evidenceview.DecisionExplanation
@@ -680,6 +877,7 @@ func (d *dashboardHandler) handleAgents(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	data := agentsPageData{
+		Nav:        navFromContext(r),
 		Groups:     groups,
 		Filter:     filter,
 		RawAllowed: rawAllowedFromContext(r),
@@ -714,6 +912,7 @@ func (d *dashboardHandler) handleAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := agentsPageData{
+		Nav:        navFromContext(r),
 		Groups:     []evidenceview.AgentGroup{group},
 		Filter:     filter,
 		RawAllowed: rawAllowedFromContext(r),
@@ -736,14 +935,25 @@ func (d *dashboardHandler) handleFleetOverview(w http.ResponseWriter, r *http.Re
 		return
 	}
 	q := r.URL.Query()
-	if err := validateFleetScope(q.Get("org_id"), q.Get("fleet_id"), d.model.fleetSource != nil); err != nil {
+	orgID := q.Get("org_id")
+	fleetID := q.Get("fleet_id")
+	// A plain "Fleet" nav click carries no scope. When neither is supplied,
+	// fall back to the operator-configured default (the conductor org/fleet the
+	// dashboard reads) so the view resolves instead of 400ing. A partial scope
+	// (only one supplied) is deliberately NOT defaulted; it stays an explicit
+	// error so a half-specified request never silently reads a different fleet.
+	if orgID == "" && fleetID == "" {
+		orgID = d.defaultFleetScope.OrgID
+		fleetID = d.defaultFleetScope.FleetID
+	}
+	if err := validateFleetScope(orgID, fleetID, d.model.fleetSource != nil); err != nil {
 		http.Error(w, "invalid fleet scope", http.StatusBadRequest)
 		return
 	}
-	if !d.authorizeFleetScopeRequest(w, r, DecisionScope{OrgID: q.Get("org_id"), FleetID: q.Get("fleet_id")}, d.model.fleetSource != nil, rawAllowedFromContext(r)) {
+	if !d.authorizeFleetScopeRequest(w, r, DecisionScope{OrgID: orgID, FleetID: fleetID}, d.model.fleetSource != nil, rawAllowedFromContext(r)) {
 		return
 	}
-	overview, err := d.model.FleetOverview(r.Context(), q.Get("org_id"), q.Get("fleet_id"), rawAllowedFromContext(r))
+	overview, err := d.model.FleetOverview(r.Context(), orgID, fleetID, rawAllowedFromContext(r))
 	if err != nil {
 		if errors.Is(err, errInvalidFleetScope) {
 			http.Error(w, "invalid fleet scope", http.StatusBadRequest)
@@ -752,6 +962,7 @@ func (d *dashboardHandler) handleFleetOverview(w http.ResponseWriter, r *http.Re
 		http.Error(w, "could not read fleet overview", http.StatusInternalServerError)
 		return
 	}
+	overview.Nav = navFromContext(r)
 	var buf bytes.Buffer
 	if err := fleetoverviewTemplate.Execute(&buf, overview); err != nil {
 		http.Error(w, "could not render fleet overview", http.StatusInternalServerError)
@@ -796,6 +1007,7 @@ func (d *dashboardHandler) serveDecisionScopePage(w http.ResponseWriter, r *http
 	if scope.ArtifactHash != "" {
 		d.recordDecisionScopeAudit(r, raw, scope, page)
 	}
+	page = withNavContext(page, navFromContext(r))
 	var buf bytes.Buffer
 	if err := opts.tmpl.Execute(&buf, page); err != nil {
 		http.Error(w, opts.renderErr, http.StatusInternalServerError)
@@ -803,6 +1015,19 @@ func (d *dashboardHandler) serveDecisionScopePage(w http.ResponseWriter, r *http
 	}
 	w.Header().Set("Content-Type", contentTypeHTML)
 	_, _ = w.Write(buf.Bytes())
+}
+
+func withNavContext(page any, nav NavContext) any {
+	switch p := page.(type) {
+	case WorkbenchPage:
+		p.Nav = nav
+		return p
+	case IncidentPage:
+		p.Nav = nav
+		return p
+	default:
+		return page
+	}
 }
 
 // handleWorkbench serves the read-only Signed Action Workbench. It is GET-only
@@ -864,6 +1089,7 @@ func (d *dashboardHandler) handleBudgets(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "could not read agent budgets", http.StatusInternalServerError)
 		return
 	}
+	overview.Nav = navFromContext(r)
 	var buf bytes.Buffer
 	if err := budgetsTemplate.Execute(&buf, overview); err != nil {
 		http.Error(w, "could not render budgets", http.StatusInternalServerError)
@@ -886,6 +1112,7 @@ func (d *dashboardHandler) handleTrustKeys(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "could not audit trust and keys", http.StatusInternalServerError)
 		return
 	}
+	page.Nav = navFromContext(r)
 	var buf bytes.Buffer
 	if err := trustKeysTemplate.Execute(&buf, page); err != nil {
 		http.Error(w, "could not render trust and keys", http.StatusInternalServerError)
@@ -916,7 +1143,7 @@ func (d *dashboardHandler) handleSession(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "could not read evidence sessions", http.StatusInternalServerError)
 		return
 	}
-	d.render(w, sessions, selected, rawAllowedFromContext(r))
+	d.render(w, r, sessions, selected, rawAllowedFromContext(r))
 }
 
 func (d *dashboardHandler) handleSessionReceipt(w http.ResponseWriter, r *http.Request, rest string) {
@@ -951,6 +1178,7 @@ func (d *dashboardHandler) handleSessionReceipt(w http.ResponseWriter, r *http.R
 		explanation = evidenceview.RedactExplanation(explanation)
 	}
 	data := investigatorPageData{
+		Nav:         navFromContext(r),
 		SessionID:   sessionID,
 		Seq:         seq,
 		Explanation: explanation,
@@ -965,8 +1193,9 @@ func (d *dashboardHandler) handleSessionReceipt(w http.ResponseWriter, r *http.R
 	_, _ = w.Write(buf.Bytes())
 }
 
-func (d *dashboardHandler) render(w http.ResponseWriter, sessions []SessionSummary, selected string, raw bool) {
+func (d *dashboardHandler) render(w http.ResponseWriter, r *http.Request, sessions []SessionSummary, selected string, raw bool) {
 	data := pageData{
+		Nav:             navFromContext(r),
 		Sessions:        sessions,
 		SelectedSession: selected,
 		RawAllowed:      raw,

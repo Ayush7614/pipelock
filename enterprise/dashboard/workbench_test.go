@@ -282,11 +282,21 @@ func TestWorkbench_PrepareGuidanceAndNeverAuthority(t *testing.T) {
 	}
 	body := rec.Body.String()
 	for _, want := range []string{
+		"Fleet &middot; Signed Actions",
+		"Signed Action Workbench",
+		"Prepare guidance and read-only replay for signed conductor actions",
+		"operator-run command templates",
 		workbenchNeverAuthority,
 		"pipelock conductor publish",
 		"pipelock conductor kill",
 		"pipelock conductor rollback",
 		"No conductor decision source configured",
+		`type="button" class="copy-command" hidden>Copy</button>`,
+		"navigator.clipboard.writeText(code.textContent)",
+		".catch(function()",
+		"white-space: pre-wrap",
+		"overflow-wrap: anywhere",
+		`<script nonce="`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("workbench body missing %q: %s", want, body)

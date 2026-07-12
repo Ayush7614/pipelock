@@ -141,8 +141,15 @@ func TestHandler_AgentsRendersGroups(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Cross-Agent Evidence Explorer") {
+	if !strings.Contains(body, "Agent evidence") {
 		t.Fatal("body should contain the agents page heading")
+	}
+	// The designed header carries the honest what-this-proves lead, not a bare title.
+	if !strings.Contains(body, "produced signed receipts in the configured evidence source") {
+		t.Fatal("body should contain the honest agents-page intent lead")
+	}
+	if !strings.Contains(body, "with loaded evidence") {
+		t.Fatal("body should contain the agent-count summary line")
 	}
 	if !strings.Contains(body, testActor) {
 		t.Fatalf("body should contain agent name %q", testActor)
@@ -155,8 +162,34 @@ func TestHandler_AgentsRendersGroups(t *testing.T) {
 		t.Fatal("body should show 'chains broken' rollup label")
 	}
 	// CSP headers set by gate.
-	if got := rec.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
-		t.Fatalf("CSP = %q, want %q", got, contentSecurityPolicy)
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, contentSecurityPolicy) || !strings.Contains(got, "script-src 'self' 'nonce-") {
+		t.Fatalf("CSP = %q, want dashboard base policy plus script nonce", got)
+	}
+}
+
+func TestHandler_AgentsEmptyStateExplainsReceiptSource(t *testing.T) {
+	t.Parallel()
+
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       t.TempDir(),
+		HasFeature:       allowAgentsFeature,
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(
+		context.Background(), http.MethodGet, "/agents", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"The roster proves which agents have loaded receipt sessions",
+		"No agents or receipts are loaded",
+		"--receipt-dir",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("agents empty body missing %q: %s", want, body)
+		}
 	}
 }
 

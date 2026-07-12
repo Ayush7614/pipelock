@@ -24,27 +24,15 @@
       color: var(--text);
       font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    .topbar {
-      height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border-strong);
-      background: #08080a;
-    }
-    .brand { font-weight: 650; }
-    .brand span { color: var(--text-muted); font-weight: 500; }
-    .mode { color: var(--text-dim); font-size: 13px; }
-    .mode a { color: var(--text-muted); text-decoration: none; margin-right: 14px; }
-    .mode a:hover { color: var(--text); }
     main { padding: 24px; max-width: 1180px; margin: 0 auto; }
     h1, h2 { margin: 0; }
     h1 { font-size: 24px; margin-bottom: 18px; }
     h2 { font-size: 16px; margin-bottom: 10px; }
     .muted { color: var(--text-muted); }
     .dim { color: var(--text-dim); }
-    .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    /* Designed page header (matches the Operator Overview language) so the view
+       reads as intentional at any density -- one agent looks as finished as many. */
+    {{template "dashboardStyles" .}}
     .filter-form {
       display: flex;
       gap: 12px;
@@ -128,17 +116,19 @@
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">Pipelock <span>· Operator Console / Agents</span></div>
-    <div class="mode"><a href="/">Evidence</a><a href="/exemptions">Exemptions</a><a href="/trust-keys">Trust &amp; Keys</a>air-gapped · self-hosted</div>
-  </header>
+  {{template "dashboardHeader" .Nav}}
   <main>
-    <h1>Cross-Agent Evidence Explorer</h1>
+    <header class="page-head">
+      <div class="eyebrow mono">Evidence &middot; Agents</div>
+      <h1>Agent evidence</h1>
+      <p class="lead">Every agent that produced signed receipts in the configured evidence source, with its per-agent chain, anchor, and trusted-key rollup. Read-only. An agent absent here simply has no loaded receipts &mdash; that is not proof it was idle.</p>
+      <div class="summary mono"><b>{{len .Groups}}</b> agent{{if ne (len .Groups) 1}}s{{end}} with loaded evidence{{if .Filter.Agent}} &middot; filtered to &ldquo;{{.Filter.Agent}}&rdquo;{{end}}</div>
+    </header>
 
     <form class="filter-form" method="get" action="/agents">
       <div>
         <label for="f-agent">Agent</label><br>
-        <input type="text" id="f-agent" name="agent" value="{{.Filter.Agent}}">
+        <input type="text" id="f-agent" name="agent" value="{{.Filter.Agent}}" maxlength="128">
       </div>
       <div>
         <label for="f-chain">Chain</label><br>
@@ -187,7 +177,7 @@
         </div>
       </div>
     {{else}}
-      <div class="empty">No agents found matching the current filter.</div>
+      <div class="empty">The roster proves which agents have loaded receipt sessions in the configured evidence source. No agents or receipts are loaded from that source for this view or filter. Point <code>pipelock dashboard serve</code> at a flight-recorder evidence directory with <code>--receipt-dir</code>, or clear the current filter.</div>
     {{end}}
   </main>
 </body>

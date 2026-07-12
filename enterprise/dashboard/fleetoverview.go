@@ -22,6 +22,7 @@ const (
 	fleetStatusVerified        = "Verified"
 	fleetStatusSignedOnly      = "Signed, not verified"
 	fleetStatusUnsigned        = "Unsigned/self-reported"
+	fleetStatusNoSignedState   = "No signed applied-state yet"
 	fleetRedacted              = "redacted"
 	fleetEmptyDash             = "-"
 	fleetOverviewFollowerLimit = 500
@@ -94,6 +95,7 @@ type FleetFollowerView struct {
 }
 
 type FleetOverview struct {
+	Nav              NavContext
 	SourceConfigured bool
 	OrgID            string
 	FleetID          string
@@ -270,7 +272,7 @@ func (f FleetFollowerView) SourceLabel() string {
 	if f.RuntimeReported {
 		return fleetStatusUnsigned
 	}
-	return "No applied-state report"
+	return fleetStatusNoSignedState
 }
 
 func (f FleetFollowerView) SourceClass() string {
@@ -283,7 +285,7 @@ func (f FleetFollowerView) SourceClass() string {
 	if f.RuntimeReported {
 		return "unsigned"
 	}
-	return "missing"
+	return "no-report"
 }
 
 func (f FleetFollowerView) EnrollmentLabel() string {

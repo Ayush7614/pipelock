@@ -134,8 +134,51 @@ func TestBudgets_NilSourceDegrades(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "No budget source is configured") {
-		t.Fatalf("nil source did not render the empty state; body=%s", rec.Body.String())
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Runtime &middot; Budgets",
+		"Per-agent budgets",
+		"Read-only; this page does not change limits, sessions, or enforcement state.",
+		"agents with loaded budget rows",
+		"Budget pressure proves only mediated per-agent budget consumption",
+		"No budget source is connected",
+		"--runtime-snapshot-file",
+		"--receipt-dir/dashboard/runtime-snapshot.json",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("nil source body missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestBudgets_ConnectedEmptySourceExplainsSnapshotRows(t *testing.T) {
+	t.Parallel()
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       t.TempDir(),
+		HasFeature:       func(f string) bool { return f == license.FeatureAgents },
+		BudgetSource:     &fakeBudgetSource{},
+		AuthorizeRaw:     allowRawAccess,
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/budgets", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Runtime &middot; Budgets",
+		"Per-agent budgets",
+		"Read-only; this page does not change limits, sessions, or enforcement state.",
+		"agents with loaded budget rows",
+		"Budget pressure proves only mediated per-agent budget consumption",
+		"The source is connected",
+		"no agents with configured forward-proxy budgets or live MCP sessions",
+		"--runtime-snapshot-file",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("connected empty source body missing %q: %s", want, body)
+		}
 	}
 }
 

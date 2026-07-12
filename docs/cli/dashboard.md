@@ -26,14 +26,6 @@ a license that grants the `agents` feature (Pro or Enterprise); without one it
 refuses to start. The dashboard is read-only: it renders evidence and never
 mutates policy, receipts, or runtime state.
 
-The Compliance console at `/compliance` is a source-grounded mapping view over
-the same receipt scorecards, loaded config, optional live fleet coverage source,
-and operator-authored legal-hold metadata. It renders Pipelock's mapping for
-AARM R1-R9 and an illustrative generic SOC 2-style control set. It is not a
-certification, an auditor opinion, or an endorsement by a framework body.
-Coverage labels are LIMITED to mediated egress inside the declared Pipelock
-boundary.
-
 ## `pipelock dashboard serve`
 
 ```bash
@@ -42,8 +34,14 @@ pipelock dashboard serve \
   --config /etc/pipelock/pipelock.yaml \
   --legal-hold-store /var/lib/pipelock/legal-holds.json \
   --auth-token-file /etc/pipelock/dashboard.token \
-  --compliance-token-file /etc/pipelock/dashboard-auditor.token \
-  --trusted-signer 'file=/etc/pipelock/receipt-signing.pub,source=ops runbook'
+  --trusted-signer 'file=/etc/pipelock/receipt-signing.pub,source=ops runbook' \
+  --conductor-url https://127.0.0.1:8895 \
+  --conductor-token-file /etc/pipelock/conductor-auditor.token \
+  --conductor-tls-cert /etc/pipelock/dashboard-conductor-client.pem \
+  --conductor-tls-key /etc/pipelock/dashboard-conductor-client.key \
+  --conductor-server-ca /etc/pipelock/conductor-server-ca.pem \
+  --conductor-org org-main \
+  --conductor-fleet prod
 ```
 
 Then open `http://127.0.0.1:8896/` in a browser (`https://` when
@@ -88,8 +86,7 @@ startup error.
 | `--config` | none | Optional Pipelock config file for the read-only Exemptions inventory. When omitted, `/exemptions` renders an explicit "no config loaded" state and the Evidence view still works. |
 | `--auth-token-file` | none | File containing the operator token for token-authenticated requests. Required unless OIDC or `--require-client-cert` is configured. Grants the redacted metadata view. |
 | `--raw-token-file` | none | Optional second, higher-privilege token that unlocks raw destinations and signed payloads. Must differ from `--auth-token-file`. |
-| `--compliance-token-file` | none | Optional distinct auditor token granting only `dashboard:compliance:read`; it cannot reach evidence, raw, fleet-control preparation, or signed-action routes. |
-| `--legal-hold-store` | none | Optional atomic JSON legal-hold metadata store displayed read-only by `/compliance`. |
+| `--legal-hold-store` | none | Optional atomic JSON legal-hold metadata store displayed read-only by the governance sections. |
 | `--listen` | `127.0.0.1:8896` | Dashboard listener address. Non-loopback addresses require `--tls-cert`/`--tls-key`. |
 | `--trusted-signer` | none | Trusted receipt signing key: `(inline=HEX_OR_VERSIONED_PUBLIC_KEY\|file=/path)[,source=LABEL]`. Repeatable. `source` is shown in the UI as the reason the key is trusted. |
 | `--license-crl-file` | none | Signed license revocation list; falls back to `PIPELOCK_LICENSE_CRL_FILE`. |
@@ -102,6 +99,11 @@ startup error.
 | `--require-client-cert` | `false` | Require a verified client certificate on every TLS connection and authorize it through the role map. Requires all three mTLS file flags below. |
 | `--client-ca-file` | none | PEM bundle of trust anchors used by TLS to verify client certificates. |
 | `--client-cert-role-map` | none | YAML file mapping client-certificate SPKI SHA-256 fingerprints to roles and bounded dashboard permissions. |
+| `--conductor-url` | none | Optional Conductor HTTPS base URL for read-only live fleet status. When omitted, live fleet panels render the explicit "no conductor source configured" state. |
+| `--conductor-token-file` | none | File containing the Conductor read bearer token. Required with `--conductor-url`; must authorize the configured org/fleet read. |
+| `--conductor-tls-cert`, `--conductor-tls-key` | none | Client certificate and key used for Conductor mutual TLS. Both are required with `--conductor-url`. |
+| `--conductor-server-ca` | none | PEM CA bundle that signed the Conductor server certificate. Required with `--conductor-url`; the dashboard never falls back to plaintext or insecure TLS. |
+| `--conductor-org`, `--conductor-fleet` | none | The single org/fleet scope this dashboard is allowed to read from the Conductor. Required with `--conductor-url`; requests for any other scope are denied before the Conductor is queried. |
 
 ### Mutual TLS client authentication
 
@@ -255,11 +257,12 @@ the server is running stops serving.
 - **Exemptions is inventory only.** `/exemptions` is GET-only and reads the
   already-loaded config snapshot. It has no POST route, no apply/remove/renew
   controls, no config write path, and no hot-reload hook.
-- **Compliance is mapping only.** `/compliance` is GET-only. Its `covered`,
-  `partial`, and `not-covered` labels report whether the declared backing
-  evidence exists; they do not assert organizational compliance. With no live
-  fleet source, it renders an unconfigured empty state rather than local data
-  labeled as live fleet coverage.
+- **Conductor reads are scoped and read-only.** When `--conductor-url` is set,
+  the dashboard uses mutual TLS plus a bearer token to issue GET requests to
+  the Conductor followers roster read endpoint, enriched with runtime status,
+  for the configured
+  `--conductor-org` / `--conductor-fleet`. It never holds a signing key and has
+  no publish, kill, resume, rollback, enroll, revoke, or delete method.
 - **Sensitive by design.** Even the metadata view exposes reasons, signer
   fingerprints, and session IDs. Treat the listener like an admin API: keep it
   loopback or behind TLS on a network only operators reach.
@@ -331,9 +334,10 @@ current fleet and policy state. The panel surfaces the re-derived verdict and a
 loud **Divergence** flag when the re-derived decision no longer matches what was
 recorded. Replay does not re-derive proxy content-scan verdicts, and does not
 prove any action executed or was prevented outside the conductor decision. Until
-the dashboard is wired to a conductor read source, the replay panel renders an
-explicit "no conductor decision source configured" state; the prepare guidance
-and the other views do not depend on that source.
+the dashboard can resolve the supplied artifact hash to the signed artifact the
+Conductor replay endpoint requires, the replay panel renders an explicit "no
+conductor decision source configured" state; the prepare guidance and the other
+views do not depend on that source.
 
 ### Incident Cockpit (`/incident`)
 
@@ -345,6 +349,11 @@ applied-state source (verified / signed-but-unverified / unsigned / no report),
 plus drift and apply-failed counts. The cockpit never kills an agent, publishes,
 or mutates fleet state, and does not prove no bypass occurred outside Pipelock,
 outside enrolled followers, or outside the report window.
+
+With `--conductor-url` configured, the fleet applied-state summary reads the
+configured Conductor follower roster and runtime/applied-state status for the
+single configured org/fleet. Decision replay remains unavailable until the
+dashboard has a read source for the signed artifact behind an artifact hash.
 
 ### Redaction on these pages
 

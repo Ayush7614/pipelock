@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -29,6 +30,9 @@ const (
 	clientHTTPTimeout   = 30 * time.Second
 	clientMaxBodyBytes  = 8 << 20 // 8 MiB cap on operator read responses
 	defaultClientServer = "https://127.0.0.1:8895"
+
+	// ReadClientFollowerLimitMax is the bounded read limit for dashboard follower roster queries.
+	ReadClientFollowerLimitMax = 501
 )
 
 // clientOptions are the connection flags shared by every Conductor operator
@@ -45,6 +49,70 @@ type clientOptions struct {
 	tokenFile      string
 	serverName     string
 	licenseCRLFile string
+}
+
+// ReadClientOptions configures a read-only Conductor client for dashboard and
+// operator read surfaces. It mirrors clientOptions without exposing mutating CLI
+// helpers to callers outside this package.
+type ReadClientOptions struct {
+	Server         string
+	CAFile         string
+	ClientCertFile string
+	ClientKeyFile  string
+	TokenFile      string
+	ServerName     string
+}
+
+// ReadClient exposes only the Conductor read endpoints the dashboard can use.
+// It deliberately has no publish, kill, resume, rollback, enroll, revoke, or
+// delete methods.
+type ReadClient struct {
+	client *conductorClient
+}
+
+// NewReadClient builds an authenticated TLS 1.3 + bearer-token Conductor read
+// client using the same validation and transport setup as the operator CLI.
+func NewReadClient(opts ReadClientOptions) (*ReadClient, error) {
+	client, err := newConductorClient(clientOptions{
+		server:         opts.Server,
+		caFile:         opts.CAFile,
+		clientCertFile: opts.ClientCertFile,
+		clientKeyFile:  opts.ClientKeyFile,
+		tokenFile:      opts.TokenFile,
+		serverName:     opts.ServerName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ReadClient{client: client}, nil
+}
+
+// ListFollowers reads the enrolled-follower roster. It only issues GET against
+// the allowlisted followers endpoint.
+func (c *ReadClient) ListFollowers(ctx context.Context, orgID, fleetID string, limit int) ([]byte, error) {
+	if c == nil || c.client == nil {
+		return nil, errors.New("conductor read client is nil")
+	}
+	if limit <= 0 {
+		return nil, errors.New("follower limit must be positive")
+	}
+	if limit > ReadClientFollowerLimitMax {
+		return nil, fmt.Errorf("follower limit exceeds maximum %d", ReadClientFollowerLimitMax)
+	}
+	orgID = strings.TrimSpace(orgID)
+	fleetID = strings.TrimSpace(fleetID)
+	if orgID == "" || fleetID == "" {
+		return nil, errors.New("org_id and fleet_id are required")
+	}
+	if strings.IndexFunc(orgID, unicode.IsControl) >= 0 || strings.IndexFunc(fleetID, unicode.IsControl) >= 0 {
+		return nil, errors.New("org_id and fleet_id must not contain control characters")
+	}
+	params := map[string]string{
+		"org_id":   orgID,
+		"fleet_id": fleetID,
+		"limit":    fmt.Sprintf("%d", limit),
+	}
+	return c.client.getJSON(ctx, controlplane.FollowersPath+encodeQuery(params))
 }
 
 func (o *clientOptions) bindFlags(cmd *cobra.Command) {
@@ -80,6 +148,9 @@ func newConductorClient(opts clientOptions) (*conductorClient, error) {
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("invalid --server %q: missing host", server)
 	}
+	if parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("invalid --server %q: conductor server URL must not include userinfo, path, query, or fragment", server)
+	}
 	if strings.TrimSpace(opts.caFile) == "" {
 		return nil, errors.New("--ca-file is required")
 	}
@@ -111,6 +182,9 @@ func newConductorClient(opts clientOptions) (*conductorClient, error) {
 	}
 	client := &http.Client{
 		Timeout: clientHTTPTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("conductor redirects are not allowed")
+		},
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				MinVersion:   tls.VersionTLS13,
@@ -142,12 +216,12 @@ func (c *conductorClient) getJSON(ctx context.Context, path string) ([]byte, err
 		return nil, fmt.Errorf("request conductor: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, clientMaxBodyBytes))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("conductor returned status %d: %s", resp.StatusCode, clientSnippet(body, c.token))
-	}
+	body, readErr := readClientBody(resp.Body)
 	if readErr != nil {
 		return nil, fmt.Errorf("read conductor response: %w", readErr)
+	}
+	if err := checkClientStatus(resp, body, c.token); err != nil {
+		return nil, err
 	}
 	return body, nil
 }
@@ -183,14 +257,32 @@ func (c *conductorClient) deleteJSON(ctx context.Context, path string, body any)
 		return nil, fmt.Errorf("delete request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, clientMaxBodyBytes))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("conductor returned status %d: %s", resp.StatusCode, clientSnippet(respBody, c.token))
-	}
+	respBody, readErr := readClientBody(resp.Body)
 	if readErr != nil {
-		return nil, fmt.Errorf("read delete response: %w", readErr)
+		return nil, fmt.Errorf("read conductor response: %w", readErr)
+	}
+	if err := checkClientStatus(resp, respBody, c.token); err != nil {
+		return nil, err
 	}
 	return respBody, nil
+}
+
+func checkClientStatus(resp *http.Response, body []byte, secrets ...string) error {
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("conductor returned status %d: %s", resp.StatusCode, clientSnippet(body, secrets...))
+	}
+	return nil
+}
+
+func readClientBody(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, clientMaxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > clientMaxBodyBytes {
+		return nil, fmt.Errorf("conductor response exceeds %d byte limit", clientMaxBodyBytes)
+	}
+	return body, nil
 }
 
 func readClientTokenFile(path string) (string, error) {

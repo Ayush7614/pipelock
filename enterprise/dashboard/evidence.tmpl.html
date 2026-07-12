@@ -22,28 +22,16 @@
     body {
       margin: 0;
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
       background: var(--bg);
       color: var(--text);
       font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    .topbar {
-      height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border-strong);
-      background: #08080a;
-    }
-    .brand { font-weight: 650; }
-    .brand span { color: var(--text-muted); font-weight: 500; }
-    .mode { color: var(--text-dim); font-size: 13px; }
-    .mode a { color: var(--text-muted); text-decoration: none; margin-right: 14px; }
-    .mode a:hover { color: var(--text); }
     .shell {
       display: grid;
       grid-template-columns: 320px minmax(0, 1fr);
-      height: calc(100vh - 56px);
+      flex: 1;
       min-height: 0;
     }
     aside {
@@ -84,7 +72,7 @@
     .warn, .limited { background: var(--warn); }
     .fail { background: var(--danger); color: white; }
     main {
-      height: calc(100vh - 56px);
+      height: 100%;
       overflow-y: auto;
       min-width: 0;
       min-height: 0;
@@ -222,10 +210,7 @@
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">Pipelock <span>· Operator Console / Evidence</span></div>
-    <div class="mode"><a href="/exemptions">Exemptions</a><a href="/trust-keys">Trust &amp; Keys</a>air-gapped · self-hosted</div>
-  </header>
+  {{template "dashboardHeader" .Nav}}
   <div class="shell">
     <aside>
       <div class="aside-title">Sessions</div>
@@ -238,7 +223,7 @@
           <div class="session-meta">{{.ID}} · {{.ReceiptCount}}{{if .ReadLimited}}+{{end}} receipts</div>
         </a>
       {{else}}
-        <div class="empty">No recorder sessions found.</div>
+        <div class="empty">Evidence proves receipt ordering, signer trust, and per-session decisions only for recorder sessions loaded from the configured evidence source. No recorder sessions are loaded. Point <code>pipelock dashboard serve</code> at a flight-recorder evidence directory with <code>--receipt-dir</code>.</div>
       {{end}}
     </aside>
     <main>

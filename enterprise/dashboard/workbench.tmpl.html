@@ -25,24 +25,6 @@
       color: var(--text);
       font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    .topbar {
-      min-height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border-strong);
-      background: #08080a;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-    }
-    .brand { font-weight: 650; }
-    .brand span { color: var(--text-muted); font-weight: 500; }
-    .nav { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 13px; flex-wrap: wrap; }
-    .nav a { color: var(--text-muted); text-decoration: none; }
-    .nav a:hover { color: var(--text); }
     main { min-width: 0; padding: 24px; }
     .panel { max-width: 1100px; margin: 0 auto; }
     h1, h2 { margin: 0; letter-spacing: 0; }
@@ -50,7 +32,7 @@
     h2 { font-size: 16px; margin: 24px 0 12px; }
     .muted { color: var(--text-muted); }
     .dim { color: var(--text-dim); }
-    .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    {{template "dashboardStyles" .}}
     .banner {
       border: 1px solid rgba(0,229,160,0.4);
       background: rgba(0,229,160,0.06);
@@ -75,12 +57,27 @@
     }
     .step h3 { margin: 0 0 4px; font-size: 14px; }
     pre {
-      overflow-x: auto;
+      overflow-x: visible;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
       background: #08080a;
       border: 1px solid var(--border);
       border-radius: 6px;
       padding: 10px 12px;
       margin: 8px 0 0;
+    }
+    .command-block { position: relative; }
+    .copy-command {
+      float: right;
+      margin: 8px 0 8px 10px;
+      background: var(--accent);
+      color: #050507;
+      border: 0;
+      border-radius: 4px;
+      padding: 5px 10px;
+      font-weight: 800;
+      font-size: 12px;
+      cursor: pointer;
     }
     code { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
     .kv { display: grid; grid-template-columns: 220px 1fr; gap: 6px 16px; margin-top: 8px; }
@@ -118,13 +115,15 @@
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">Pipelock <span>- Operator Console / Workbench</span></div>
-    <div class="nav"><a href="/">Evidence</a><a href="/fleet">Fleet</a><a href="/incident">Incident</a><a href="/exemptions">Exemptions</a><a href="/trust-keys">Trust &amp; Keys</a><span class="mono">read-only</span></div>
-  </header>
+  {{template "dashboardHeader" .Nav}}
   <main>
     <div class="panel">
-      <h1>Signed Action Workbench</h1>
+      <header class="page-head">
+        <div class="eyebrow mono">Fleet &middot; Signed Actions</div>
+        <h1>Signed Action Workbench</h1>
+        <p class="lead">Prepare guidance and read-only replay for signed conductor actions. It shows shipped commands and replay facts; it never submits an action or mutates fleet state.</p>
+        <div class="summary mono"><b>{{len .PrepareSteps}}</b> operator-run command template{{if ne (len .PrepareSteps) 1}}s{{end}}</div>
+      </header>
       <div class="banner">{{.NeverAuthority}}</div>
 
       <h2>Prepare and submit (outside the dashboard)</h2>
@@ -133,7 +132,10 @@
         <div class="step">
           <h3>{{.Title}}</h3>
           <div class="muted">{{.Description}}</div>
-          <pre><code>{{.Command}}</code></pre>
+          <div class="command-block">
+            <button type="button" class="copy-command" hidden>Copy</button>
+            <pre><code>{{.Command}}</code></pre>
+          </div>
         </div>
       {{end}}
 
@@ -177,5 +179,34 @@
       {{end}}
     </div>
   </main>
+  <script nonce="{{.Nav.ScriptNonce}}">
+  (function() {
+    if (!navigator.clipboard) {
+      return;
+    }
+    document.querySelectorAll(".copy-command").forEach(function(button) {
+      button.hidden = false;
+      button.addEventListener("click", function() {
+        var block = button.closest(".command-block");
+        var code = block && block.querySelector("code");
+        if (!code) {
+          return;
+        }
+        var previous = button.textContent;
+        navigator.clipboard.writeText(code.textContent).then(function() {
+          button.textContent = "Copied";
+          window.setTimeout(function() {
+            button.textContent = previous;
+          }, 1200);
+        }).catch(function() {
+          button.textContent = "Copy failed";
+          window.setTimeout(function() {
+            button.textContent = previous;
+          }, 1200);
+        });
+      });
+    });
+  }());
+  </script>
 </body>
 </html>

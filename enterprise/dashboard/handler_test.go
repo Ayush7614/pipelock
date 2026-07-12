@@ -9,8 +9,11 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"html"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -112,8 +115,17 @@ func TestHandler_AllowedRendersScorecard(t *testing.T) {
 	if !strings.Contains(body, "Scorecard") {
 		t.Fatal("allowed response should render scorecard")
 	}
-	if got := rec.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
-		t.Fatalf("CSP = %q, want %q", got, contentSecurityPolicy)
+	for _, want := range []string{
+		"scrollbar-color:rgba(0,229,160,0.45) transparent",
+		"*::-webkit-scrollbar{width:10px;height:10px;}",
+		"*::-webkit-scrollbar-thumb{background:rgba(0,229,160,0.35);border-radius:8px;}",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("shared dashboard header missing %q", want)
+		}
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, contentSecurityPolicy) || !strings.Contains(got, "script-src 'self' 'nonce-") {
+		t.Fatalf("CSP = %q, want dashboard base policy plus script nonce", got)
 	}
 	for header, want := range map[string]string{
 		"Cache-Control":          "no-store",
@@ -122,6 +134,25 @@ func TestHandler_AllowedRendersScorecard(t *testing.T) {
 	} {
 		if got := rec.Header().Get(header); got != want {
 			t.Fatalf("%s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestHandler_FaviconServedWithoutDashboardRoute404(t *testing.T) {
+	t.Parallel()
+
+	handler := New(Options{})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/favicon.ico", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("favicon status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != contentTypeSVG {
+		t.Fatalf("favicon content type = %q, want %q", got, contentTypeSVG)
+	}
+	for _, want := range []string{`<svg xmlns="http://www.w3.org/2000/svg"`, `#00e5a0`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("favicon body missing %q: %s", want, rec.Body.String())
 		}
 	}
 }
@@ -236,11 +267,36 @@ func TestHandler_ExemptionsAllowedRendersInventory(t *testing.T) {
 			t.Fatalf("body missing %q: %s", want, body)
 		}
 	}
-	if got := rec.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
-		t.Fatalf("CSP = %q, want %q", got, contentSecurityPolicy)
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, contentSecurityPolicy) || !strings.Contains(got, "script-src 'self' 'nonce-") {
+		t.Fatalf("CSP = %q, want dashboard base policy plus script nonce", got)
 	}
 	if !strings.Contains(audit.String(), "path=\"/exemptions\"") {
 		t.Fatalf("audit should record exemptions path; got %q", audit.String())
+	}
+}
+
+func TestHandler_EvidenceNoSessionsExplainsReceiptSource(t *testing.T) {
+	t.Parallel()
+
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       t.TempDir(),
+		HasFeature:       allowAgentsFeature,
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Evidence proves receipt ordering, signer trust, and per-session decisions",
+		"No recorder sessions are loaded",
+		"--receipt-dir",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("evidence no-sessions body missing %q: %s", want, body)
+		}
 	}
 }
 
@@ -378,6 +434,41 @@ func TestHandler_RouteSpecsDeclarePermissions(t *testing.T) {
 	}
 }
 
+func TestHandler_NavSpecsUseTopLevelRouteSpecs(t *testing.T) {
+	t.Parallel()
+
+	routes := map[string]routeSpec{}
+	for _, spec := range dashboardRouteSpecs() {
+		routes[spec.pattern] = spec
+	}
+	seen := map[string]struct{}{}
+	for i, navSpec := range dashboardNavRouteSpecs {
+		if i == 0 && navSpec.key != "overview" {
+			t.Fatalf("first nav route = %q, want overview", navSpec.key)
+		}
+		if navSpec.key == "" || navSpec.label == "" || navSpec.pattern == "" {
+			t.Fatalf("invalid dashboard nav spec: %+v", navSpec)
+		}
+		if strings.HasSuffix(navSpec.pattern, "/") && navSpec.pattern != "/" {
+			t.Fatalf("nav spec %q points at detail-prefix route %q", navSpec.key, navSpec.pattern)
+		}
+		route, ok := routes[navSpec.pattern]
+		if !ok {
+			t.Fatalf("nav spec %q points at unregistered route %q", navSpec.key, navSpec.pattern)
+		}
+		if route.permission == "" || route.feature == "" {
+			t.Fatalf("nav route %q has incomplete gate data: %+v", navSpec.pattern, route)
+		}
+		if _, ok := seen[navSpec.pattern]; ok {
+			t.Fatalf("nav route %q is registered twice", navSpec.pattern)
+		}
+		seen[navSpec.pattern] = struct{}{}
+	}
+	if len(seen) != 9 {
+		t.Fatalf("nav route count = %d, want 9", len(seen))
+	}
+}
+
 func TestHandler_RoutePermissionFailsClosed(t *testing.T) {
 	t.Parallel()
 
@@ -447,14 +538,669 @@ func TestHandler_RoutePermissionUsesSpecificPermission(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.path, func(t *testing.T) {
+			got = nil
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.path, nil)
 			handler.ServeHTTP(rec, req)
-			if len(got) == 0 || got[len(got)-1] != tc.want {
-				t.Fatalf("%s permission = %v, want last permission %q", tc.path, got, tc.want)
+			if len(got) == 0 || got[0] != tc.want {
+				t.Fatalf("%s permission = %v, want first permission %q", tc.path, got, tc.want)
 			}
 		})
 	}
+}
+
+func TestHandler_SharedNavReachabilityFromRenderedViews(t *testing.T) {
+	t.Parallel()
+
+	dir, trusted := writeTrustedHandlerSession(t)
+	handler := New(Options{
+		TrustedOuterAuth:    true,
+		ReceiptDir:          dir,
+		TrustedKeys:         trusted,
+		HasFeature:          allowAllDashboardFeatures,
+		AuthorizeFleetScope: allowFleetScope,
+	})
+	tests := []struct {
+		path      string
+		activeKey string
+	}{
+		{path: "/", activeKey: "evidence"},
+		{path: "/session/" + testSessionID, activeKey: "evidence"},
+		{path: "/session/" + testSessionID + "/receipt/0", activeKey: "evidence"},
+		{path: "/exemptions", activeKey: "exemptions"},
+		{path: "/agents", activeKey: "agents"},
+		{path: "/agent/" + testActor, activeKey: "agents"},
+		{path: "/budgets", activeKey: "budgets"},
+		{path: "/trust-keys", activeKey: "trust-keys"},
+		{path: "/fleet", activeKey: "fleet"},
+		{path: "/workbench", activeKey: "workbench"},
+		{path: "/incident", activeKey: "incident"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s status = %d, want 200; body=%s", tc.path, rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			assertSharedNavLinksExactly(t, body, dashboardNavRouteSpecs)
+			assertActiveNavLink(t, body, tc.activeKey)
+		})
+	}
+}
+
+func TestHandler_SharedHeaderCSSSingleSourcedAcrossRenderedViews(t *testing.T) {
+	t.Parallel()
+
+	dir, trusted := writeTrustedHandlerSession(t)
+	handler := New(Options{
+		TrustedOuterAuth:    true,
+		ReceiptDir:          dir,
+		TrustedKeys:         trusted,
+		HasFeature:          allowAllDashboardFeatures,
+		AuthorizeFleetScope: allowFleetScope,
+	})
+
+	overview := renderDashboardPath(t, handler, "/overview")
+	wantStyle := extractDashboardHeaderStyle(t, overview)
+	for _, path := range []string{
+		"/",
+		"/session/" + testSessionID,
+		"/session/" + testSessionID + "/receipt/0",
+		"/exemptions",
+		"/agents",
+		"/agent/" + testActor,
+		"/budgets",
+		"/trust-keys",
+		"/fleet",
+		"/workbench",
+		"/incident",
+	} {
+		if got := extractDashboardHeaderStyle(t, renderDashboardPath(t, handler, path)); got != wantStyle {
+			t.Fatalf("shared dashboard header CSS differs between %s and /overview\n--- %s ---\n%s\n--- overview ---\n%s", path, path, got, wantStyle)
+		}
+	}
+	if !strings.Contains(overview, `<div class="brand"><a href="/overview">Pipelock</a>`) {
+		t.Fatalf("overview brand wordmark does not link to /overview: %s", overview)
+	}
+	assertActiveNavLink(t, overview, "overview")
+	assertActiveNavLink(t, renderDashboardPath(t, handler, "/"), "evidence")
+}
+
+func TestHandler_SharedNavMatchesRouteGateAuthorization(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		hasFeature func(string) bool
+		permission func(Permission) bool
+	}{
+		{
+			name:       "no license",
+			hasFeature: func(string) bool { return false },
+		},
+		{
+			name:       "agents only",
+			hasFeature: allowAgentsFeature,
+		},
+		{
+			name:       "fleet entitled",
+			hasFeature: allowAllDashboardFeatures,
+		},
+		{
+			name:       "fleet feature only",
+			hasFeature: func(feature string) bool { return feature == license.FeatureFleet },
+		},
+	}
+	for _, navSpec := range dashboardNavRouteSpecs {
+		route := routeSpecForPattern(t, navSpec.pattern)
+		permission := route.permission
+		tests = append(tests, struct {
+			name       string
+			hasFeature func(string) bool
+			permission func(Permission) bool
+		}{
+			name:       "permission " + string(permission),
+			hasFeature: allowAllDashboardFeatures,
+			permission: func(got Permission) bool {
+				return got == permission
+			},
+		})
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			d := &dashboardHandler{
+				hasFeature:       tc.hasFeature,
+				trustedOuterAuth: tc.permission == nil,
+			}
+			if tc.permission != nil {
+				d.authorizePermission = func(_ *http.Request, permission Permission) error {
+					if tc.permission(permission) {
+						return nil
+					}
+					return errors.New("permission denied")
+				}
+			}
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/agents?ignored=%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E", nil)
+			want := expectedNavRouteSpecsForGate(t, d, req)
+			got := d.navContext(req, &routeAuthorizationCache{}, "test-nonce")
+			assertNavContextMatchesSpecs(t, got, want, "agents")
+		})
+	}
+}
+
+func TestHandler_SharedNavFiltersUnauthorizedRoutes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		handler    http.Handler
+		gate       *dashboardHandler
+		entryPath  string
+		wantStatus int
+	}{
+		{
+			name: "agents-only evidence page",
+			handler: New(Options{
+				TrustedOuterAuth: true,
+				ReceiptDir:       t.TempDir(),
+				HasFeature:       allowAgentsFeature,
+			}),
+			gate: &dashboardHandler{
+				hasFeature:       allowAgentsFeature,
+				trustedOuterAuth: true,
+			},
+			entryPath:  "/",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "fleet-permission denied from evidence page",
+			handler: New(Options{
+				TrustedOuterAuth:    true,
+				ReceiptDir:          t.TempDir(),
+				HasFeature:          allowAllDashboardFeatures,
+				AuthorizePermission: allowAgentsNavPermissions,
+			}),
+			gate: &dashboardHandler{
+				hasFeature:          allowAllDashboardFeatures,
+				authorizePermission: allowAgentsNavPermissions,
+			},
+			entryPath:  "/",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "agents-permission denied from fleet page",
+			handler: New(Options{
+				TrustedOuterAuth:    true,
+				ReceiptDir:          t.TempDir(),
+				HasFeature:          allowAllDashboardFeatures,
+				AuthorizePermission: allowFleetNavPermissions,
+				AuthorizeFleetScope: allowFleetScope,
+			}),
+			gate: &dashboardHandler{
+				hasFeature:          allowAllDashboardFeatures,
+				authorizePermission: allowFleetNavPermissions,
+			},
+			entryPath:  "/fleet",
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.entryPath, nil)
+			tc.handler.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("%s status = %d, want %d; body=%s", tc.entryPath, rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			body := rec.Body.String()
+
+			want := expectedNavRouteSpecsForGate(t, tc.gate, req)
+			assertSharedNavLinksExactly(t, body, want)
+			for _, spec := range want {
+				rec := httptest.NewRecorder()
+				tc.handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, spec.pattern, nil))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("shown nav route %s status = %d, want 200; body=%s", spec.pattern, rec.Code, rec.Body.String())
+				}
+			}
+			for _, spec := range deniedNavRouteSpecs(t, want) {
+				rec := httptest.NewRecorder()
+				tc.handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, spec.pattern, nil))
+				if rec.Code != http.StatusForbidden {
+					t.Fatalf("hidden nav route %s status = %d, want 403; body=%s", spec.pattern, rec.Code, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestLicenseTierAccessMatrix(t *testing.T) {
+	t.Parallel()
+	assertLicenseTierRouteSpecIntent(t)
+
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	dir, trusted := writeTrustedHandlerSession(t)
+	allowEveryPermission := func(*http.Request, Permission) error { return nil }
+	newMatrixHandler := func(hasFeature func(string) bool, fleetSource *fakeFleetSource) http.Handler {
+		return New(Options{
+			TrustedOuterAuth:    true,
+			ReceiptDir:          dir,
+			TrustedKeys:         trusted,
+			HasFeature:          hasFeature,
+			FleetSource:         fleetSource,
+			DefaultFleetScope:   DecisionScope{OrgID: fleetTestOrgID, FleetID: fleetTestFleetID},
+			AuthorizeFleetScope: allowFleetScope,
+			AuthorizePermission: allowEveryPermission,
+			Now:                 func() time.Time { return now },
+		})
+	}
+
+	agentsFleetSource := &fakeFleetSource{followers: overviewFleetFollowers(now)}
+	enterpriseFleetSource := &fakeFleetSource{followers: overviewFleetFollowers(now)}
+	tiers := []struct {
+		name       string
+		handler    http.Handler
+		hasFeature func(string) bool
+	}{
+		{
+			name:       "agentsOnly",
+			handler:    newMatrixHandler(allowAgentsFeature, agentsFleetSource),
+			hasFeature: allowAgentsFeature,
+		},
+		{
+			name:       "enterprise",
+			handler:    newMatrixHandler(allowAllDashboardFeatures, enterpriseFleetSource),
+			hasFeature: allowAllDashboardFeatures,
+		},
+	}
+
+	for _, tier := range tiers {
+		t.Run(tier.name+"/routes", func(t *testing.T) {
+			for _, spec := range dashboardRouteSpecs() {
+				spec := spec
+				t.Run(spec.pattern, func(t *testing.T) {
+					target := licenseTierMatrixRequestPath(t, spec)
+					rec := httptest.NewRecorder()
+					req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)
+					tier.handler.ServeHTTP(rec, req)
+
+					wantAllowed := tier.hasFeature(spec.feature)
+					if !wantAllowed {
+						if rec.Code != http.StatusForbidden {
+							t.Fatalf("%s %s feature %q status = %d, want 403; body=%s", tier.name, target, spec.feature, rec.Code, rec.Body.String())
+						}
+						return
+					}
+					if rec.Code == http.StatusForbidden {
+						t.Fatalf("%s %s feature %q was license-denied; body=%s", tier.name, target, spec.feature, rec.Body.String())
+					}
+					if licenseTierMatrixRouteMustRenderOK(spec) && rec.Code != http.StatusOK {
+						t.Fatalf("%s %s feature %q status = %d, want 200; body=%s", tier.name, target, spec.feature, rec.Code, rec.Body.String())
+					}
+				})
+			}
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/compliance", nil)
+			tier.handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s /compliance status = %d, want 404; body=%s", tier.name, rec.Code, rec.Body.String())
+			}
+		})
+
+		t.Run(tier.name+"/nav", func(t *testing.T) {
+			body := renderDashboardPath(t, tier.handler, "/overview")
+			wantNav := licenseTierExpectedNavSpecs(t, tier.hasFeature)
+			assertSharedNavLinksExactly(t, body, wantNav)
+			assertLicenseTierFleetNavVisibility(t, body, tier.hasFeature(license.FeatureFleet))
+		})
+	}
+
+	agentsOverview := renderDashboardPath(t, tiers[0].handler, "/overview")
+	for _, leaked := range []string{"Scope " + fleetTestOrgID, "4 accepted follower rows", "verified applied"} {
+		if strings.Contains(agentsOverview, leaked) {
+			t.Fatalf("agents-only overview rendered fleet follower data %q: %s", leaked, agentsOverview)
+		}
+	}
+	assertLicenseTierFleetSurfaceLinks(t, agentsOverview, false)
+	if agentsFleetSource.gotOrgID != "" || agentsFleetSource.gotFleet != "" || agentsFleetSource.gotLimit != 0 {
+		t.Fatalf("agents-only matrix queried fleet source: org=%q fleet=%q limit=%d",
+			agentsFleetSource.gotOrgID, agentsFleetSource.gotFleet, agentsFleetSource.gotLimit)
+	}
+
+	enterpriseOverview := renderDashboardPath(t, tiers[1].handler, "/overview")
+	for _, want := range []string{"Scope redacted / redacted", "4 accepted follower rows", "verified applied"} {
+		if !strings.Contains(enterpriseOverview, want) {
+			t.Fatalf("enterprise overview missing fleet posture %q: %s", want, enterpriseOverview)
+		}
+	}
+	assertLicenseTierFleetSurfaceLinks(t, enterpriseOverview, true)
+}
+
+func TestHandler_SharedNavDoesNotReflectRequestPayloads(t *testing.T) {
+	t.Parallel()
+
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       t.TempDir(),
+		HasFeature:       allowAllDashboardFeatures,
+	})
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, `/agents?agent=%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E`, nil)
+	req.Header.Set("X-Dashboard-Nav", hostileImage)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, hostile := range []string{hostileScript, hostileImage, hostileJSON} {
+		if strings.Contains(body, hostile) {
+			t.Fatalf("dashboard nav response reflected hostile input %q without escaping: %s", hostile, body)
+		}
+	}
+	assertActiveNavLink(t, body, "agents")
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, `/agent/%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E`, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("hostile path status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), hostileScript) || strings.Contains(rec.Body.String(), hostileImage) {
+		t.Fatalf("not-found path reflected hostile input: %s", rec.Body.String())
+	}
+	if key := activeNavKey(`/agent/%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E`); key != "agents" {
+		t.Fatalf("active key for hostile agents subpath = %q, want agents", key)
+	}
+	if label := navLabel(activeNavKey(`/"><script>alert(1)</script>`)); label != "Dashboard" {
+		t.Fatalf("hostile unknown path label = %q, want Dashboard", label)
+	}
+}
+
+func TestHandler_AgentsFilterBoundsAgentInput(t *testing.T) {
+	t.Parallel()
+
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       t.TempDir(),
+		HasFeature:       allowAllDashboardFeatures,
+	})
+	bounded := strings.Repeat("a", agentFilterMaxRunes)
+	oversized := bounded + `"><script>alert(1)</script>`
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/agents?agent="+url.QueryEscape(oversized), nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="agent" value="`+bounded+`" maxlength="128"`) {
+		t.Fatalf("agents filter did not render the bounded value with maxlength: %s", body)
+	}
+	if strings.Contains(body, html.EscapeString(oversized[len(bounded):])) {
+		t.Fatal("agents filter rendered the truncated suffix")
+	}
+}
+
+func expectedNavRouteSpecsForGate(t *testing.T, d *dashboardHandler, req *http.Request) []navRouteSpec {
+	t.Helper()
+	var specs []navRouteSpec
+	cache := &routeAuthorizationCache{}
+	for _, navSpec := range dashboardNavRouteSpecs {
+		route := routeSpecForPattern(t, navSpec.pattern)
+		if d.authorizeRoute(req, route, cache).allowed() {
+			specs = append(specs, navSpec)
+		}
+	}
+	return specs
+}
+
+func assertLicenseTierRouteSpecIntent(t *testing.T) {
+	t.Helper()
+	for _, spec := range dashboardRouteSpecs() {
+		switch spec.feature {
+		case license.FeatureAgents, license.FeatureFleet:
+		default:
+			t.Fatalf("dashboard route %q has unsupported license feature %q", spec.pattern, spec.feature)
+		}
+		if licenseTierFleetSurfacePattern(spec.pattern) && spec.feature != license.FeatureFleet {
+			t.Fatalf("fleet surface %q is tagged %q, want %q", spec.pattern, spec.feature, license.FeatureFleet)
+		}
+	}
+	for _, navSpec := range dashboardNavRouteSpecs {
+		route := routeSpecForPattern(t, navSpec.pattern)
+		if licenseTierFleetSurfacePattern(navSpec.pattern) && route.feature != license.FeatureFleet {
+			t.Fatalf("fleet nav route %q is tagged %q, want %q", navSpec.pattern, route.feature, license.FeatureFleet)
+		}
+	}
+}
+
+func licenseTierFleetSurfacePattern(pattern string) bool {
+	return pattern == "/fleet" || strings.HasPrefix(pattern, "/fleet/") ||
+		pattern == "/workbench" || strings.HasPrefix(pattern, "/workbench/") ||
+		pattern == "/incident" || strings.HasPrefix(pattern, "/incident/")
+}
+
+func licenseTierMatrixRequestPath(t *testing.T, spec routeSpec) string {
+	t.Helper()
+	switch spec.pattern {
+	case "/session/":
+		return "/session/" + testSessionID
+	case "/agent/":
+		return "/agent/" + testActor
+	case "/fleet/", "/workbench/", "/incident/":
+		return spec.pattern + "extra"
+	default:
+		return spec.pattern
+	}
+}
+
+func licenseTierMatrixRouteMustRenderOK(spec routeSpec) bool {
+	switch spec.pattern {
+	case "/fleet/", "/workbench/", "/incident/":
+		return false
+	default:
+		return true
+	}
+}
+
+func licenseTierExpectedNavSpecs(t *testing.T, hasFeature func(string) bool) []navRouteSpec {
+	t.Helper()
+	var specs []navRouteSpec
+	for _, navSpec := range dashboardNavRouteSpecs {
+		route := routeSpecForPattern(t, navSpec.pattern)
+		if hasFeature(route.feature) {
+			specs = append(specs, navSpec)
+		}
+	}
+	return specs
+}
+
+func assertLicenseTierFleetNavVisibility(t *testing.T, body string, wantVisible bool) {
+	t.Helper()
+	nav := extractDashboardNav(t, body)
+	for _, navSpec := range dashboardNavRouteSpecs {
+		route := routeSpecForPattern(t, navSpec.pattern)
+		if route.feature != license.FeatureFleet {
+			continue
+		}
+		has := strings.Contains(nav, fmt.Sprintf(`href="%s"`, navSpec.pattern))
+		switch {
+		case wantVisible && !has:
+			t.Fatalf("enterprise nav missing fleet route %q: %s", navSpec.pattern, body)
+		case !wantVisible && has:
+			t.Fatalf("agents-only nav rendered fleet route %q: %s", navSpec.pattern, body)
+		}
+	}
+}
+
+func assertLicenseTierFleetSurfaceLinks(t *testing.T, body string, wantVisible bool) {
+	t.Helper()
+	nav := extractDashboardNav(t, body)
+	bodyWithoutNav := strings.Replace(body, nav, "", 1)
+	for _, navSpec := range dashboardNavRouteSpecs {
+		route := routeSpecForPattern(t, navSpec.pattern)
+		if route.feature != license.FeatureFleet {
+			continue
+		}
+		has := strings.Contains(bodyWithoutNav, fmt.Sprintf(`href="%s"`, navSpec.pattern))
+		switch {
+		case wantVisible && !has && navSpec.pattern == "/workbench":
+			t.Fatalf("enterprise overview missing body attention link to %q: %s", navSpec.pattern, body)
+		case !wantVisible && has:
+			t.Fatalf("agents-only overview rendered body link to fleet route %q: %s", navSpec.pattern, body)
+		}
+	}
+}
+
+func allowAgentsNavPermissions(_ *http.Request, permission Permission) error {
+	switch permission {
+	case PermissionEvidenceRead, PermissionExemptionsRead, PermissionAgentsRead, PermissionBudgetsRead, PermissionTrustKeysRead:
+		return nil
+	default:
+		return errors.New("permission denied")
+	}
+}
+
+func allowFleetNavPermissions(_ *http.Request, permission Permission) error {
+	switch permission {
+	case PermissionFleetRead, PermissionSignedActionRead, PermissionIncidentRead:
+		return nil
+	default:
+		return errors.New("permission denied")
+	}
+}
+
+func routeSpecForPattern(t *testing.T, pattern string) routeSpec {
+	t.Helper()
+	for _, spec := range dashboardRouteSpecs() {
+		if spec.pattern == pattern {
+			return spec
+		}
+	}
+	t.Fatalf("route spec %q not registered", pattern)
+	return routeSpec{}
+}
+
+func assertNavContextMatchesSpecs(t *testing.T, nav NavContext, specs []navRouteSpec, activeKey string) {
+	t.Helper()
+	if nav.Active != activeKey {
+		t.Fatalf("active nav key = %q, want %q", nav.Active, activeKey)
+	}
+	if nav.ActiveLabel != navLabel(activeKey) {
+		t.Fatalf("active nav label = %q, want %q", nav.ActiveLabel, navLabel(activeKey))
+	}
+	if len(nav.Entries) != len(specs) {
+		t.Fatalf("nav entries = %+v, want specs %+v", nav.Entries, specs)
+	}
+	for i, spec := range specs {
+		entry := nav.Entries[i]
+		if entry.Key != spec.key || entry.Label != spec.label || entry.Path != spec.pattern {
+			t.Fatalf("nav entry[%d] = %+v, want %+v", i, entry, spec)
+		}
+		if entry.Active != (spec.key == activeKey) {
+			t.Fatalf("nav entry[%d] active = %t, want %t", i, entry.Active, spec.key == activeKey)
+		}
+	}
+}
+
+func deniedNavRouteSpecs(t *testing.T, allowed []navRouteSpec) []navRouteSpec {
+	t.Helper()
+	allowedByPattern := make(map[string]struct{}, len(allowed))
+	for _, spec := range allowed {
+		allowedByPattern[spec.pattern] = struct{}{}
+	}
+	var denied []navRouteSpec
+	for _, spec := range dashboardNavRouteSpecs {
+		if _, ok := allowedByPattern[spec.pattern]; !ok {
+			denied = append(denied, spec)
+		}
+	}
+	return denied
+}
+
+func assertSharedNavLinksExactly(t *testing.T, body string, specs []navRouteSpec) {
+	t.Helper()
+	nav := extractDashboardNav(t, body)
+	if !strings.Contains(nav, `aria-label="Dashboard navigation"`) {
+		t.Fatalf("response missing shared dashboard nav: %s", body)
+	}
+	wantByPattern := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		wantByPattern[spec.pattern] = struct{}{}
+	}
+	for _, spec := range dashboardNavRouteSpecs {
+		has := strings.Contains(nav, fmt.Sprintf(`href="%s"`, spec.pattern))
+		_, want := wantByPattern[spec.pattern]
+		switch {
+		case want && !has:
+			t.Fatalf("shared nav missing %s link %q: %s", spec.label, spec.pattern, body)
+		case !want && has:
+			t.Fatalf("shared nav rendered unauthorized %s link %q: %s", spec.label, spec.pattern, body)
+		}
+	}
+}
+
+func renderDashboardPath(t *testing.T, handler http.Handler, path string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s status = %d, want 200; body=%s", path, rec.Code, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
+func extractDashboardHeaderStyle(t *testing.T, body string) string {
+	t.Helper()
+	topbar := strings.Index(body, ".topbar{")
+	if topbar < 0 {
+		t.Fatalf("response missing shared dashboard header style block: %s", body)
+	}
+	start := strings.LastIndex(body[:topbar], "<style>")
+	if start < 0 {
+		t.Fatalf("shared dashboard header style block missing open tag: %s", body)
+	}
+	rest := body[start:]
+	end := strings.Index(rest, "</style>")
+	if end < 0 {
+		t.Fatalf("shared dashboard header style block missing close tag: %s", body)
+	}
+	return rest[:end+len("</style>")]
+}
+
+func extractDashboardNav(t *testing.T, body string) string {
+	t.Helper()
+	start := strings.Index(body, `<nav class="nav" aria-label="Dashboard navigation">`)
+	if start < 0 {
+		t.Fatalf("response missing shared dashboard nav: %s", body)
+	}
+	rest := body[start:]
+	end := strings.Index(rest, "</nav>")
+	if end < 0 {
+		t.Fatalf("shared dashboard nav missing close tag: %s", body)
+	}
+	return rest[:end+len("</nav>")]
+}
+
+func assertActiveNavLink(t *testing.T, body, activeKey string) {
+	t.Helper()
+	for _, spec := range dashboardNavRouteSpecs {
+		if spec.key != activeKey {
+			continue
+		}
+		want := fmt.Sprintf(`href="%s" class="active" aria-current="page">%s</a>`, spec.pattern, html.EscapeString(spec.label))
+		if !strings.Contains(body, want) {
+			t.Fatalf("active nav link = missing %q in body: %s", want, body)
+		}
+		return
+	}
+	t.Fatalf("unknown active nav key %q", activeKey)
 }
 
 func TestHandler_RawViewShownWhenRawPermissionGranted(t *testing.T) {

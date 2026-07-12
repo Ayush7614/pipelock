@@ -32,6 +32,8 @@ const (
 	chainAny     = "any"
 	chainNoMatch = "__invalid_chain__"
 
+	agentFilterMaxRunes = 128
+
 	pipUntampered = "U"
 )
 
@@ -97,6 +99,13 @@ type Options struct {
 	// the access log.
 	AuditWriter io.Writer
 	FleetSource FleetDataSource
+	// DefaultFleetScope is the org/fleet the fleet views fall back to when a
+	// request omits both org_id and fleet_id (e.g. a plain nav click on
+	// "Fleet"). It is the operator-configured conductor org/fleet the dashboard
+	// is allowed to read. A partial scope (only one of the two) is never
+	// defaulted; it stays an explicit error. Empty when no conductor source is
+	// configured.
+	DefaultFleetScope DecisionScope
 	// ConductorSource, when non-nil, is the read-only conductor decision
 	// dry-run/replay seam (BE-2) consumed by the Signed Action Workbench and
 	// Incident Cockpit. It exposes no publish/kill/rollback method, so no write
@@ -122,8 +131,8 @@ type Options struct {
 	DeliveryInboxPath  string
 	ReadModelIndexPath string
 	// LegalHoldStore, when non-nil, supplies operator-authored retention hold
-	// metadata for read-only display on the compliance console. Dashboard HTTP
-	// handlers never mutate it; operators use the dashboard legal-hold CLI.
+	// metadata for read-only dashboard display. Dashboard HTTP handlers never
+	// mutate it; operators use the dashboard legal-hold CLI.
 	LegalHoldStore *LegalHoldStore
 	// Now supplies the current time for lifecycle rendering. Nil uses time.Now.
 	Now func() time.Time
@@ -136,12 +145,14 @@ type ReadModel struct {
 	trustCRLSource     func() (*license.CRL, error)
 	anchorResolver     AnchorResolver
 	cfg                *config.Config
+	hasFeature         func(string) bool
 	receiptReadLimit   int
 	timelineLimit      int
 	filterPresets      map[string]FilterSpec
 	fleetSource        FleetDataSource
 	conductorSource    ConductorDecisionSource
 	budgetSource       BudgetDataSource
+	defaultFleetScope  DecisionScope
 	fleetRedactionKey  [fleetRedactionKeySize]byte
 	exemptionStore     *ExemptionStore
 	legalHoldStore     *LegalHoldStore
@@ -174,12 +185,14 @@ func NewReadModel(opts Options) *ReadModel {
 		trustCRLSource:     opts.TrustCRLSource,
 		anchorResolver:     opts.AnchorResolver,
 		cfg:                opts.Config,
+		hasFeature:         opts.HasFeature,
 		receiptReadLimit:   receiptReadLimit,
 		timelineLimit:      timelineLimit,
 		filterPresets:      opts.FilterPresets,
 		fleetSource:        opts.FleetSource,
 		conductorSource:    opts.ConductorSource,
 		budgetSource:       opts.BudgetSource,
+		defaultFleetScope:  normalizeDecisionScope(opts.DefaultFleetScope),
 		fleetRedactionKey:  fleetRedactionKey,
 		exemptionStore:     opts.ExemptionStore,
 		legalHoldStore:     opts.LegalHoldStore,
@@ -261,7 +274,7 @@ func (m *ReadModel) ReceiptDetail(sessionID string, seq uint64) (evidenceview.De
 func (m *ReadModel) ResolveFilter(r *http.Request) FilterSpec {
 	q := r.URL.Query()
 	verdict := q.Get("verdict")
-	agent := q.Get("agent")
+	agent := truncateFilterValue(q.Get("agent"), agentFilterMaxRunes)
 	chain := q.Get("chain")
 	preset := q.Get("preset")
 
@@ -284,6 +297,19 @@ func overrideIfSet(explicit, preset string) string {
 		return explicit
 	}
 	return preset
+}
+
+func truncateFilterValue(value string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	for i := range value {
+		if maxRunes == 0 {
+			return value[:i]
+		}
+		maxRunes--
+	}
+	return value
 }
 
 // normalizeFilter clamps filter values to the enumerated bounded set.

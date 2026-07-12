@@ -25,39 +25,14 @@
       color: var(--text);
       font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    .topbar {
-      min-height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border-strong);
-      background: #08080a;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-    }
-    .brand { font-weight: 650; }
-    .brand span { color: var(--text-muted); font-weight: 500; }
-    .nav { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 13px; flex-wrap: wrap; }
-    .nav a { color: var(--text-muted); text-decoration: none; }
-    .nav a:hover { color: var(--text); }
     main { min-width: 0; padding: 24px; }
     .panel { max-width: 1320px; margin: 0 auto; }
-    .heading {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 20px;
-      margin-bottom: 18px;
-    }
     h1, h2 { margin: 0; letter-spacing: 0; }
     h1 { font-size: 24px; }
     h2 { font-size: 16px; margin-bottom: 12px; }
     .muted { color: var(--text-muted); }
     .dim { color: var(--text-dim); }
-    .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    {{template "dashboardStyles" .}}
     .callout {
       border: 1px solid var(--border-strong);
       background: #0b0f0e;
@@ -126,7 +101,7 @@
     .chip.verified { background: var(--accent); }
     .chip.signed-unverified { background: var(--warn); }
     .chip.unsigned { background: #64748b; color: #f8fafc; }
-    .chip.missing { background: var(--danger); color: white; }
+    .chip.no-report { background: rgba(245,158,11,0.16); border: 1px solid rgba(245,158,11,0.55); color: #fde68a; }
     .empty {
       color: var(--text-muted);
       padding: 26px;
@@ -136,29 +111,23 @@
     }
     @media (max-width: 900px) {
       main { padding: 16px; }
-      .heading { display: block; }
-      .topbar { align-items: flex-start; height: auto; padding: 14px 16px; flex-direction: column; }
     }
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">Pipelock <span>- Operator Console / Fleet</span></div>
-    <div class="nav"><a href="/">Evidence</a><a href="/exemptions">Exemptions</a><a href="/agents">Agents</a><a href="/trust-keys">Trust &amp; Keys</a><span class="mono">read-only</span></div>
-  </header>
+  {{template "dashboardHeader" .Nav}}
   <main>
     <div class="panel">
-      <div class="heading">
-        <div>
-          <h1>Fleet Overview</h1>
-          <div class="muted">{{.Claim}}</div>
-          <div class="scope">
-            <span class="scope-item">org <span class="mono">{{if .OrgID}}{{.OrgID}}{{else}}any{{end}}</span></span>
-            <span class="scope-item">fleet <span class="mono">{{if .FleetID}}{{.FleetID}}{{else}}any{{end}}</span></span>
-          </div>
+      <header class="page-head">
+        <div class="eyebrow mono">Fleet &middot; Followers</div>
+        <h1>Fleet Overview</h1>
+        <p class="lead">Fleet Overview proves {{.Claim}} for the selected org and fleet scope. It {{.NonClaim}}. Absence, stale reporting, or unsigned rows are amber/neutral evidence gaps, not success.</p>
+        <div class="summary mono"><b>{{len .Followers}}</b> follower{{if ne (len .Followers) 1}}s{{end}} loaded from accepted reports{{if .Truncated}} &middot; truncated{{end}}</div>
+        <div class="scope">
+          <span class="scope-item">org <span class="mono">{{if .OrgID}}{{.OrgID}}{{else}}any{{end}}</span></span>
+          <span class="scope-item">fleet <span class="mono">{{if .FleetID}}{{.FleetID}}{{else}}any{{end}}</span></span>
         </div>
-        <div class="dim mono">{{len .Followers}} followers</div>
-      </div>
+      </header>
 
       <div class="callout muted">
         This view shows signed applied-state only after the conductor has accepted and verified a follower audit batch. Unsigned rows are self-reported runtime status from enrolled followers, not cryptographic proof. It {{.NonClaim}}.
@@ -173,10 +142,10 @@
       {{if not .SourceConfigured}}
         <section class="absence">
           <h2>No conductor fleet source configured</h2>
-          <p class="muted">Fleet data requires the dashboard to be wired to a conductor read source. Other dashboard views do not depend on that source.</p>
+          <p class="muted">Fleet Overview proves mediated fleet state only from accepted follower reports returned by Conductor. No conductor fleet source is connected for this dashboard. Start <span class="mono">pipelock dashboard serve</span> with <span class="mono">--conductor-url</span>, <span class="mono">--conductor-org</span>, <span class="mono">--conductor-fleet</span>, <span class="mono">--conductor-token-file</span>, <span class="mono">--conductor-tls-cert</span>, <span class="mono">--conductor-tls-key</span>, and <span class="mono">--conductor-server-ca</span>; other dashboard views do not depend on that source.</p>
         </section>
       {{else if not .Followers}}
-        <section class="empty">No enrolled followers matched this fleet scope.</section>
+        <section class="empty">Fleet Overview proves mediated fleet state only from accepted follower reports returned by Conductor. The conductor source is connected, but no enrolled followers matched this <span class="mono">org_id</span>/<span class="mono">fleet_id</span> scope. Use the configured <span class="mono">--conductor-org</span> and <span class="mono">--conductor-fleet</span>, or query a scope that contains enrolled followers.</section>
       {{else}}
         {{if .Truncated}}
           <div class="callout muted">Showing the first {{len .Followers}} followers returned by this scoped query. Narrow the fleet scope in the conductor source to inspect additional rows.</div>

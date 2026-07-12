@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -869,21 +870,21 @@ func TestBuildTrustKeyRows_CorruptCRLFailsClosed(t *testing.T) {
 func TestTrustKeysRouteUsesDedicatedPermission(t *testing.T) {
 	t.Parallel()
 
-	var got Permission
+	var got []Permission
 	handler := New(Options{
 		TrustedOuterAuth: true,
 		ReceiptDir:       t.TempDir(), HasFeature: allowAgentsFeature,
 		Authorize: func(*http.Request) error { return nil },
 		AuthorizePermission: func(_ *http.Request, permission Permission) error {
-			got = permission
+			got = append(got, permission)
 			return nil
 		},
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/trust-keys", nil)
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || got != PermissionTrustKeysRead {
-		t.Fatalf("status=%d permission=%q body=%s", rec.Code, got, rec.Body.String())
+	if rec.Code != http.StatusOK || len(got) == 0 || got[0] != PermissionTrustKeysRead {
+		t.Fatalf("status=%d permissions=%v body=%s", rec.Code, got, rec.Body.String())
 	}
 }
 
@@ -935,6 +936,102 @@ func TestTrustKeysTemplateEscapesHostileMetadata(t *testing.T) {
 	for _, escaped := range []string{"&lt;script&gt;", "&lt;img", "&lt;svg"} {
 		if !strings.Contains(body, escaped) {
 			t.Fatalf("escaped hostile metadata missing %q from %s", escaped, body)
+		}
+	}
+}
+
+func TestTrustKeysEmptyStatesExplainSources(t *testing.T) {
+	t.Parallel()
+
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       t.TempDir(),
+		HasFeature:       allowAgentsFeature,
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/trust-keys", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Evidence &middot; Trust",
+		"Trust &amp; Keys",
+		"Read-only registry provenance and evidence-derived signing blast radius",
+		"trusted keys",
+		"chain audits",
+		"The trusted-key registry proves which receipt signing keys",
+		"No trusted signer keys are configured",
+		"--trusted-signer",
+		"The anchor-consistency audit proves receipt-chain consistency",
+		"No receipt sessions were found",
+		"--receipt-dir",
+		"--anchor-local-log",
+		"--rekor-log-key",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("trust-keys empty body missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestTrustKeysAnchorUnconfiguredRendersAmberNotFailure(t *testing.T) {
+	t.Parallel()
+
+	dir, trusted := writeTrustedHandlerSession(t)
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       dir,
+		HasFeature:       allowAgentsFeature,
+		TrustedKeys:      trusted,
+		AnchorResolver: func(string) (*anchor.Bundle, anchor.Backend, bool, error) {
+			return nil, nil, true, errors.New(localAnchorLogPathRequired)
+		},
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/trust-keys", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`class="warn">` + AnchorUnconfigured,
+		"anchor audit not configured: cannot verify local anchor",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("unconfigured anchor body missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `class="fail">`+AnchorUnconfigured) || strings.Contains(body, "anchor audit FAILURE: "+localAnchorLogPathRequired) {
+		t.Fatalf("unconfigured anchor rendered as failure: %s", body)
+	}
+}
+
+func TestTrustKeysAnchorResolverMismatchRendersRedFailure(t *testing.T) {
+	t.Parallel()
+
+	dir, trusted := writeTrustedHandlerSession(t)
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       dir,
+		HasFeature:       allowAgentsFeature,
+		TrustedKeys:      trusted,
+		AnchorResolver: func(string) (*anchor.Bundle, anchor.Backend, bool, error) {
+			return nil, nil, true, errors.New("anchor bundle hash does not match anchor-state marker")
+		},
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/trust-keys", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"anchor audit FAILURE: anchor bundle hash does not match anchor-state marker",
+		`class="fail">` + AnchorFailure,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("anchor mismatch body missing %q: %s", want, body)
 		}
 	}
 }

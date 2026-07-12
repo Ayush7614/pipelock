@@ -25,23 +25,6 @@
       color: var(--text);
       font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    .topbar {
-      height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border-strong);
-      background: #08080a;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-    }
-    .brand { font-weight: 650; }
-    .brand span { color: var(--text-muted); font-weight: 500; }
-    .nav { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 13px; }
-    .nav a { color: var(--text-muted); text-decoration: none; }
-    .nav a:hover { color: var(--text); }
     main {
       min-width: 0;
       padding: 24px;
@@ -152,6 +135,11 @@
     }
     tr:last-child td { border-bottom: 0; }
     .scope, .detail { overflow-wrap: anywhere; }
+    .opaque-cell { display: block; max-width: 260px; overflow-x: auto; }
+    .attrs .opaque-cell { display: inline-block; max-width: 100%; vertical-align: top; }
+    .opaque-value { display: inline-block; min-width: 0; max-width: 100%; word-break: break-all; overflow-wrap: anywhere; }
+    .knob-cell .opaque-cell { overflow: hidden; }
+    .knob-cell .opaque-value { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; word-break: normal; overflow-wrap: normal; }
     .attrs { display: grid; gap: 4px; }
     .attr-name { color: var(--text-dim); }
     .empty {
@@ -165,15 +153,11 @@
       main { padding: 16px; }
       .heading, .summary { grid-template-columns: 1fr; }
       .summary { display: grid; }
-      .topbar { align-items: flex-start; height: auto; min-height: 56px; padding: 14px 16px; gap: 10px; flex-direction: column; }
     }
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">Pipelock <span>- Operator Console / Exemptions</span></div>
-    <div class="nav"><a href="/">Evidence</a><a href="/trust-keys">Trust &amp; Keys</a><span class="mono">air-gapped - self-hosted</span></div>
-  </header>
+  {{template "dashboardHeader" .Nav}}
   <main>
     <div class="panel">
       <div class="heading">
@@ -195,7 +179,7 @@
       {{if not .Inventory.ConfigLoaded}}
         <section class="absence">
           <h2>No config loaded</h2>
-          <p class="muted">Start the dashboard with <span class="mono">--config</span> to show configured exemptions. The evidence view still works without a config.</p>
+          <p class="muted">The exemptions inventory proves which exemption-like knobs are present in the loaded Pipelock config and whether they are active, inert, or misdirected. No config source is connected for this dashboard. Start <span class="mono">pipelock dashboard serve</span> with <span class="mono">--config</span>; add <span class="mono">--exemption-store</span> only when lifecycle owner/expiry/match metadata should be overlaid.</p>
         </section>
       {{else}}
         <section class="summary" aria-label="Exemption counts">
@@ -225,8 +209,8 @@
                 <article class="finding">
                   <div class="finding-head">
                     <div>
-                      <strong>{{.Knob}}</strong>
-                      <div class="dim mono">{{.Scope}}</div>
+                      <strong><span class="opaque-cell"><span class="opaque-value">{{.Knob}}</span></span></strong>
+                      <div class="dim mono opaque-cell"><span class="opaque-value">{{.Scope}}</span></div>
                     </div>
                     <span class="chip {{.State}}">{{.State}}</span>
                   </div>
@@ -264,13 +248,13 @@
                   {{range .Inventory.Entries}}
                     <tr>
                       <td>{{.Scanner}}</td>
-                      <td class="mono">{{.Knob}}</td>
-                      <td class="scope mono">{{.Scope}}</td>
+                      <td class="mono knob-cell" title="{{.Knob}}"><div class="opaque-cell"><span class="opaque-value">{{.Knob}}</span></div></td>
+                      <td class="scope mono"><div class="opaque-cell"><span class="opaque-value">{{.Scope}}</span></div></td>
                       <td>
                         {{if .Attributes}}
                           <div class="attrs">
                             {{range .Attributes}}
-                              <div><span class="attr-name">{{.Name}}:</span> <span class="mono">{{.Value}}</span></div>
+                              <div><span class="attr-name">{{.Name}}:</span> <span class="mono opaque-cell"><span class="opaque-value">{{.Value}}</span></span></div>
                             {{end}}
                           </div>
                         {{else}}
@@ -290,7 +274,7 @@
               </table>
             </div>
           {{else}}
-            <div class="empty">No exemption entries are configured in the loaded config.</div>
+            <div class="empty">The exemptions inventory proves which exemption-like knobs are present in the loaded Pipelock config and whether they are active, inert, or misdirected. A config source is loaded, but it contains no exemption entries. Add exemption entries to the file supplied with <span class="mono">--config</span> if this dashboard should show them.</div>
           {{end}}
         </section>
       {{end}}

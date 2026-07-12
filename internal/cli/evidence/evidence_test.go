@@ -5,15 +5,20 @@ package evidence
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +37,36 @@ const (
 	testTarget            = "https://api.vendor.example/evidence"
 	testTransport         = "fetch"
 )
+
+type serveListenCapture struct {
+	mu sync.Mutex
+	ch chan string
+	bytes.Buffer
+}
+
+func newServeListenCapture() *serveListenCapture {
+	return &serveListenCapture{ch: make(chan string, 1)}
+}
+
+func (c *serveListenCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	n, err := c.Buffer.Write(p)
+	text := c.Buffer.String()
+	c.mu.Unlock()
+	if strings.Contains(text, "http://") {
+		select {
+		case c.ch <- text:
+		default:
+		}
+	}
+	return n, err
+}
+
+func (c *serveListenCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Buffer.String()
+}
 
 func genKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	t.Helper()
@@ -111,6 +146,20 @@ func writeEvidenceSessionWithTarget(
 	count int,
 ) {
 	t.Helper()
+	writeEvidenceSessionWithPlan(t, dir, priv, sessionID, count, func(_ int) (string, string) {
+		return actor, target
+	})
+}
+
+func writeEvidenceSessionWithPlan(
+	t *testing.T,
+	dir string,
+	priv ed25519.PrivateKey,
+	sessionID string,
+	count int,
+	receiptPlan func(int) (actor string, target string),
+) {
+	t.Helper()
 	const entryType = "action_receipt"
 	path := filepath.Join(dir, fmt.Sprintf("evidence-%s-000000.jsonl", sessionID))
 
@@ -119,6 +168,7 @@ func writeEvidenceSessionWithTarget(
 	var lines []byte
 
 	for i := range count {
+		actor, target := receiptPlan(i)
 		ar := receipt.ActionRecord{
 			Version:       receipt.ActionRecordVersion,
 			ActionID:      receipt.NewActionID(),
@@ -336,6 +386,214 @@ func TestViewCmd_ExplicitSession(t *testing.T) {
 	// No Pro note when session is explicit.
 	if strings.Contains(stderr.String(), "Pro") {
 		t.Error("stderr should not mention Pro when --session is explicit")
+	}
+}
+
+func TestServeCmd_ExplicitSessionServesBoundReport(t *testing.T) {
+	t.Parallel()
+	_, priv := genKey(t)
+	dir := emitMultiSessionDir(t, priv)
+
+	sessionID, err := resolveServeSession(dir, "bravo")
+	if err != nil {
+		t.Fatalf("resolveServeSession: %v", err)
+	}
+	handler := evidenceServeHandler(dir, sessionID)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, testActorBravo) {
+		t.Fatalf("GET / missing bound agent %q: %s", testActorBravo, body)
+	}
+	if strings.Contains(body, testActorAlpha) {
+		t.Fatalf("GET / rendered unbound agent %q: %s", testActorAlpha, body)
+	}
+}
+
+func TestServeCmd_NoLicenseRequired(t *testing.T) {
+	t.Parallel()
+	_, priv := genKey(t)
+	dir := t.TempDir()
+	emitSingleSession(t, dir, priv, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdout := newServeListenCapture()
+	cmd := Cmd()
+	cmd.SetContext(ctx)
+	cmd.SetOut(stdout)
+	cmd.SetErr(stdout)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runServe(cmd, serveOptions{
+			receiptDir: dir,
+			listen:     "127.0.0.1:0",
+		})
+	}()
+
+	var listenLine string
+	select {
+	case listenLine = <-stdout.ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("free serve did not bind without a license; output=%s", stdout.String())
+	}
+	endpoint := strings.TrimSpace(strings.TrimPrefix(listenLine, "pipelock evidence serve listening on "))
+	if endpoint == listenLine {
+		t.Fatalf("could not parse serve listen address from %q", listenLine)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("free serve should answer GET / without a license: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	body := string(bodyBytes)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, testActorAlpha) || !strings.Contains(body, "Authentic") {
+		t.Fatalf("GET / missing free evidence report content: %s", body)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve shutdown error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not shut down after context cancellation")
+	}
+}
+
+func TestServeCmd_MixedActorSessionFailsClosed(t *testing.T) {
+	t.Parallel()
+	_, priv := genKey(t)
+	dir := t.TempDir()
+	writeEvidenceSessionWithPlan(t, dir, priv, "shared", 2, func(i int) (string, string) {
+		if i == 0 {
+			return testActorAlpha, testTarget
+		}
+		return testActorBravo, "https://api.vendor.example/" + testBravoTargetSecret
+	})
+
+	handler := evidenceServeHandler(dir, "shared")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("GET / status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, testActorBravo) || strings.Contains(body, testBravoTargetSecret) {
+		t.Fatalf("GET / leaked mixed-actor evidence: %s", body)
+	}
+}
+
+// A single named agent mixed with unattributed ("anonymous") traffic is a normal
+// single-agent session and must render, while two distinct NAMED agents must still
+// be rejected. anonymous is pipelock's default actor, not a second agent.
+func TestValidateSingleActorReceipts_AnonymousIsNotADistinctAgent(t *testing.T) {
+	t.Parallel()
+	mk := func(actor string) receipt.Receipt {
+		return receipt.Receipt{ActionRecord: receipt.ActionRecord{Actor: actor}}
+	}
+	if err := validateSingleActorReceipts("proxy", []receipt.Receipt{mk("pipelock"), mk("anonymous"), mk("pipelock")}); err != nil {
+		t.Fatalf("named agent + anonymous traffic must render, got: %v", err)
+	}
+	if err := validateSingleActorReceipts("proxy", []receipt.Receipt{mk("anonymous"), mk("anonymous")}); err != nil {
+		t.Fatalf("all-anonymous session must render, got: %v", err)
+	}
+	if err := validateSingleActorReceipts("proxy", []receipt.Receipt{mk("agent-alpha"), mk("anonymous"), mk("agent-bravo")}); err == nil {
+		t.Fatal("two distinct named agents must be rejected even with anonymous present")
+	}
+}
+
+func TestServeCmd_MultiSessionRequiresExplicitSession(t *testing.T) {
+	t.Parallel()
+	_, priv := genKey(t)
+	dir := emitMultiSessionDir(t, priv)
+
+	var buf bytes.Buffer
+	cmd := Cmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	err := runServe(cmd, serveOptions{
+		receiptDir: dir,
+		listen:     defaultEvidenceServeListen,
+	})
+	if err == nil {
+		t.Fatal("serve without --session must error for a multi-session receipt directory")
+	}
+	for _, want := range []string{"sessions found", "pass --session"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want it to contain %q", err, want)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("serve should not start or print a listen address on multi-session error, got: %s", buf.String())
+	}
+}
+
+func TestServeCmd_NoEndpointCanSwitchBoundSession(t *testing.T) {
+	t.Parallel()
+	_, priv := genKey(t)
+	dir := emitMultiSessionDir(t, priv)
+
+	handler := evidenceServeHandler(dir, "bravo")
+	for _, target := range []string{"/", "/?session=alpha", "/?agent=agent-alpha"} {
+		t.Run(target, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, target, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET %s status = %d, want 200; body=%s", target, rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, testActorBravo) {
+				t.Fatalf("GET %s missing bound agent %q: %s", target, testActorBravo, body)
+			}
+			if strings.Contains(body, testActorAlpha) {
+				t.Fatalf("GET %s rendered unbound agent %q: %s", target, testActorAlpha, body)
+			}
+		})
+	}
+
+	for _, target := range []string{"/session/alpha", "/session/bravo", "/agent/agent-alpha"} {
+		t.Run(target, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, target, nil))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("GET %s status = %d, want 404; body=%s", target, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestServeCmd_NonGETRootReturnsMethodNotAllowed(t *testing.T) {
+	t.Parallel()
+	_, priv := genKey(t)
+	dir := t.TempDir()
+	writeEvidenceSession(t, dir, priv, "alpha", testActorAlpha, 1)
+
+	handler := evidenceServeHandler(dir, "alpha")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST / status = %d, want 405; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("Allow = %q, want GET", rec.Header().Get("Allow"))
 	}
 }
 

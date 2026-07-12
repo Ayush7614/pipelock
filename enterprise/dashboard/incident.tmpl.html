@@ -25,24 +25,6 @@
       color: var(--text);
       font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    .topbar {
-      min-height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border-strong);
-      background: #08080a;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-    }
-    .brand { font-weight: 650; }
-    .brand span { color: var(--text-muted); font-weight: 500; }
-    .nav { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 13px; flex-wrap: wrap; }
-    .nav a { color: var(--text-muted); text-decoration: none; }
-    .nav a:hover { color: var(--text); }
     main { min-width: 0; padding: 24px; }
     .panel { max-width: 1100px; margin: 0 auto; }
     h1, h2 { margin: 0; letter-spacing: 0; }
@@ -50,7 +32,38 @@
     h2 { font-size: 16px; margin: 24px 0 12px; }
     .muted { color: var(--text-muted); }
     .dim { color: var(--text-dim); }
-    .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    {{template "dashboardStyles" .}}
+    .scope-form {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      margin: 18px 0;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-elevated);
+    }
+    .scope-form label { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .scope-form input[type="text"] {
+      width: min(100%, 230px);
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      padding: 6px 10px;
+      font-size: 13px;
+    }
+    .scope-form button {
+      background: var(--accent);
+      color: #050507;
+      border: 0;
+      border-radius: 4px;
+      padding: 7px 16px;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+    }
     .scope { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     .scope-item { border: 1px solid var(--border); background: var(--bg-elevated); border-radius: 8px; padding: 8px 10px; }
     .callout {
@@ -95,18 +108,35 @@
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">Pipelock <span>- Operator Console / Incident</span></div>
-    <div class="nav"><a href="/">Evidence</a><a href="/fleet">Fleet</a><a href="/workbench">Workbench</a><a href="/exemptions">Exemptions</a><a href="/trust-keys">Trust &amp; Keys</a><span class="mono">read-only</span></div>
-  </header>
+  {{template "dashboardHeader" .Nav}}
   <main>
     <div class="panel">
-      <h1>Incident Cockpit</h1>
-      <div class="muted">{{.Claim}}</div>
-      <div class="scope">
-        <span class="scope-item">org <span class="mono">{{if .OrgID}}{{.OrgID}}{{else}}-{{end}}</span></span>
-        <span class="scope-item">fleet <span class="mono">{{if .FleetID}}{{.FleetID}}{{else}}-{{end}}</span></span>
-      </div>
+      <header class="page-head">
+        <div class="eyebrow mono">Fleet &middot; Incident</div>
+        <h1>Incident Cockpit</h1>
+        <p class="lead">{{.Claim}} It {{.NonClaim}}. Read-only; this cockpit correlates sources and has no kill, publish, or fleet mutation path.</p>
+        {{if .HasFleet}}<div class="summary mono"><b>{{.Applied.Total}}</b> follower{{if ne .Applied.Total 1}}s{{end}} in the correlated applied-state counts{{if .Applied.Truncated}} &middot; truncated{{end}}</div>{{end}}
+        <div class="scope">
+          <span class="scope-item">org <span class="mono">{{if .OrgID}}{{.OrgID}}{{else}}-{{end}}</span></span>
+          <span class="scope-item">fleet <span class="mono">{{if .FleetID}}{{.FleetID}}{{else}}-{{end}}</span></span>
+        </div>
+      </header>
+
+      <form class="scope-form" method="get" action="/incident">
+        <div>
+          <label for="incident-org">Org ID</label><br>
+          <input type="text" id="incident-org" name="org_id" value="{{if .ScopeProvided}}{{.OrgID}}{{end}}">
+        </div>
+        <div>
+          <label for="incident-fleet">Fleet ID</label><br>
+          <input type="text" id="incident-fleet" name="fleet_id" value="{{if .ScopeProvided}}{{.FleetID}}{{end}}">
+        </div>
+        <div>
+          <label for="incident-artifact">Artifact hash</label><br>
+          <input type="text" id="incident-artifact" name="artifact_hash" value="{{if .ScopeProvided}}{{.ArtifactHash}}{{end}}">
+        </div>
+        <button type="submit">Submit</button>
+      </form>
 
       <div class="callout muted">This cockpit reads and correlates; it never kills an agent, publishes, or mutates fleet state. It {{.NonClaim}}.</div>
       {{if not .RawAllowed}}
@@ -114,11 +144,11 @@
       {{end}}
 
       {{if not .ScopeProvided}}
-        <section class="empty">Supply <span class="mono">?org_id=&lt;org&gt;&amp;fleet_id=&lt;fleet&gt;&amp;artifact_hash=&lt;hash&gt;</span> to correlate a conductor decision with its fleet applied state.</section>
+        <section class="empty">This tool correlates one conductor decision with fleet applied-state counts. It is awaiting input, not missing data. Supply <span class="mono">org_id</span>, <span class="mono">fleet_id</span>, and <span class="mono">artifact_hash</span> in the form above, or open <span class="mono">/incident?org_id=&lt;org&gt;&amp;fleet_id=&lt;fleet&gt;&amp;artifact_hash=&lt;hash&gt;</span>.</section>
       {{else}}
         <h2>Conductor decision</h2>
         {{if not .DecisionSourceConfigured}}
-          <section class="absence"><h2>No conductor decision source configured</h2><p class="muted">Decision replay requires the dashboard to be wired to a conductor read source.</p></section>
+          <section class="absence"><h2>No conductor decision source configured</h2><p class="muted">Decision replay proves how the conductor would resolve this artifact through the read-only replay seam. No conductor decision source is connected. Start <span class="mono">pipelock dashboard serve</span> with <span class="mono">--conductor-url</span> and its required read credentials.</p></section>
         {{else if .DecisionMissing}}
           <section class="empty">No recorded decision matched this artifact hash.</section>
         {{else if .HasDecision}}
@@ -144,7 +174,7 @@
 
         <h2>Fleet applied state</h2>
         {{if not .FleetSourceConfigured}}
-          <section class="absence"><h2>No conductor fleet source configured</h2><p class="muted">Applied-state correlation requires the dashboard to be wired to a conductor read source.</p></section>
+          <section class="absence"><h2>No conductor fleet source configured</h2><p class="muted">Applied-state correlation proves follower report counts for the requested fleet scope. No conductor fleet source is connected. Start <span class="mono">pipelock dashboard serve</span> with <span class="mono">--conductor-url</span>, <span class="mono">--conductor-org</span>, <span class="mono">--conductor-fleet</span>, <span class="mono">--conductor-token-file</span>, <span class="mono">--conductor-tls-cert</span>, <span class="mono">--conductor-tls-key</span>, and <span class="mono">--conductor-server-ca</span>.</p></section>
         {{else if .HasFleet}}
           {{with .Applied}}
           {{if .Truncated}}<div class="callout muted">Showing counts for the first 500 followers returned by this scoped query.</div>{{end}}
