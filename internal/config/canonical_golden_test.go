@@ -263,7 +263,37 @@ const (
 	// endpoint+parameter query-value entropy exemptions are policy-semantic.
 	// Advisory metadata is excluded, but the effective tuple is included in
 	// sorted order.
-	goldenHashDefaults = "6653383bbbf6d327ea4cdecf3284f56c85c47a857212039b3a8fa50991c16ece"
+	// Re-bumped for the Markdown Link Credential Exfiltration and Auth
+	// Material Requirement precision fixes: verb<->noun gaps are now
+	// clause-aware (no bare DOTALL '.') so a benign two-clause sentence no
+	// longer bridges an unrelated transfer verb to a credential noun, the
+	// "collect/copy/include NOUN, then VERB ... link" branch requires the
+	// verb's object to be the credential itself, and Auth Material
+	// Requirement now requires an explicit hand-over request in the same
+	// clause as the stated requirement instead of firing on a bare
+	// precondition statement. See
+	// TestCore_MarkdownLinkCredentialExfiltrationIntentAnchor and
+	// TestScanResponse_AuthMaterialRequirementIntentAnchor.
+	// Re-bumped for adversarial regression coverage on those same patterns:
+	// Auth Material Requirement now catches immediate sentence-split
+	// requirement-plus-handover forms, and the default/core floor adds a
+	// narrow Markdown Link Credential Value Exfiltration sibling for
+	// "copy credential, then submit the value to [link]" without changing the
+	// preset YAML regex bytes.
+	// Re-bumped to close an indirect markdown-link exfiltration gap: the
+	// default/core floor adds a new "Markdown Link Credential Follow
+	// Exfiltration" sibling pattern for "collect credential, then
+	// open/follow/visit this link to sync/upload/send: [...](...)",
+	// a shape the existing transmit-verb-anchored patterns above do not
+	// cover because the link is never the direct object of a send/upload/
+	// submit verb. See TestCore_MarkdownLinkCredentialFollowExfiltrationIntentAnchor.
+	// Re-bumped for the Markdown Link Credential Exfiltration verb-to-noun
+	// separator: ordinary direct gaps are short again, while comma-set-off
+	// parenthetical padding still blocks. This catches padded single-clause
+	// exfiltration without bridging coordinated objects like "send your invoice
+	// and include your account token ... [billing]". See
+	// TestCore_MarkdownLinkCredentialExfiltrationIntentAnchor.
+	goldenHashDefaults = "f0368215f7fc693880af230b3f7a41bdfbc0b78adb9244418a532a817ff76a0f"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -393,7 +423,17 @@ const (
 	// Re-bumped for Credential Path Directive changes (merged from origin/main)
 	// and for fetch_proxy.monitoring.query_entropy_param_exclusions: see
 	// goldenHashDefaults note above.
-	goldenHashRichConfig = "35861d2ae576c832f74c7cb2d5e9a1e673cf525aabf77ee5adae1f6b15c15de0"
+	// Re-bumped for the Markdown Link Credential Exfiltration and Auth
+	// Material Requirement precision fixes: see goldenHashDefaults note above;
+	// the rich fixture inherits the default response-scanning pattern set, so
+	// the hash shifts in lockstep.
+	// Re-bumped for the new Markdown Link Credential Follow Exfiltration
+	// sibling pattern: see goldenHashDefaults note above; the rich fixture
+	// inherits the default response-scanning pattern set, so the hash
+	// shifts in lockstep.
+	// Re-bumped for the Markdown Link Credential Exfiltration verb-to-noun
+	// separator. See goldenHashDefaults note above.
+	goldenHashRichConfig = "21595dabe082d838709dd9af8a6871e491672a77a056862e00ca7c2ccb0ee568"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It
