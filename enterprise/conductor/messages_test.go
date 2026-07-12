@@ -527,6 +527,57 @@ func TestPolicyBundlePayloadPolicyHashDistinctLoadedConfigsDiffer(t *testing.T) 
 	}
 }
 
+func TestPolicyBundleLegacyPolicyHashCollidesOnExactJSONNumbers(t *testing.T) {
+	left := PolicyBundlePayload{ConfigYAML: toolPolicyNumberBoundYAML("9007199254740992.0")}
+	right := PolicyBundlePayload{ConfigYAML: toolPolicyNumberBoundYAML("9007199254740993.0")}
+	leftPolicyHash, err := left.PolicyHash()
+	if err != nil {
+		t.Fatalf("PolicyHash(left): %v", err)
+	}
+	rightPolicyHash, err := right.PolicyHash()
+	if err != nil {
+		t.Fatalf("PolicyHash(right): %v", err)
+	}
+	if leftPolicyHash == rightPolicyHash {
+		t.Fatalf("current loaded-config policy hashes collided: %s", leftPolicyHash)
+	}
+
+	leftLegacyHash, err := left.LegacyPolicyHash()
+	if err != nil {
+		t.Fatalf("LegacyPolicyHash(left): %v", err)
+	}
+	rightLegacyHash, err := right.LegacyPolicyHash()
+	if err != nil {
+		t.Fatalf("LegacyPolicyHash(right): %v", err)
+	}
+	if leftLegacyHash != rightLegacyHash {
+		t.Fatalf("legacy collision attempt did not collide:\nleft=%s\nright=%s", leftLegacyHash, rightLegacyHash)
+	}
+
+	bundle := testPolicyBundle()
+	bundle.Payload = right
+	bundle.PayloadSHA256 = mustPayloadHash(right)
+	bundle.PolicyHash = leftLegacyHash
+	if err := bundle.Validate(); !errors.Is(err, ErrHashMismatch) {
+		t.Fatalf("Validate(legacy collision policy_hash) = %v, want ErrHashMismatch", err)
+	}
+	if err := bundle.ValidateAllowLegacyPolicyHash(); err != nil {
+		t.Fatalf("ValidateAllowLegacyPolicyHash(legacy collision policy_hash) = %v, want nil", err)
+	}
+}
+
+func toolPolicyNumberBoundYAML(bound string) string {
+	return "mcp_tool_policy:\n" +
+		"  enabled: true\n" +
+		"  action: block\n" +
+		"  rules:\n" +
+		"    - name: exact-number-bound\n" +
+		"      tool_pattern: '^db_query$'\n" +
+		"      arg_key: '^amount$'\n" +
+		"      arg_type: number\n" +
+		"      arg_number_gt: " + bound + "\n"
+}
+
 func TestPolicyBundlePayloadPolicyHashRejectsLocalCompanionFields(t *testing.T) {
 	cwd := t.TempDir()
 	secretsPath := filepath.Join(cwd, "secrets.env")
@@ -1607,6 +1658,7 @@ func TestRemoteKillMessage_ValidateErrors(t *testing.T) {
 		{"missing_message_id", func(m *RemoteKillMessage) { m.MessageID = "" }, ErrMissingField},
 		{"missing_org", func(m *RemoteKillMessage) { m.OrgID = "" }, ErrMissingField},
 		{"empty_audience", func(m *RemoteKillMessage) { m.Audience = Audience{} }, ErrInvalidAudience},
+		{"invalid_intent", func(m *RemoteKillMessage) { m.Intent = "preview" }, ErrInvalidControlIntent},
 		{"invalid_state", func(m *RemoteKillMessage) { m.State = "paused" }, ErrInvalidState},
 		{"missing_counter", func(m *RemoteKillMessage) { m.Counter = 0 }, ErrMissingField},
 		{"invalid_window", func(m *RemoteKillMessage) { m.ExpiresAt = m.NotBefore }, ErrInvalidValidityWindow},
@@ -1633,6 +1685,7 @@ func TestRollbackAuthorization_ValidateErrors(t *testing.T) {
 		{"unsupported_schema", func(r *RollbackAuthorization) { r.SchemaVersion = 99 }, ErrUnsupportedSchemaVersion},
 		{"missing_authorization_id", func(r *RollbackAuthorization) { r.AuthorizationID = "" }, ErrMissingField},
 		{"missing_fleet", func(r *RollbackAuthorization) { r.FleetID = "" }, ErrMissingField},
+		{"invalid_intent", func(r *RollbackAuthorization) { r.Intent = "preview" }, ErrInvalidControlIntent},
 		{"missing_current_bundle", func(r *RollbackAuthorization) { r.CurrentBundleID = "" }, ErrMissingField},
 		{"missing_target_bundle", func(r *RollbackAuthorization) { r.TargetBundleID = "" }, ErrMissingField},
 		{"missing_counter", func(r *RollbackAuthorization) { r.Counter = 0 }, ErrMissingField},

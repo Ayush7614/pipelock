@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -651,12 +652,21 @@ func (s *FileBundleStore) load() error {
 	slices.Sort(names)
 	for _, name := range names {
 		path := filepath.Join(s.bundlesDir, name)
-		record, err := readBundleRecord(path)
+		record, err := readBundleRecordAllowLegacyPolicyHash(path)
 		if err != nil {
 			return err
 		}
 		if _, exists := s.records[record.BundleHash]; exists {
 			return fmt.Errorf("%w: duplicate bundle_hash %q", ErrInvalidStoreRecord, record.BundleHash)
+		}
+		if record.Bundle.UsesLegacyPolicyHash() {
+			slog.Warn("conductor_policy_bundle_legacy_policy_hash",
+				slog.String("event", "conductor_policy_bundle_legacy_policy_hash"),
+				slog.String("bundle_id", record.Bundle.BundleID),
+				slog.String("bundle_hash", record.BundleHash),
+				slog.Uint64("version", record.Bundle.Version),
+				slog.String("policy_hash", record.Bundle.PolicyHash),
+			)
 		}
 		if _, err := s.bundleByIDVersionLocked(record.Bundle.BundleID, record.Bundle.Version); err == nil {
 			return fmt.Errorf("%w: duplicate bundle_id/version %q/%d", ErrInvalidStoreRecord, record.Bundle.BundleID, record.Bundle.Version)
@@ -934,8 +944,21 @@ func (s *FileBundleStore) maybeResolveRollbackHeadLocked(record PublishedBundle)
 }
 
 func validatePublishableBundle(bundle conductor.PolicyBundle, now time.Time) error {
-	if err := bundle.Validate(); err != nil {
+	return validatePublishableBundleWithOptions(bundle, now, false)
+}
+
+func validatePublishableBundleWithOptions(bundle conductor.PolicyBundle, now time.Time, allowLegacyPolicyHash bool) error {
+	var err error
+	if allowLegacyPolicyHash {
+		err = bundle.ValidateAllowLegacyPolicyHash()
+	} else {
+		err = bundle.Validate()
+	}
+	if err != nil {
 		return err
+	}
+	if !conductor.NotBeforeReached(now, bundle.NotBefore) {
+		return fmt.Errorf("%w: now=%s not_before=%s", conductor.ErrNotYetValid, now.UTC().Format(time.RFC3339), bundle.NotBefore.UTC().Format(time.RFC3339))
 	}
 	if bundle.ExpiresAt.Before(now) {
 		return conductor.ErrExpired
@@ -944,6 +967,14 @@ func validatePublishableBundle(bundle conductor.PolicyBundle, now time.Time) err
 }
 
 func readBundleRecord(path string) (PublishedBundle, error) {
+	return readBundleRecordWithOptions(path, false)
+}
+
+func readBundleRecordAllowLegacyPolicyHash(path string) (PublishedBundle, error) {
+	return readBundleRecordWithOptions(path, true)
+}
+
+func readBundleRecordWithOptions(path string, allowLegacyPolicyHash bool) (PublishedBundle, error) {
 	clean := filepath.Clean(path)
 	info, err := os.Lstat(clean)
 	if err != nil {
@@ -969,7 +1000,7 @@ func readBundleRecord(path string) (PublishedBundle, error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return PublishedBundle{}, fmt.Errorf("%w: trailing JSON document", ErrInvalidStoreRecord)
 	}
-	if err := validateStoredRecord(record); err != nil {
+	if err := validateStoredRecordWithOptions(record, allowLegacyPolicyHash); err != nil {
 		return PublishedBundle{}, err
 	}
 	return record, nil
@@ -1061,6 +1092,10 @@ func streamHeadRecordFileName(streamKey string) string {
 }
 
 func validateStoredRecord(record PublishedBundle) error {
+	return validateStoredRecordWithOptions(record, false)
+}
+
+func validateStoredRecordWithOptions(record PublishedBundle, allowLegacyPolicyHash bool) error {
 	if record.BundleHash == "" || len(record.BundleHash) != sha256.Size*2 {
 		return fmt.Errorf("%w: invalid bundle_hash", ErrInvalidStoreRecord)
 	}
@@ -1084,7 +1119,7 @@ func validateStoredRecord(record PublishedBundle) error {
 	if record.PublishedAt.IsZero() {
 		return fmt.Errorf("%w: published_at", ErrInvalidStoreRecord)
 	}
-	return validatePublishableBundle(record.Bundle, record.PublishedAt)
+	return validatePublishableBundleWithOptions(record.Bundle, record.PublishedAt, allowLegacyPolicyHash)
 }
 
 func streamKey(bundle conductor.PolicyBundle) (string, error) {

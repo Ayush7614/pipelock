@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	conductorcore "github.com/luckyPipewrench/pipelock/enterprise/conductor"
 	"github.com/luckyPipewrench/pipelock/enterprise/conductor/controlplane"
@@ -39,6 +40,89 @@ func TestConductorDryRunFlagsAndReplayCommandRegistered(t *testing.T) {
 	if cmd := findCommandPath(t, root, "replay"); cmd == nil {
 		t.Fatal("conductor replay command is not registered")
 	}
+	for _, path := range [][]string{{"replay", "remote-kill"}, {"replay", "rollback"}} {
+		if cmd := findCommandPath(t, root, path...); cmd == nil {
+			t.Fatalf("%s replay mode is not registered", strings.Join(path, " "))
+		}
+	}
+	t.Run("remote-kill replay flags stay in parity with publish flags", func(t *testing.T) {
+		kill := findCommandPath(t, root, "kill")
+		replayKill := findCommandPath(t, root, "replay", "remote-kill")
+		kill.Flags().VisitAll(func(flag *pflag.Flag) {
+			if flag.Name == "dry-run" {
+				if replayKill.Flags().Lookup(flag.Name) != nil {
+					t.Fatalf("replay remote-kill unexpectedly exposes %q", flag.Name)
+				}
+				return
+			}
+			replayFlag := replayKill.Flags().Lookup(flag.Name)
+			if replayFlag == nil {
+				t.Fatalf("replay remote-kill missing %q flag from kill command", flag.Name)
+			}
+			if replayFlag.Value.Type() != flag.Value.Type() {
+				t.Fatalf("replay remote-kill %q type = %q, want %q", flag.Name, replayFlag.Value.Type(), flag.Value.Type())
+			}
+		})
+		if replayKill.Flags().Lookup("state") == nil {
+			t.Fatal("replay remote-kill missing replay-only --state flag")
+		}
+		if got := replayKill.Flags().Lookup("state").DefValue; got != "" {
+			t.Fatalf("replay remote-kill --state default = %q, want empty required value", got)
+		}
+	})
+	t.Run("rollback replay flags stay in parity with rollback flags", func(t *testing.T) {
+		rollback := findCommandPath(t, root, "rollback")
+		replayRollback := findCommandPath(t, root, "replay", "rollback")
+		rollback.Flags().VisitAll(func(flag *pflag.Flag) {
+			if flag.Name == "dry-run" {
+				if replayRollback.Flags().Lookup(flag.Name) != nil {
+					t.Fatalf("replay rollback unexpectedly exposes %q", flag.Name)
+				}
+				return
+			}
+			replayFlag := replayRollback.Flags().Lookup(flag.Name)
+			if replayFlag == nil {
+				t.Fatalf("replay rollback missing %q flag from rollback command", flag.Name)
+			}
+			if replayFlag.Value.Type() != flag.Value.Type() {
+				t.Fatalf("replay rollback %q type = %q, want %q", flag.Name, replayFlag.Value.Type(), flag.Value.Type())
+			}
+		})
+	})
+	t.Run("replay emergency output is not mislabeled as dry-run", func(t *testing.T) {
+		var out bytes.Buffer
+		writeDecisionReplayResult(&out, controlplane.DecisionReplayResult{
+			ActionKind:   "remote_kill",
+			ArtifactHash: strings.Repeat("a", 64),
+			ReplayedAt:   testFixedNow(t),
+			RemoteKill: &controlplane.RemoteKillEvaluation{
+				Valid:       true,
+				WouldCreate: true,
+				Counter:     100,
+			},
+		})
+		writeDecisionReplayResult(&out, controlplane.DecisionReplayResult{
+			ActionKind:   "rollback",
+			ArtifactHash: strings.Repeat("b", 64),
+			ReplayedAt:   testFixedNow(t),
+			Rollback: &controlplane.RollbackEvaluation{
+				Valid:               true,
+				WouldCreate:         true,
+				Counter:             101,
+				WouldRollToVersion:  41,
+				WouldRollToBundleID: "bundle-target",
+			},
+		})
+		got := out.String()
+		for _, want := range []string{"replay remote-kill", "replay rollback"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("output %q missing %q", got, want)
+			}
+		}
+		if strings.Contains(got, "dry-run remote-kill") || strings.Contains(got, "dry-run rollback") {
+			t.Fatalf("replay output mislabeled as dry-run: %q", got)
+		}
+	})
 }
 
 func TestReplayCommandRunELicenseGateAndRunReplay(t *testing.T) {
@@ -534,6 +618,10 @@ func TestRunReplayPostsBundleAndRendersResult(t *testing.T) {
 			t.Fatalf("request missing signed bundle: %+v", body.Bundle)
 		}
 		gotSnapshot = len(body.StateSnapshot) > 0
+		artifactHash, err := body.Bundle.CanonicalHash()
+		if err != nil {
+			t.Fatalf("CanonicalHash(bundle): %v", err)
+		}
 		var raw map[string]json.RawMessage
 		if err := json.NewDecoder(bytes.NewReader(requestBody)).Decode(&raw); err != nil {
 			t.Fatalf("decode raw request: %v", err)
@@ -546,7 +634,7 @@ func TestRunReplayPostsBundleAndRendersResult(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(controlplane.DecisionReplayResult{
 			ActionKind:        "publish",
-			ArtifactHash:      strings.Repeat("b", 64),
+			ArtifactHash:      artifactHash,
 			UsedStateSnapshot: true,
 			ReplayedAt:        testFixedNow(t),
 			PublishEvaluation: &controlplane.PublishEvaluation{
@@ -578,6 +666,368 @@ func TestRunReplayPostsBundleAndRendersResult(t *testing.T) {
 		if !strings.Contains(gotOut, want) {
 			t.Fatalf("output %q missing %q", gotOut, want)
 		}
+	}
+}
+
+func TestRunReplayRemoteKillPostsEndpointShapeAndDoesNotApply(t *testing.T) {
+	rig := newKillRig(t, 0)
+	recorder := &recordingEmergencyTransport{inner: rig.srv}
+	rig.opts.transport = recorder
+
+	opts := replayOptions{
+		mode:            replayModeRemoteKill,
+		kill:            rig.opts,
+		remoteKillState: string(conductorcore.KillSwitchActive),
+	}
+	cmd, out := replayCobra(t)
+	if err := runReplay(cmd, opts); err != nil {
+		t.Fatalf("runReplay remote-kill: %v", err)
+	}
+	if recorder.method != http.MethodPost {
+		t.Fatalf("method = %q, want POST", recorder.method)
+	}
+	if recorder.path != controlplane.DecisionReplayPath {
+		t.Fatalf("path = %q, want %q", recorder.path, controlplane.DecisionReplayPath)
+	}
+	if recorder.authorization != "Bearer "+testAdminToken {
+		t.Fatalf("Authorization = %q, want admin bearer", recorder.authorization)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(recorder.body, &raw); err != nil {
+		t.Fatalf("decode replay request: %v", err)
+	}
+	for key := range raw {
+		if key != "remote_kill" {
+			t.Fatalf("remote-kill replay request included unexpected key %q", key)
+		}
+	}
+	var body struct {
+		RemoteKill *conductorcore.RemoteKillMessage `json:"remote_kill"`
+	}
+	if err := json.Unmarshal(recorder.body, &body); err != nil {
+		t.Fatalf("decode remote-kill replay request: %v", err)
+	}
+	if body.RemoteKill == nil || body.RemoteKill.State != conductorcore.KillSwitchActive || body.RemoteKill.Intent != conductorcore.ControlIntentReplay || len(body.RemoteKill.Signatures) == 0 {
+		t.Fatalf("remote-kill replay body = %+v, want signed active message", body.RemoteKill)
+	}
+	gotOut := out.String()
+	for _, want := range []string{"decision replay action=remote_kill", "replay remote-kill", "valid=true", "would_create=true"} {
+		if !strings.Contains(gotOut, want) {
+			t.Fatalf("output %q missing %q", gotOut, want)
+		}
+	}
+	if strings.Contains(gotOut, "dry-run remote-kill") {
+		t.Fatalf("remote-kill replay output mislabeled as dry-run: %q", gotOut)
+	}
+
+	follower := controlplane.FollowerIdentity{OrgID: testOrgID, FleetID: testFleetID, InstanceID: testInstanceID, Environment: testEnvironment}
+	if _, err := rig.srv.emergency.LatestRemoteKill(t.Context(), follower, rig.now); !errors.Is(err, controlplane.ErrEmergencyNotFound) {
+		t.Fatalf("remote-kill replay stored a kill: err=%v, want ErrEmergencyNotFound", err)
+	}
+}
+
+func TestRunReplayRemoteKillRequiresExplicitState(t *testing.T) {
+	rig := newKillRig(t, 0)
+	opts := replayOptions{
+		mode: replayModeRemoteKill,
+		kill: rig.opts,
+	}
+	cmd, _ := replayCobra(t)
+	if err := runReplay(cmd, opts); err == nil || !strings.Contains(err.Error(), "--state is required") {
+		t.Fatalf("runReplay remote-kill without --state error = %v, want required state error", err)
+	}
+}
+
+func TestParseReplayRemoteKillState(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    conductorcore.KillSwitchState
+		wantErr string
+	}{
+		{name: "active", raw: "active", want: conductorcore.KillSwitchActive},
+		{name: "kill_alias", raw: " kill ", want: conductorcore.KillSwitchActive},
+		{name: "inactive", raw: "inactive", want: conductorcore.KillSwitchInactive},
+		{name: "resume_alias", raw: " RESUME ", want: conductorcore.KillSwitchInactive},
+		{name: "empty", raw: "", wantErr: "--state is required"},
+		{name: "invalid", raw: "paused", wantErr: "--state must be"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseReplayRemoteKillState(tt.raw)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseReplayRemoteKillState(%q) error = %v, want %q", tt.raw, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseReplayRemoteKillState(%q) error = %v", tt.raw, err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseReplayRemoteKillState(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunReplayRollbackPostsEndpointShapeAndDoesNotApply(t *testing.T) {
+	rb := newRollbackRig(t, 0)
+	srv, ok := rb.transport.(*testServer)
+	if !ok {
+		t.Fatalf("rollback test transport = %T, want *testServer", rb.transport)
+	}
+	recorder := &recordingEmergencyTransport{inner: srv}
+	rb.transport = recorder
+
+	opts := replayOptions{
+		mode:     replayModeRollback,
+		rollback: rb,
+	}
+	cmd, out := replayCobra(t)
+	if err := runReplay(cmd, opts); err != nil {
+		t.Fatalf("runReplay rollback: %v", err)
+	}
+	if recorder.method != http.MethodPost {
+		t.Fatalf("method = %q, want POST", recorder.method)
+	}
+	if recorder.path != controlplane.DecisionReplayPath {
+		t.Fatalf("path = %q, want %q", recorder.path, controlplane.DecisionReplayPath)
+	}
+	if recorder.authorization != "Bearer "+testAdminToken {
+		t.Fatalf("Authorization = %q, want admin bearer", recorder.authorization)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(recorder.body, &raw); err != nil {
+		t.Fatalf("decode replay request: %v", err)
+	}
+	for key := range raw {
+		if key != "rollback" {
+			t.Fatalf("rollback replay request included unexpected key %q", key)
+		}
+	}
+	var body struct {
+		Rollback *conductorcore.RollbackAuthorization `json:"rollback"`
+	}
+	if err := json.Unmarshal(recorder.body, &body); err != nil {
+		t.Fatalf("decode rollback replay request: %v", err)
+	}
+	if body.Rollback == nil || body.Rollback.TargetVersion != rb.targetVersion || body.Rollback.Intent != conductorcore.ControlIntentReplay || len(body.Rollback.Signatures) == 0 {
+		t.Fatalf("rollback replay body = %+v, want signed rollback authorization", body.Rollback)
+	}
+	gotOut := out.String()
+	for _, want := range []string{"decision replay action=rollback", "replay rollback", "valid=true", "would_create=true", "would_roll_to_version=41"} {
+		if !strings.Contains(gotOut, want) {
+			t.Fatalf("output %q missing %q", gotOut, want)
+		}
+	}
+	if strings.Contains(gotOut, "dry-run rollback") {
+		t.Fatalf("rollback replay output mislabeled as dry-run: %q", gotOut)
+	}
+
+	follower := controlplane.FollowerIdentity{OrgID: testOrgID, FleetID: testFleetID, InstanceID: testInstanceID, Environment: testEnvironment}
+	if _, active, err := srv.emergency.ActiveRollbackForFollower(t.Context(), follower, rb.now()); err != nil || active {
+		t.Fatalf("rollback replay active rollback = %t err=%v, want none", active, err)
+	}
+	head, err := srv.store.Latest(t.Context(), follower, rb.now())
+	if err != nil {
+		t.Fatalf("latest bundle after rollback replay: %v", err)
+	}
+	if head.Bundle.Version != rb.currentVersion || head.Bundle.BundleID != rb.currentBundleID {
+		t.Fatalf("rollback replay moved stream head to %s v%d, want %s v%d", head.Bundle.BundleID, head.Bundle.Version, rb.currentBundleID, rb.currentVersion)
+	}
+}
+
+func TestPostDecisionReplayRejectsResponseModeMismatches(t *testing.T) {
+	resultTime := testFixedNow(t)
+	tests := []struct {
+		name     string
+		artifact decisionReplayArtifact
+		result   controlplane.DecisionReplayResult
+		wantErr  string
+	}{
+		{
+			name:     "publish action mismatch",
+			artifact: decisionReplayArtifact{Bundle: &conductorcore.PolicyBundle{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:   replayModeRemoteKill,
+				ArtifactHash: strings.Repeat("a", 64),
+				ReplayedAt:   resultTime,
+				RemoteKill:   &controlplane.RemoteKillEvaluation{Valid: true},
+			},
+			wantErr: "replay response action_kind",
+		},
+		{
+			name:     "publish missing evaluation",
+			artifact: decisionReplayArtifact{Bundle: &conductorcore.PolicyBundle{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:   "publish",
+				ArtifactHash: strings.Repeat("b", 64),
+				ReplayedAt:   resultTime,
+			},
+			wantErr: "missing publish_evaluation",
+		},
+		{
+			name:     "remote kill action mismatch",
+			artifact: decisionReplayArtifact{RemoteKill: &conductorcore.RemoteKillMessage{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:        "publish",
+				ArtifactHash:      strings.Repeat("c", 64),
+				ReplayedAt:        resultTime,
+				PublishEvaluation: &controlplane.PublishEvaluation{Valid: true},
+			},
+			wantErr: "replay response action_kind",
+		},
+		{
+			name:     "remote kill missing evaluation",
+			artifact: decisionReplayArtifact{RemoteKill: &conductorcore.RemoteKillMessage{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:   replayModeRemoteKill,
+				ArtifactHash: strings.Repeat("d", 64),
+				ReplayedAt:   resultTime,
+			},
+			wantErr: "missing remote_kill_evaluation",
+		},
+		{
+			name:     "rollback action mismatch",
+			artifact: decisionReplayArtifact{Rollback: &conductorcore.RollbackAuthorization{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:   replayModeRemoteKill,
+				ArtifactHash: strings.Repeat("e", 64),
+				ReplayedAt:   resultTime,
+				RemoteKill:   &controlplane.RemoteKillEvaluation{Valid: true},
+			},
+			wantErr: "replay response action_kind",
+		},
+		{
+			name:     "rollback missing evaluation",
+			artifact: decisionReplayArtifact{Rollback: &conductorcore.RollbackAuthorization{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:   replayModeRollback,
+				ArtifactHash: strings.Repeat("f", 64),
+				ReplayedAt:   resultTime,
+			},
+			wantErr: "missing rollback_evaluation",
+		},
+		{
+			name:     "publish response included extra emergency evaluation",
+			artifact: decisionReplayArtifact{Bundle: &conductorcore.PolicyBundle{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:        replayActionPublish,
+				ArtifactHash:      strings.Repeat("g", 64),
+				ReplayedAt:        resultTime,
+				PublishEvaluation: &controlplane.PublishEvaluation{Valid: true},
+				RemoteKill:        &controlplane.RemoteKillEvaluation{Valid: true},
+			},
+			wantErr: "included an emergency evaluation",
+		},
+		{
+			name:     "remote kill response included extra publish evaluation",
+			artifact: decisionReplayArtifact{RemoteKill: &conductorcore.RemoteKillMessage{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:        replayModeRemoteKill,
+				ArtifactHash:      strings.Repeat("h", 64),
+				ReplayedAt:        resultTime,
+				RemoteKill:        &controlplane.RemoteKillEvaluation{Valid: true},
+				PublishEvaluation: &controlplane.PublishEvaluation{Valid: true},
+			},
+			wantErr: "included a different evaluation",
+		},
+		{
+			name:     "rollback response included extra emergency evaluation",
+			artifact: decisionReplayArtifact{Rollback: &conductorcore.RollbackAuthorization{}},
+			result: controlplane.DecisionReplayResult{
+				ActionKind:   replayModeRollback,
+				ArtifactHash: strings.Repeat("i", 64),
+				ReplayedAt:   resultTime,
+				Rollback:     &controlplane.RollbackEvaluation{Valid: true},
+				RemoteKill:   &controlplane.RemoteKillEvaluation{Valid: true},
+			},
+			wantErr: "included a different evaluation",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expectedHash, err := validateDecisionReplayArtifact(tt.artifact)
+			if err != nil {
+				t.Fatalf("validateDecisionReplayArtifact(): %v", err)
+			}
+			tt.result.ArtifactHash = expectedHash
+			body, err := json.Marshal(tt.result)
+			if err != nil {
+				t.Fatalf("marshal result: %v", err)
+			}
+			client := &staticEmergencyTransport{status: http.StatusOK, body: string(body)}
+			_, err = postDecisionReplay(t.Context(), client, "https://conductor.example", testAdminToken, tt.artifact)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("postDecisionReplay() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPostDecisionReplayRejectsMalformedRequestLocally(t *testing.T) {
+	bundle := &conductorcore.PolicyBundle{}
+	msg := &conductorcore.RemoteKillMessage{}
+	snapshot := json.RawMessage(`{"followers":[]}`)
+	tests := []struct {
+		name     string
+		artifact decisionReplayArtifact
+		wantErr  string
+	}{
+		{
+			name:     "none",
+			artifact: decisionReplayArtifact{},
+			wantErr:  "exactly one artifact",
+		},
+		{
+			name:     "multiple",
+			artifact: decisionReplayArtifact{Bundle: bundle, RemoteKill: msg},
+			wantErr:  "exactly one artifact",
+		},
+		{
+			name:     "snapshot without bundle",
+			artifact: decisionReplayArtifact{RemoteKill: msg, StateSnapshot: snapshot},
+			wantErr:  "state_snapshot",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &staticEmergencyTransport{status: http.StatusOK, body: `{}`}
+			_, err := postDecisionReplay(t.Context(), client, "https://conductor.example", testAdminToken, tt.artifact)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("postDecisionReplay() error = %v, want %q", err, tt.wantErr)
+			}
+			if client.path != "" {
+				t.Fatalf("postDecisionReplay() sent malformed request to %q, want local rejection", client.path)
+			}
+		})
+	}
+}
+
+func TestPostDecisionReplayRejectsArtifactHashMismatch(t *testing.T) {
+	msg := conductorcore.RemoteKillMessage{MessageID: "kill-mismatch"}
+	expectedHash, err := msg.CanonicalHash()
+	if err != nil {
+		t.Fatalf("CanonicalHash(remote kill): %v", err)
+	}
+	if expectedHash == strings.Repeat("0", 64) {
+		t.Fatal("test fixture unexpectedly matched mismatch hash")
+	}
+	result := controlplane.DecisionReplayResult{
+		ActionKind:   replayModeRemoteKill,
+		ArtifactHash: strings.Repeat("0", 64),
+		ReplayedAt:   testFixedNow(t),
+		RemoteKill:   &controlplane.RemoteKillEvaluation{Valid: true},
+	}
+	body, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	client := &staticEmergencyTransport{status: http.StatusOK, body: string(body)}
+	_, err = postDecisionReplay(t.Context(), client, "https://conductor.example", testAdminToken, decisionReplayArtifact{RemoteKill: &msg})
+	if err == nil || !strings.Contains(err.Error(), "artifact_hash") {
+		t.Fatalf("postDecisionReplay() error = %v, want artifact_hash mismatch", err)
 	}
 }
 
@@ -621,10 +1071,14 @@ func TestRunReplayBundleArtifactPostsExactBundle(t *testing.T) {
 			t.Fatalf("replay bundle timestamps changed: got created=%s not_before=%s expires=%s want created=%s not_before=%s expires=%s",
 				body.Bundle.CreatedAt, body.Bundle.NotBefore, body.Bundle.ExpiresAt, bundle.CreatedAt, bundle.NotBefore, bundle.ExpiresAt)
 		}
+		artifactHash, err := body.Bundle.CanonicalHash()
+		if err != nil {
+			t.Fatalf("CanonicalHash(bundle): %v", err)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(controlplane.DecisionReplayResult{
 			ActionKind:   "publish",
-			ArtifactHash: strings.Repeat("b", 64),
+			ArtifactHash: artifactHash,
 			ReplayedAt:   testFixedNow(t),
 			PublishEvaluation: &controlplane.PublishEvaluation{
 				Valid:       true,
@@ -674,9 +1128,13 @@ func TestRunReplayResolvesPreviousHashAuto(t *testing.T) {
 				t.Fatalf("decode replay request: %v", err)
 			}
 			replayPreviousHash = body.Bundle.PreviousBundleHash
+			artifactHash, err := body.Bundle.CanonicalHash()
+			if err != nil {
+				t.Fatalf("CanonicalHash(bundle): %v", err)
+			}
 			_ = json.NewEncoder(w).Encode(controlplane.DecisionReplayResult{
 				ActionKind:   "publish",
-				ArtifactHash: strings.Repeat("b", 64),
+				ArtifactHash: artifactHash,
 				ReplayedAt:   testFixedNow(t),
 				PublishEvaluation: &controlplane.PublishEvaluation{
 					Valid:       true,
@@ -724,6 +1182,25 @@ func TestRunReplayErrorPaths(t *testing.T) {
 	cmd, _ = replayCobra(t)
 	if err := runReplay(cmd, opts); err == nil || !strings.Contains(err.Error(), "HTTP 502") {
 		t.Fatalf("server error = %v, want HTTP 502", err)
+	}
+
+	opts = replayOptions{publish: publishDryRunTestOptions(t, dir)}
+	createdReplay, err := json.Marshal(controlplane.DecisionReplayResult{
+		ActionKind:   "publish",
+		ArtifactHash: strings.Repeat("b", 64),
+		ReplayedAt:   testFixedNow(t),
+		PublishEvaluation: &controlplane.PublishEvaluation{
+			Valid:       true,
+			WouldCreate: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal created replay response: %v", err)
+	}
+	opts.publish.conductorURL = newStubStatusServer(t, http.StatusCreated, string(createdReplay))
+	cmd, _ = replayCobra(t)
+	if err := runReplay(cmd, opts); err == nil || !strings.Contains(err.Error(), "201 Created") {
+		t.Fatalf("created replay response error = %v, want 201 Created rejection", err)
 	}
 
 	opts = replayOptions{publish: publishDryRunTestOptions(t, dir)}
@@ -830,6 +1307,29 @@ func (s *staticEmergencyTransport) Do(req *http.Request) (*http.Response, error)
 		Header:     make(http.Header),
 		Request:    req,
 	}, nil
+}
+
+type recordingEmergencyTransport struct {
+	inner         emergencyTransport
+	method        string
+	path          string
+	authorization string
+	body          []byte
+}
+
+func (r *recordingEmergencyTransport) Do(req *http.Request) (*http.Response, error) {
+	r.method = req.Method
+	r.path = req.URL.Path
+	r.authorization = req.Header.Get("Authorization")
+	if req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		r.body = body
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	return r.inner.Do(req)
 }
 
 type errReader struct{}

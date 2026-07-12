@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -71,6 +70,27 @@ are not supported. It requires at least ` + fmt.Sprintf("%d", conductorcore.Requ
 			return runRollback(cmd, opts)
 		},
 	}
+	bindRollbackFlags(cmd, &opts)
+	return cmd
+}
+
+type rollbackFlagOptions struct {
+	includeDryRun bool
+	counterHelp   string
+}
+
+func bindRollbackFlags(cmd *cobra.Command, opts *rollbackOptions) {
+	bindRollbackFlagsWithOptions(cmd, opts, rollbackFlagOptions{
+		includeDryRun: true,
+		counterHelp:   "monotonic counter; defaults to the current Unix time so each publish supersedes the prior one",
+	})
+}
+
+func bindRollbackFlagsWithOptions(cmd *cobra.Command, opts *rollbackOptions, flagOpts rollbackFlagOptions) {
+	counterHelp := strings.TrimSpace(flagOpts.counterHelp)
+	if counterHelp == "" {
+		counterHelp = "monotonic counter; defaults to the current Unix time"
+	}
 	cmd.Flags().StringVar(&opts.baseURL, "conductor-url", "", "base URL of the Conductor control plane (required)")
 	cmd.Flags().StringVar(&opts.adminTokenFile, "admin-token-file", "", "file containing the Conductor admin bearer token (required)")
 	cmd.Flags().StringArrayVar(&opts.signingKeys, "signing-key", nil,
@@ -82,10 +102,12 @@ are not supported. It requires at least ` + fmt.Sprintf("%d", conductorcore.Requ
 	cmd.Flags().Uint64Var(&opts.currentVersion, "current-version", 0, "version currently applied on the followers (required, must be > target)")
 	cmd.Flags().StringVar(&opts.targetBundleID, "target-bundle-id", "", "bundle id to roll back to (required)")
 	cmd.Flags().Uint64Var(&opts.targetVersion, "target-version", 0, "version to roll back to (required, must be < current)")
-	cmd.Flags().Uint64Var(&opts.counter, "counter", 0, "monotonic counter; defaults to the current Unix time so each publish supersedes the prior one")
+	cmd.Flags().Uint64Var(&opts.counter, "counter", 0, counterHelp)
 	cmd.Flags().StringVar(&opts.reason, "reason", "", "operator reason recorded in the signed authorization")
 	cmd.Flags().DurationVar(&opts.ttl, "ttl", rollbackDefaultTTL, "validity window; must not exceed the Conductor's configured rollback max validity")
-	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "evaluate the signed rollback without mutating Conductor state")
+	if flagOpts.includeDryRun {
+		cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "evaluate the signed rollback without mutating Conductor state")
+	}
 	cmd.Flags().StringVar(&opts.tlsCert, "tls-cert", "", "operator client TLS certificate for Conductor mTLS (required)")
 	cmd.Flags().StringVar(&opts.tlsKey, "tls-key", "", "operator client TLS private key for Conductor mTLS (required)")
 	cmd.Flags().StringVar(&opts.serverCA, "server-ca", "", "CA bundle that signed the Conductor server certificate (required)")
@@ -96,17 +118,67 @@ are not supported. It requires at least ` + fmt.Sprintf("%d", conductorcore.Requ
 	_ = cmd.MarkFlagRequired("fleet")
 	_ = cmd.MarkFlagRequired("current-bundle-id")
 	_ = cmd.MarkFlagRequired("target-bundle-id")
-	return cmd
 }
 
 func runRollback(cmd *cobra.Command, opts rollbackOptions) error {
+	auth, err := buildSignedRollbackAuthorization(opts)
+	if err != nil {
+		return err
+	}
+	adminToken, err := loadBearerToken(opts.adminTokenFile)
+	if err != nil {
+		return err
+	}
+	client, err := resolveEmergencyTransport(opts.transport, opts.emergencyClientOptions)
+	if err != nil {
+		return err
+	}
+
+	if opts.dryRun {
+		var eval controlplane.RollbackEvaluation
+		status, err := postEmergencyJSONStatus(cmd.Context(), client, opts.baseURL, controlplane.RollbackEvaluatePath, adminToken,
+			publishRollbackAuthorizationRequest{Authorization: auth, DryRun: true}, &eval)
+		if err != nil {
+			return err
+		}
+		if err := requireEmergencyDryRunStatus("rollback", status); err != nil {
+			return err
+		}
+		if err := requireDryRunEvaluation("rollback", eval.DryRun); err != nil {
+			return err
+		}
+		writeRollbackEvaluation(cmd.OutOrStdout(), "dry-run", eval)
+		return nil
+	}
+
+	var resp publishRollbackAuthorizationResponse
+	status, err := postEmergencyJSONStatus(cmd.Context(), client, opts.baseURL, controlplane.RollbackAuthorizationsPath, adminToken,
+		publishRollbackAuthorizationRequest{Authorization: auth}, &resp)
+	if err != nil {
+		return err
+	}
+	if err := requireEmergencyMutationStatus("rollback", status, resp.Created); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		"pipelock: conductor rollback published authorization_id=%s target_version=%d counter=%d hash=%s created=%t\n",
+		resp.AuthorizationID, opts.targetVersion, resp.Counter, resp.AuthorizationHash, resp.Created)
+	return nil
+}
+
+func buildSignedRollbackAuthorization(opts rollbackOptions) (conductorcore.RollbackAuthorization, error) {
+	return buildSignedRollbackAuthorizationWithIntent(opts, "")
+}
+
+func buildSignedRollbackAuthorizationWithIntent(opts rollbackOptions, intent conductorcore.ControlIntent) (conductorcore.RollbackAuthorization, error) {
 	now := time.Now().UTC()
 	if opts.now != nil {
 		now = opts.now().UTC()
 	}
 
 	if len(opts.instanceIDs) > 0 || len(opts.labels) > 0 {
-		return errors.New("rollback is stream-wide; per-instance and per-label rollback are not supported")
+		return conductorcore.RollbackAuthorization{}, errors.New("rollback is stream-wide; per-instance and per-label rollback are not supported")
 	}
 
 	counter := opts.counter
@@ -130,6 +202,7 @@ func runRollback(cmd *cobra.Command, opts rollbackOptions) error {
 		AuthorizationID: authID,
 		OrgID:           opts.orgID,
 		FleetID:         opts.fleetID,
+		Intent:          intent,
 		CurrentBundleID: opts.currentBundleID,
 		CurrentVersion:  opts.currentVersion,
 		TargetBundleID:  opts.targetBundleID,
@@ -142,56 +215,20 @@ func runRollback(cmd *cobra.Command, opts rollbackOptions) error {
 
 	keys, err := loadSigningKeys(opts.signingKeys, conductorcore.RequiredCatastrophicSigners, signing.PurposePolicyBundleRollback)
 	if err != nil {
-		return err
+		return conductorcore.RollbackAuthorization{}, err
 	}
 	defer zeroLoadedSigningKeys(keys)
 	auth.Signatures, err = signEmergencyPreimage(auth.SignablePreimage, signing.PurposePolicyBundleRollback, keys)
 	if err != nil {
-		return err
+		return conductorcore.RollbackAuthorization{}, err
 	}
 
 	// Validate locally before transmitting so the operator gets the exact
 	// field error (e.g. target_version >= current_version) immediately.
 	if err := auth.Validate(); err != nil {
-		return fmt.Errorf("rollback authorization invalid: %w", err)
+		return conductorcore.RollbackAuthorization{}, fmt.Errorf("rollback authorization invalid: %w", err)
 	}
-
-	adminToken, err := loadBearerToken(opts.adminTokenFile)
-	if err != nil {
-		return err
-	}
-	client, err := resolveEmergencyTransport(opts.transport, opts.emergencyClientOptions)
-	if err != nil {
-		return err
-	}
-
-	if opts.dryRun {
-		var eval controlplane.RollbackEvaluation
-		status, err := postEmergencyJSONStatus(cmd.Context(), client, opts.baseURL, controlplane.RollbackEvaluatePath, adminToken,
-			publishRollbackAuthorizationRequest{Authorization: auth, DryRun: true}, &eval)
-		if err != nil {
-			return err
-		}
-		if status == http.StatusCreated {
-			return errors.New("conductor returned 201 Created for rollback dry-run; refusing ambiguous mutating response")
-		}
-		if err := requireDryRunEvaluation("rollback", eval.DryRun); err != nil {
-			return err
-		}
-		writeRollbackEvaluation(cmd.OutOrStdout(), "dry-run", eval)
-		return nil
-	}
-
-	var resp publishRollbackAuthorizationResponse
-	if err := postEmergencyJSON(cmd.Context(), client, opts.baseURL, controlplane.RollbackAuthorizationsPath, adminToken,
-		publishRollbackAuthorizationRequest{Authorization: auth}, &resp); err != nil {
-		return err
-	}
-
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-		"pipelock: conductor rollback published authorization_id=%s target_version=%d counter=%d hash=%s created=%t\n",
-		resp.AuthorizationID, opts.targetVersion, resp.Counter, resp.AuthorizationHash, resp.Created)
-	return nil
+	return auth, nil
 }
 
 // publishRollbackAuthorizationRequest/Response mirror the control-plane

@@ -5,7 +5,6 @@
 package conductor
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -94,7 +93,23 @@ func remoteKillStateCmd(use, short, long string, state conductorcore.KillSwitchS
 	return cmd
 }
 
+type remoteKillFlagOptions struct {
+	includeDryRun bool
+	counterHelp   string
+}
+
 func bindRemoteKillFlags(cmd *cobra.Command, opts *killOptions) {
+	bindRemoteKillFlagsWithOptions(cmd, opts, remoteKillFlagOptions{
+		includeDryRun: true,
+		counterHelp:   "monotonic counter; defaults to the current Unix time so each publish supersedes the prior one",
+	})
+}
+
+func bindRemoteKillFlagsWithOptions(cmd *cobra.Command, opts *killOptions, flagOpts remoteKillFlagOptions) {
+	counterHelp := strings.TrimSpace(flagOpts.counterHelp)
+	if counterHelp == "" {
+		counterHelp = "monotonic counter; defaults to the current Unix time"
+	}
 	cmd.Flags().StringVar(&opts.baseURL, "conductor-url", "", "base URL of the Conductor control plane, e.g. https://conductor.example:8895 (required)")
 	cmd.Flags().StringVar(&opts.adminTokenFile, "admin-token-file", "", "file containing the Conductor admin bearer token (required)")
 	cmd.Flags().StringArrayVar(&opts.signingKeys, "signing-key", nil,
@@ -104,10 +119,12 @@ func bindRemoteKillFlags(cmd *cobra.Command, opts *killOptions) {
 	cmd.Flags().StringArrayVar(&opts.instanceIDs, "instance", nil, "target follower instance id; repeat for several, or pass '*' for the whole fleet (mutually exclusive with --label)")
 	cmd.Flags().StringToStringVar(&opts.labels, "label", nil, "target followers by label selector key=value; repeat for several (mutually exclusive with --instance)")
 	cmd.Flags().StringVar(&opts.messageID, "message-id", "", "message id (defaults to a generated remote-kill-<state>-<counter> id)")
-	cmd.Flags().Uint64Var(&opts.counter, "counter", 0, "monotonic counter; defaults to the current Unix time so each publish supersedes the prior one")
+	cmd.Flags().Uint64Var(&opts.counter, "counter", 0, counterHelp)
 	cmd.Flags().StringVar(&opts.reason, "reason", "", "operator reason recorded in the signed message")
 	cmd.Flags().DurationVar(&opts.ttl, "ttl", remoteKillDefaultTTL, "validity window for the message; must not exceed the Conductor's configured remote-kill max validity")
-	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "evaluate the signed remote-kill without mutating Conductor state")
+	if flagOpts.includeDryRun {
+		cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "evaluate the signed remote-kill without mutating Conductor state")
+	}
 	cmd.Flags().StringVar(&opts.tlsCert, "tls-cert", "", "operator client TLS certificate for Conductor mTLS (required)")
 	cmd.Flags().StringVar(&opts.tlsKey, "tls-key", "", "operator client TLS private key for Conductor mTLS (required)")
 	cmd.Flags().StringVar(&opts.serverCA, "server-ca", "", "CA bundle that signed the Conductor server certificate (required)")
@@ -119,6 +136,85 @@ func bindRemoteKillFlags(cmd *cobra.Command, opts *killOptions) {
 }
 
 func runRemoteKill(cmd *cobra.Command, opts killOptions, state conductorcore.KillSwitchState) error {
+	msg, err := buildSignedRemoteKillMessage(opts, state)
+	if err != nil {
+		return err
+	}
+	adminToken, err := loadBearerToken(opts.adminTokenFile)
+	if err != nil {
+		return err
+	}
+	client, err := resolveEmergencyTransport(opts.transport, opts.emergencyClientOptions)
+	if err != nil {
+		return err
+	}
+
+	if opts.dryRun {
+		var eval controlplane.RemoteKillEvaluation
+		status, err := postEmergencyJSONStatus(cmd.Context(), client, opts.baseURL, controlplane.RemoteKillEvaluatePath, adminToken,
+			publishRemoteKillRequest{Message: msg, DryRun: true}, &eval)
+		if err != nil {
+			return err
+		}
+		if err := requireEmergencyDryRunStatus("remote-kill", status); err != nil {
+			return err
+		}
+		if err := requireDryRunEvaluation("remote-kill", eval.DryRun); err != nil {
+			return err
+		}
+		writeRemoteKillEvaluation(cmd.OutOrStdout(), "dry-run", eval)
+		return nil
+	}
+
+	var resp publishRemoteKillResponse
+	status, err := postEmergencyJSONStatus(cmd.Context(), client, opts.baseURL, controlplane.RemoteKillPath, adminToken,
+		publishRemoteKillRequest{Message: msg}, &resp)
+	if err != nil {
+		return err
+	}
+	if err := requireEmergencyMutationStatus("remote-kill", status, resp.Created); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		"pipelock: conductor remote-kill published state=%s message_id=%s counter=%d hash=%s created=%t\n",
+		state, resp.MessageID, resp.Counter, resp.MessageHash, resp.Created)
+	return nil
+}
+
+func requireEmergencyDryRunStatus(action string, status int) error {
+	if status != http.StatusOK {
+		return fmt.Errorf("conductor returned HTTP %s for %s dry-run; expected 200 OK and refusing ambiguous response", httpStatusLabel(status), action)
+	}
+	return nil
+}
+
+func requireEmergencyMutationStatus(action string, status int, created bool) error {
+	switch {
+	case created && status == http.StatusCreated:
+		return nil
+	case !created && status == http.StatusOK:
+		return nil
+	case created:
+		return fmt.Errorf("conductor returned HTTP %s for newly-created %s; expected 201 Created and refusing ambiguous response", httpStatusLabel(status), action)
+	default:
+		return fmt.Errorf("conductor returned HTTP %s for idempotent %s; expected 200 OK and refusing ambiguous response", httpStatusLabel(status), action)
+	}
+}
+
+func httpStatusLabel(status int) string {
+	text := http.StatusText(status)
+	if text == "" {
+		return fmt.Sprintf("%d", status)
+	}
+	return fmt.Sprintf("%d %s", status, text)
+}
+
+func buildSignedRemoteKillMessage(opts killOptions, state conductorcore.KillSwitchState) (conductorcore.RemoteKillMessage, error) {
+	return buildSignedRemoteKillMessageWithIntent(opts, state, "")
+}
+
+func buildSignedRemoteKillMessageWithIntent(opts killOptions, state conductorcore.KillSwitchState, intent conductorcore.ControlIntent) (conductorcore.RemoteKillMessage, error) {
 	now := time.Now().UTC()
 	if opts.now != nil {
 		now = opts.now().UTC()
@@ -126,7 +222,7 @@ func runRemoteKill(cmd *cobra.Command, opts killOptions, state conductorcore.Kil
 
 	audience, err := buildAudience(opts.instanceIDs, opts.labels)
 	if err != nil {
-		return err
+		return conductorcore.RemoteKillMessage{}, err
 	}
 
 	counter := opts.counter
@@ -153,6 +249,7 @@ func runRemoteKill(cmd *cobra.Command, opts killOptions, state conductorcore.Kil
 		OrgID:         opts.orgID,
 		FleetID:       opts.fleetID,
 		Audience:      audience,
+		Intent:        intent,
 		State:         state,
 		Counter:       counter,
 		Reason:        opts.reason,
@@ -163,57 +260,21 @@ func runRemoteKill(cmd *cobra.Command, opts killOptions, state conductorcore.Kil
 
 	keys, err := loadSigningKeys(opts.signingKeys, conductorcore.RequiredCatastrophicSigners, signing.PurposeRemoteKillSigning)
 	if err != nil {
-		return err
+		return conductorcore.RemoteKillMessage{}, err
 	}
 	defer zeroLoadedSigningKeys(keys)
 	msg.Signatures, err = signEmergencyPreimage(msg.SignablePreimage, signing.PurposeRemoteKillSigning, keys)
 	if err != nil {
-		return err
+		return conductorcore.RemoteKillMessage{}, err
 	}
 
 	// Validate locally before transmitting. The server re-validates, but a
 	// client-side check gives the operator the exact field error immediately
 	// instead of a round-trip and an opaque 4xx.
 	if err := msg.Validate(); err != nil {
-		return fmt.Errorf("remote-kill message invalid: %w", err)
+		return conductorcore.RemoteKillMessage{}, fmt.Errorf("remote-kill message invalid: %w", err)
 	}
-
-	adminToken, err := loadBearerToken(opts.adminTokenFile)
-	if err != nil {
-		return err
-	}
-	client, err := resolveEmergencyTransport(opts.transport, opts.emergencyClientOptions)
-	if err != nil {
-		return err
-	}
-
-	if opts.dryRun {
-		var eval controlplane.RemoteKillEvaluation
-		status, err := postEmergencyJSONStatus(cmd.Context(), client, opts.baseURL, controlplane.RemoteKillEvaluatePath, adminToken,
-			publishRemoteKillRequest{Message: msg, DryRun: true}, &eval)
-		if err != nil {
-			return err
-		}
-		if status == http.StatusCreated {
-			return errors.New("conductor returned 201 Created for remote-kill dry-run; refusing ambiguous mutating response")
-		}
-		if err := requireDryRunEvaluation("remote-kill", eval.DryRun); err != nil {
-			return err
-		}
-		writeRemoteKillEvaluation(cmd.OutOrStdout(), "dry-run", eval)
-		return nil
-	}
-
-	var resp publishRemoteKillResponse
-	if err := postEmergencyJSON(cmd.Context(), client, opts.baseURL, controlplane.RemoteKillPath, adminToken,
-		publishRemoteKillRequest{Message: msg}, &resp); err != nil {
-		return err
-	}
-
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-		"pipelock: conductor remote-kill published state=%s message_id=%s counter=%d hash=%s created=%t\n",
-		state, resp.MessageID, resp.Counter, resp.MessageHash, resp.Created)
-	return nil
+	return msg, nil
 }
 
 // publishRemoteKillRequest/publishRemoteKillResponse mirror the control-plane

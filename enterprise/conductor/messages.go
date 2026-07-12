@@ -118,6 +118,7 @@ var (
 	ErrInvalidAudienceSelectors      = errors.New("conductor audience cannot mix instance_ids with labels")
 	ErrInvalidReason                 = errors.New("invalid conductor reason")
 	ErrInvalidIdentifier             = errors.New("invalid conductor identifier")
+	ErrInvalidControlIntent          = errors.New("invalid conductor control intent")
 	ErrSignatureVerification         = errors.New("conductor signature verification failed")
 	ErrInvalidDroppedAccounting      = errors.New("invalid conductor dropped accounting")
 	ErrInvalidAppliedState           = errors.New("invalid conductor follower applied state")
@@ -283,6 +284,34 @@ func (p PolicyBundlePayload) PolicyHash() (string, error) {
 	}, "policy_bundle_policy")
 }
 
+// LegacyPolicyHash returns the policy_hash scheme used before policy bundles
+// were hashed over config.LoadPolicyBundleBytes(). It is retained only for
+// rolling upgrades of already-signed bundles that were published by older
+// conductors; new publishers should use PolicyHash.
+func (p PolicyBundlePayload) LegacyPolicyHash() (string, error) {
+	var cfg any
+	decoder := yaml.NewDecoder(strings.NewReader(p.ConfigYAML))
+	if err := decoder.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("parse legacy policy bundle config_yaml for policy hash: %w", err)
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err == nil {
+		if !isEmptyYAMLDocument(extra) {
+			return "", fmt.Errorf("%w: config_yaml has multiple YAML documents", ErrInvalidHash)
+		}
+	} else if !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("parse legacy policy bundle config_yaml trailing document: %w", err)
+	}
+	view := struct {
+		ConfigYAML  any             `json:"config_yaml"`
+		RuleBundles []RuleBundleRef `json:"rule_bundles,omitempty"`
+	}{
+		ConfigYAML:  cfg,
+		RuleBundles: p.RuleBundles,
+	}
+	return canonicalValueHash(view, "legacy_policy_bundle_policy")
+}
+
 type PolicyBundle struct {
 	SchemaVersion             int                        `json:"schema_version"`
 	BundleID                  string                     `json:"bundle_id"`
@@ -310,12 +339,20 @@ const (
 	KillSwitchActive   KillSwitchState = "active"
 )
 
+type ControlIntent string
+
+const (
+	ControlIntentApply  ControlIntent = "apply"
+	ControlIntentReplay ControlIntent = "replay"
+)
+
 type RemoteKillMessage struct {
 	SchemaVersion int              `json:"schema_version"`
 	MessageID     string           `json:"message_id"`
 	OrgID         string           `json:"org_id"`
 	FleetID       string           `json:"fleet_id"`
 	Audience      Audience         `json:"audience"`
+	Intent        ControlIntent    `json:"intent,omitempty"`
 	State         KillSwitchState  `json:"state"`
 	Counter       uint64           `json:"counter"`
 	Reason        string           `json:"reason"`
@@ -331,6 +368,7 @@ type RollbackAuthorization struct {
 	OrgID           string           `json:"org_id"`
 	FleetID         string           `json:"fleet_id"`
 	Audience        Audience         `json:"audience"`
+	Intent          ControlIntent    `json:"intent,omitempty"`
 	CurrentBundleID string           `json:"current_bundle_id"`
 	CurrentVersion  uint64           `json:"current_version"`
 	TargetBundleID  string           `json:"target_bundle_id"`
@@ -615,6 +653,17 @@ func (b PolicyBundle) CanonicalHash() (string, error) {
 }
 
 func (b PolicyBundle) Validate() error {
+	return b.validate(false)
+}
+
+// ValidateAllowLegacyPolicyHash validates a bundle while tolerating the
+// pre-loaded-config policy_hash scheme. This is only for reading already stored
+// upgrade-era bundles; network publish/apply paths must use Validate.
+func (b PolicyBundle) ValidateAllowLegacyPolicyHash() error {
+	return b.validate(true)
+}
+
+func (b PolicyBundle) validate(allowLegacyPolicyHash bool) error {
 	if err := validateSchemaVersion(b.SchemaVersion); err != nil {
 		return err
 	}
@@ -696,13 +745,13 @@ func (b PolicyBundle) Validate() error {
 			return err
 		}
 	}
-	if err := b.validateHashes(); err != nil {
+	if err := b.validateHashes(allowLegacyPolicyHash); err != nil {
 		return err
 	}
 	return validateSignatureThreshold(b.Signatures, signing.PurposePolicyBundleSigning, RequiredStandardSigners)
 }
 
-func (b PolicyBundle) validateHashes() error {
+func (b PolicyBundle) validateHashes(allowLegacyPolicyHash bool) error {
 	payloadHash, err := b.Payload.PayloadHash()
 	if err != nil {
 		return err
@@ -715,9 +764,27 @@ func (b PolicyBundle) validateHashes() error {
 		return err
 	}
 	if !strings.EqualFold(b.PolicyHash, policyHash) {
-		return fmt.Errorf("%w: policy_hash", ErrHashMismatch)
+		if !allowLegacyPolicyHash {
+			return fmt.Errorf("%w: policy_hash", ErrHashMismatch)
+		}
+		legacyPolicyHash, legacyErr := b.Payload.LegacyPolicyHash()
+		if legacyErr != nil || !strings.EqualFold(b.PolicyHash, legacyPolicyHash) {
+			return fmt.Errorf("%w: policy_hash", ErrHashMismatch)
+		}
 	}
 	return nil
+}
+
+// UsesLegacyPolicyHash reports whether the bundle validates only through the
+// pre-loaded-config policy_hash scheme. It is an upgrade signal for operators;
+// it is not a trust decision and must not replace signature verification.
+func (b PolicyBundle) UsesLegacyPolicyHash() bool {
+	policyHash, err := b.Payload.PolicyHash()
+	if err == nil && strings.EqualFold(b.PolicyHash, policyHash) {
+		return false
+	}
+	legacyPolicyHash, err := b.Payload.LegacyPolicyHash()
+	return err == nil && strings.EqualFold(b.PolicyHash, legacyPolicyHash)
 }
 
 // ValidateAtTime extends Validate with a freshness check: now must fall inside
@@ -779,6 +846,10 @@ func (m RemoteKillMessage) CanonicalHash() (string, error) {
 	return canonicalHash(m.SignablePreimage)
 }
 
+func (m RemoteKillMessage) ControlIntent() ControlIntent {
+	return effectiveControlIntent(m.Intent)
+}
+
 func (m RemoteKillMessage) Validate() error {
 	if err := validateSchemaVersion(m.SchemaVersion); err != nil {
 		return err
@@ -790,6 +861,9 @@ func (m RemoteKillMessage) Validate() error {
 		return err
 	}
 	if err := m.Audience.Validate(); err != nil {
+		return err
+	}
+	if err := validateControlIntent(m.Intent); err != nil {
 		return err
 	}
 	if m.State != KillSwitchActive && m.State != KillSwitchInactive {
@@ -854,6 +928,10 @@ func (r RollbackAuthorization) CanonicalHash() (string, error) {
 	return canonicalHash(r.SignablePreimage)
 }
 
+func (r RollbackAuthorization) ControlIntent() ControlIntent {
+	return effectiveControlIntent(r.Intent)
+}
+
 func (r RollbackAuthorization) Validate() error {
 	if err := validateSchemaVersion(r.SchemaVersion); err != nil {
 		return err
@@ -862,6 +940,9 @@ func (r RollbackAuthorization) Validate() error {
 		return err
 	}
 	if err := validateOrgFleet(r.OrgID, r.FleetID); err != nil {
+		return err
+	}
+	if err := validateControlIntent(r.Intent); err != nil {
 		return err
 	}
 	if err := validateIdentifier("current_bundle_id", r.CurrentBundleID); err != nil {
@@ -1414,6 +1495,22 @@ func validateSchemaVersion(v int) error {
 		return fmt.Errorf("%w: got %d", ErrUnsupportedSchemaVersion, v)
 	}
 	return nil
+}
+
+func effectiveControlIntent(intent ControlIntent) ControlIntent {
+	if intent == "" {
+		return ControlIntentApply
+	}
+	return intent
+}
+
+func validateControlIntent(intent ControlIntent) error {
+	switch intent {
+	case "", ControlIntentApply, ControlIntentReplay:
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", ErrInvalidControlIntent, intent)
+	}
 }
 
 // withinValidity reports whether now ∈ [notBefore, expiresAt]. notBefore and

@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +72,132 @@ func TestFileBundleStorePublishesIdempotentlyAndReloads(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != bundleRecordFileMode {
 		t.Fatalf("bundle record mode = %v, want %v", got, bundleRecordFileMode)
+	}
+}
+
+func TestFileBundleStoreLoadsLegacyPolicyHashBundleAndServesLatest(t *testing.T) {
+	store, err := OpenFileBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFileBundleStore() error = %v", err)
+	}
+	signer := newTestSigner(t)
+	bundle := signedLegacyPolicyHashControlBundle(t, signer, bundleSpec{
+		id:       "legacy-policy-hash-1",
+		version:  1,
+		audience: conductor.Audience{InstanceIDs: []string{"*"}},
+		configYAML: "mode: strict\napi_allowlist:\n" +
+			"  - b.vendor.example\n" +
+			"  - a.vendor.example\n",
+	})
+	currentHash, err := bundle.Payload.PolicyHash()
+	if err != nil {
+		t.Fatalf("current PolicyHash() error = %v", err)
+	}
+	if strings.EqualFold(bundle.PolicyHash, currentHash) {
+		t.Fatalf("test fixture did not reproduce old/new policy_hash drift: both %s", currentHash)
+	}
+	record := storedRecordForBundle(t, bundle, testNow)
+	writeRawBundleRecordForTest(t, store.bundlesDir, record)
+
+	reopened, err := OpenFileBundleStore(store.dir)
+	if err != nil {
+		t.Fatalf("OpenFileBundleStore(reopen legacy policy_hash) error = %v, want nil", err)
+	}
+	handler := newTestHandler(t, reopened, nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, LatestPolicyBundlePath, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("latest legacy policy_hash status = %d body=%s, want 200", w.Code, w.Body.String())
+	}
+	var served conductor.PolicyBundle
+	if err := json.Unmarshal(w.Body.Bytes(), &served); err != nil {
+		t.Fatalf("decode served bundle: %v", err)
+	}
+	if served.BundleID != bundle.BundleID || served.PolicyHash != bundle.PolicyHash {
+		t.Fatalf("served bundle id/hash = %q/%s, want %q/%s", served.BundleID, served.PolicyHash, bundle.BundleID, bundle.PolicyHash)
+	}
+	resolver := resolverForSigner(signer)
+	if err := served.ValidateAllowLegacyPolicyHash(); err != nil {
+		t.Fatalf("served legacy bundle ValidateAllowLegacyPolicyHash() error = %v, want nil", err)
+	}
+	if err := served.VerifySignaturesAt(testNow, resolver); err != nil {
+		t.Fatalf("served legacy bundle VerifySignaturesAt() error = %v, want nil", err)
+	}
+
+	tampered := served
+	tampered.Payload.ConfigYAML = strings.Replace(tampered.Payload.ConfigYAML, "mode: strict", "mode: balanced", 1)
+	if err := tampered.ValidateAllowLegacyPolicyHash(); !errors.Is(err, conductor.ErrHashMismatch) {
+		t.Fatalf("tampered legacy bundle ValidateAllowLegacyPolicyHash() error = %v, want ErrHashMismatch", err)
+	}
+	wrongSigner := newTestSigner(t)
+	if err := served.VerifySignaturesAt(testNow, resolverForSigner(wrongSigner)); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("served legacy bundle VerifySignaturesAt(wrong key) error = %v, want ErrSignatureVerification", err)
+	}
+}
+
+func TestFileBundleStoreRejectsLegacyPolicyHashBundleOnPublish(t *testing.T) {
+	store, err := OpenFileBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFileBundleStore() error = %v", err)
+	}
+	bundle := signedLegacyPolicyHashControlBundle(t, newTestSigner(t), bundleSpec{
+		id:       "legacy-policy-hash-publish",
+		version:  1,
+		audience: conductor.Audience{InstanceIDs: []string{"*"}},
+		configYAML: "mode: strict\napi_allowlist:\n" +
+			"  - b.vendor.example\n" +
+			"  - a.vendor.example\n",
+	})
+	if err := bundle.ValidateAllowLegacyPolicyHash(); err != nil {
+		t.Fatalf("legacy bundle ValidateAllowLegacyPolicyHash() error = %v", err)
+	}
+	if _, _, err := store.Publish(t.Context(), bundle, PublishOptions{Now: testNow}); !errors.Is(err, conductor.ErrHashMismatch) {
+		t.Fatalf("Publish(legacy policy_hash) error = %v, want ErrHashMismatch", err)
+	}
+}
+
+func TestReadBundleRecordOnlyStartupLoadAllowsLegacyPolicyHash(t *testing.T) {
+	dir := t.TempDir()
+	bundle := signedLegacyPolicyHashControlBundle(t, newTestSigner(t), bundleSpec{
+		id:       "legacy-policy-hash-read",
+		version:  1,
+		audience: conductor.Audience{InstanceIDs: []string{"*"}},
+		configYAML: "mode: strict\napi_allowlist:\n" +
+			"  - b.vendor.example\n" +
+			"  - a.vendor.example\n",
+	})
+	record := storedRecordForBundle(t, bundle, testNow)
+	writeRawBundleRecordForTest(t, dir, record)
+	path := filepath.Join(dir, record.BundleHash+".json")
+
+	if _, err := readBundleRecord(path); !errors.Is(err, conductor.ErrHashMismatch) {
+		t.Fatalf("readBundleRecord(legacy policy_hash) error = %v, want ErrHashMismatch", err)
+	}
+	if _, err := readBundleRecordAllowLegacyPolicyHash(path); err != nil {
+		t.Fatalf("readBundleRecordAllowLegacyPolicyHash() error = %v, want nil", err)
+	}
+}
+
+func TestFileBundleStoreRejectsLegacyPolicyHashRecordBeforeNotBeforeOnLoad(t *testing.T) {
+	store, err := OpenFileBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFileBundleStore() error = %v", err)
+	}
+	bundle := signedLegacyPolicyHashControlBundle(t, newTestSigner(t), bundleSpec{
+		id:       "legacy-policy-hash-future",
+		version:  1,
+		audience: conductor.Audience{InstanceIDs: []string{"*"}},
+		configYAML: "mode: strict\napi_allowlist:\n" +
+			"  - b.vendor.example\n" +
+			"  - a.vendor.example\n",
+	})
+	bundle.NotBefore = testNow.Add(2 * time.Hour)
+	bundle.ExpiresAt = testNow.Add(4 * time.Hour)
+	record := storedRecordForBundle(t, bundle, testNow)
+	writeRawBundleRecordForTest(t, store.bundlesDir, record)
+
+	if _, err := OpenFileBundleStore(store.dir); !errors.Is(err, conductor.ErrNotYetValid) {
+		t.Fatalf("OpenFileBundleStore(legacy policy_hash before not_before) error = %v, want ErrNotYetValid", err)
 	}
 }
 
@@ -961,6 +1089,93 @@ func signedControlBundle(t *testing.T, signer testSigner, spec bundleSpec) condu
 		t.Fatalf("test bundle Validate() error = %v", err)
 	}
 	return bundle
+}
+
+func signedLegacyPolicyHashControlBundle(t *testing.T, signer testSigner, spec bundleSpec) conductor.PolicyBundle {
+	t.Helper()
+	if spec.configYAML == "" {
+		spec.configYAML = "mode: strict\napi_allowlist:\n  - api.example.com\n"
+	}
+	payload := conductor.PolicyBundlePayload{ConfigYAML: spec.configYAML}
+	payloadHash, err := payload.PayloadHash()
+	if err != nil {
+		t.Fatalf("PayloadHash() error = %v", err)
+	}
+	policyHash, err := payload.LegacyPolicyHash()
+	if err != nil {
+		t.Fatalf("payload.LegacyPolicyHash() error = %v", err)
+	}
+	bundle := conductor.PolicyBundle{
+		SchemaVersion:      conductor.SchemaVersion,
+		BundleID:           spec.id,
+		OrgID:              "org-main",
+		FleetID:            "prod",
+		Environment:        "prod",
+		Audience:           spec.audience,
+		Version:            spec.version,
+		PreviousBundleHash: spec.previousHash,
+		CreatedAt:          testNow.Add(-time.Minute),
+		NotBefore:          testNow.Add(-time.Minute),
+		ExpiresAt:          testNow.Add(2 * time.Hour),
+		MinPipelockVersion: "1.2.3",
+		PolicyHash:         policyHash,
+		PayloadSHA256:      payloadHash,
+		Payload:            payload,
+	}
+	preimage, err := bundle.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage() error = %v", err)
+	}
+	signature := ed25519.Sign(signer.priv, preimage)
+	bundle.Signatures = []conductor.SignatureProof{{
+		SignerKeyID: signer.keyID,
+		KeyPurpose:  signing.PurposePolicyBundleSigning,
+		Algorithm:   conductor.SignatureAlgorithmEd25519,
+		Signature:   conductor.SignaturePrefixEd25519 + hex.EncodeToString(signature),
+	}}
+	return bundle
+}
+
+func resolverForSigner(signer testSigner) conductor.SignatureKeyResolver {
+	return func(signerKeyID string) (conductor.SignatureKey, error) {
+		if signerKeyID != signer.keyID {
+			return conductor.SignatureKey{}, conductor.ErrSignatureVerification
+		}
+		return conductor.SignatureKey{
+			PublicKey:  signer.priv.Public().(ed25519.PublicKey),
+			KeyPurpose: signing.PurposePolicyBundleSigning,
+		}, nil
+	}
+}
+
+func storedRecordForBundle(t *testing.T, bundle conductor.PolicyBundle, publishedAt time.Time) PublishedBundle {
+	t.Helper()
+	bundleHash, err := bundle.CanonicalHash()
+	if err != nil {
+		t.Fatalf("CanonicalHash() error = %v", err)
+	}
+	stream, err := streamKey(bundle)
+	if err != nil {
+		t.Fatalf("streamKey() error = %v", err)
+	}
+	return PublishedBundle{
+		Bundle:      bundle,
+		BundleHash:  bundleHash,
+		StreamKey:   stream,
+		PublishedAt: publishedAt,
+	}
+}
+
+func writeRawBundleRecordForTest(t *testing.T, dir string, record PublishedBundle) {
+	t.Helper()
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent() error = %v", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(filepath.Join(dir, record.BundleHash+".json"), data, bundleRecordFileMode); err != nil {
+		t.Fatalf("write raw bundle record: %v", err)
+	}
 }
 
 func stringsOf(value string, count int) string {
