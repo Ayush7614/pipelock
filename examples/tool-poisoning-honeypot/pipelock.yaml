@@ -1,6 +1,6 @@
 # Pipelock config for the tool-poisoning-honeypot example.
 #
-# Run with: pipelock mcp proxy --config pipelock.yaml -- python decoy_mcp_server.py
+# Run with: pipelock mcp proxy --config pipelock.yaml -- python3 decoy_mcp_server.py
 #
 # The decoy server advertises an innocent-looking tool whose *description*
 # hides an exfiltration instruction. Pipelock scans the tools/list manifest
