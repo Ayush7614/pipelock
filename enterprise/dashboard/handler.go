@@ -139,7 +139,7 @@ type navRouteSpec struct {
 
 var dashboardNavRouteSpecs = []navRouteSpec{
 	{key: "overview", label: "Overview", pattern: "/overview"},
-	{key: "evidence", label: "Evidence", pattern: "/"},
+	{key: "evidence", label: "Evidence", pattern: "/evidence"},
 	{key: "exemptions", label: "Exemptions", pattern: "/exemptions"},
 	{key: "agents", label: "Agents", pattern: "/agents"},
 	{key: "budgets", label: "Budgets", pattern: "/budgets"},
@@ -151,24 +151,15 @@ var dashboardNavRouteSpecs = []navRouteSpec{
 
 var (
 	dashboardRouteSpecList = []routeSpec{
-		{
-			pattern:          "/overview",
-			feature:          license.FeatureAgents,
-			forbiddenMessage: agentsFeatureForbidden,
-			permission:       PermissionEvidenceRead,
-			handler: func(d *dashboardHandler) http.Handler {
-				return http.HandlerFunc(d.handleOverview)
-			},
-		},
-		{
-			pattern:          "/",
-			feature:          license.FeatureAgents,
-			forbiddenMessage: agentsFeatureForbidden,
-			permission:       PermissionEvidenceRead,
-			handler: func(d *dashboardHandler) http.Handler {
-				return http.HandlerFunc(d.handleIndex)
-			},
-		},
+		evidenceRouteSpec("/overview", func(d *dashboardHandler) http.Handler {
+			return http.HandlerFunc(d.handleOverview)
+		}),
+		evidenceRouteSpec("/", func(d *dashboardHandler) http.Handler {
+			return http.HandlerFunc(d.handleOverview)
+		}),
+		evidenceRouteSpec("/evidence", func(d *dashboardHandler) http.Handler {
+			return http.HandlerFunc(d.handleIndex)
+		}),
 		{
 			pattern:          "/exemptions",
 			feature:          license.FeatureAgents,
@@ -280,6 +271,16 @@ var (
 	}
 	dashboardRouteSpecsByPattern = routeSpecsByPattern(dashboardRouteSpecList)
 )
+
+func evidenceRouteSpec(pattern string, handler func(*dashboardHandler) http.Handler) routeSpec {
+	return routeSpec{
+		pattern:          pattern,
+		feature:          license.FeatureAgents,
+		forbiddenMessage: agentsFeatureForbidden,
+		permission:       PermissionEvidenceRead,
+		handler:          handler,
+	}
+}
 
 func routeSpecsByPattern(specs []routeSpec) map[string]routeSpec {
 	out := make(map[string]routeSpec, len(specs))
@@ -731,9 +732,9 @@ func (d *dashboardHandler) navContext(r *http.Request, cache *routeAuthorization
 
 func activeNavKey(path string) string {
 	switch {
-	case path == "/overview":
+	case path == "/", path == "/overview":
 		return "overview"
-	case path == "/", strings.HasPrefix(path, "/session/"):
+	case path == "/evidence", strings.HasPrefix(path, "/session/"):
 		return "evidence"
 	case path == "/exemptions":
 		return "exemptions"
@@ -773,7 +774,7 @@ func knownPermission(permission Permission) bool {
 }
 
 func (d *dashboardHandler) handleOverview(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/overview" {
+	if r.URL.Path != "/" && r.URL.Path != "/overview" {
 		http.NotFound(w, r)
 		return
 	}
@@ -803,7 +804,7 @@ func (d *dashboardHandler) handleOverview(w http.ResponseWriter, r *http.Request
 }
 
 func (d *dashboardHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if r.URL.Path != "/evidence" {
 		http.NotFound(w, r)
 		return
 	}
