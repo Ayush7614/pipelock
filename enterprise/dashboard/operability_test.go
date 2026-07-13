@@ -11,6 +11,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -95,6 +97,330 @@ func TestBackupRestore_RestartAndCorruptionAtomicity(t *testing.T) {
 	}
 }
 
+func TestBackupRestore_RoundTripsConfiguredLegalHoldStore(t *testing.T) {
+	stateDir := t.TempDir()
+	legalHoldPath := filepath.Join(stateDir, "governance", "holds.json")
+	store, err := OpenLegalHoldStore(legalHoldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := store.Add(LegalHold{
+		ID:      "hold-af-95",
+		Scope:   "session:agent-a",
+		Reason:  "preserve evidence for review",
+		Created: created,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(t.TempDir(), "dashboard-backup.tar")
+	result, err := BackupStateWithOptions(BackupOptions{
+		StateDir:           stateDir,
+		ArchivePath:        archive,
+		LegalHoldStorePath: legalHoldPath,
+	})
+	if err != nil {
+		t.Fatalf("BackupStateWithOptions: %v", err)
+	}
+	if !stringSliceContains(result.CapturedStores, backupStoreLegalHolds) {
+		t.Fatalf("captured stores = %v, want %s", result.CapturedStores, backupStoreLegalHolds)
+	}
+
+	restoreDir := t.TempDir()
+	restoredLegalHoldPath := filepath.Join(restoreDir, "restored-holds.json")
+	if _, err := RestoreStateWithOptions(RestoreOptions{
+		StateDir:           restoreDir,
+		ArchivePath:        archive,
+		LegalHoldStorePath: restoredLegalHoldPath,
+	}); err != nil {
+		t.Fatalf("RestoreStateWithOptions: %v", err)
+	}
+	restored, err := OpenLegalHoldStore(restoredLegalHoldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holds := restored.List()
+	if len(holds) != 1 || holds[0].ID != "hold-af-95" || holds[0].Scope != "session:agent-a" || !holds[0].Created.Equal(created) {
+		t.Fatalf("restored legal holds = %#v", holds)
+	}
+}
+
+func TestBackupRestore_HonorsConfiguredStorePaths(t *testing.T) {
+	stateDir := t.TempDir()
+	sourceDir := t.TempDir()
+	exemptionPath := filepath.Join(sourceDir, "custom-exemptions.json")
+	deliveryPath := filepath.Join(sourceDir, "custom-delivery.json")
+	legalHoldPath := filepath.Join(sourceDir, "custom-legal-holds.json")
+	when := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+
+	exemptions, err := OpenExemptionStore(exemptionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exemptions.Add(ExemptionRecord{
+		ID:      "custom-exm",
+		Scope:   "api.vendor.example",
+		Owner:   "security",
+		Reason:  "temporary maintenance",
+		Created: when,
+		Expiry:  when.Add(24 * time.Hour),
+	}, when); err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := OpenDeliveryInbox(DeliveryInboxOptions{Path: deliveryPath, QueueSize: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inbox.Record(DeliveryAttempt{ID: "custom-delivery", AlertID: "alert", Status: DeliveryDelivered, AttemptedAt: when}) {
+		t.Fatal("delivery attempt was dropped")
+	}
+	if err := inbox.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	holds, err := OpenLegalHoldStore(legalHoldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holds.Add(LegalHold{ID: "custom-hold", Scope: "agent:one", Reason: "retention", Created: when}); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(t.TempDir(), "dashboard-backup.tar")
+	result, err := BackupStateWithOptions(BackupOptions{
+		StateDir:           stateDir,
+		ArchivePath:        archive,
+		ExemptionStorePath: exemptionPath,
+		DeliveryInboxPath:  deliveryPath,
+		LegalHoldStorePath: legalHoldPath,
+	})
+	if err != nil {
+		t.Fatalf("BackupStateWithOptions: %v", err)
+	}
+	for _, want := range []string{backupStoreExemptions, backupStoreDelivery, backupStoreLegalHolds} {
+		if !stringSliceContains(result.CapturedStores, want) {
+			t.Fatalf("captured stores = %v, missing %s", result.CapturedStores, want)
+		}
+	}
+
+	restoreDir := t.TempDir()
+	restoredExemptionPath := filepath.Join(restoreDir, "configured", "exemptions.json")
+	restoredDeliveryPath := filepath.Join(restoreDir, "configured", "delivery.json")
+	restoredLegalHoldPath := filepath.Join(restoreDir, "configured", "holds.json")
+	if _, err := RestoreStateWithOptions(RestoreOptions{
+		StateDir:           filepath.Join(restoreDir, "state"),
+		ArchivePath:        archive,
+		ExemptionStorePath: restoredExemptionPath,
+		DeliveryInboxPath:  restoredDeliveryPath,
+		LegalHoldStorePath: restoredLegalHoldPath,
+	}); err != nil {
+		t.Fatalf("RestoreStateWithOptions: %v", err)
+	}
+	restoredExemptions, err := OpenExemptionStore(restoredExemptionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := restoredExemptions.List(); len(records) != 1 || records[0].ID != "custom-exm" {
+		t.Fatalf("restored exemptions = %#v", records)
+	}
+	health, err := LoadDeliveryHealth(restoredDeliveryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.Delivered != 1 {
+		t.Fatalf("restored delivery health = %#v", health)
+	}
+	restoredHolds, err := OpenLegalHoldStore(restoredLegalHoldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := restoredHolds.List(); len(records) != 1 || records[0].ID != "custom-hold" {
+		t.Fatalf("restored legal holds = %#v", records)
+	}
+	if _, err := os.Stat(filepath.Join(restoreDir, "state", ExemptionStateFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("default exemption restore path exists or stat failed: %v", err)
+	}
+}
+
+func TestBackupStateWithOptions_ReportsMissingConfiguredLegalHoldStore(t *testing.T) {
+	stateDir := t.TempDir()
+	archive := filepath.Join(t.TempDir(), "dashboard-backup.tar")
+	missingLegalHoldPath := filepath.Join(t.TempDir(), LegalHoldStateFile)
+	result, err := BackupStateWithOptions(BackupOptions{
+		StateDir:           stateDir,
+		ArchivePath:        archive,
+		LegalHoldStorePath: missingLegalHoldPath,
+	})
+	if err != nil {
+		t.Fatalf("BackupStateWithOptions: %v", err)
+	}
+	if stringSliceContains(result.CapturedStores, backupStoreLegalHolds) {
+		t.Fatalf("captured missing legal-hold store: %#v", result)
+	}
+	if !stringSliceContains(result.MissingStores, backupStoreLegalHolds) {
+		t.Fatalf("missing stores = %v, want %s", result.MissingStores, backupStoreLegalHolds)
+	}
+	if _, err := os.Stat(archive); err != nil {
+		t.Fatalf("backup archive was not written for missing optional stores: %v", err)
+	}
+}
+
+func TestBackupStateWithOptions_RejectsConfiguredStoreErrors(t *testing.T) {
+	t.Run("duplicate store path", func(t *testing.T) {
+		stateDir := t.TempDir()
+		storePath := filepath.Join(stateDir, ExemptionStateFile)
+		if err := os.WriteFile(storePath, []byte(`[]`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := BackupStateWithOptions(BackupOptions{
+			StateDir:           stateDir,
+			ArchivePath:        filepath.Join(t.TempDir(), "backup.tar"),
+			ExemptionStorePath: storePath,
+			LegalHoldStorePath: storePath,
+		})
+		if err == nil || !strings.Contains(err.Error(), "resolve to the same path") {
+			t.Fatalf("duplicate store path error = %v", err)
+		}
+	})
+
+	t.Run("unreadable legal hold store", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("permission-bit failure case is not reliable as root")
+		}
+		stateDir := t.TempDir()
+		legalHoldPath := filepath.Join(stateDir, LegalHoldStateFile)
+		if err := os.WriteFile(legalHoldPath, legalHoldStateJSON("hold-unreadable"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(legalHoldPath, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(legalHoldPath, 0o600) })
+		_, err := BackupStateWithOptions(BackupOptions{
+			StateDir:           stateDir,
+			ArchivePath:        filepath.Join(t.TempDir(), "backup.tar"),
+			LegalHoldStorePath: legalHoldPath,
+		})
+		if err == nil || !strings.Contains(err.Error(), LegalHoldStateFile) {
+			t.Fatalf("unreadable legal-hold backup error = %v", err)
+		}
+	})
+
+	t.Run("invalid legal hold schema", func(t *testing.T) {
+		stateDir := t.TempDir()
+		legalHoldPath := filepath.Join(stateDir, LegalHoldStateFile)
+		if err := os.WriteFile(legalHoldPath, []byte(`{"id":"not-an-array"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := BackupStateWithOptions(BackupOptions{
+			StateDir:           stateDir,
+			ArchivePath:        filepath.Join(t.TempDir(), "backup.tar"),
+			LegalHoldStorePath: legalHoldPath,
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid legal hold store schema") {
+			t.Fatalf("invalid legal-hold backup error = %v", err)
+		}
+	})
+
+	t.Run("archive directory cannot be created", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("permission-bit failure case is not reliable as root")
+		}
+		stateDir := t.TempDir()
+		parentDir := t.TempDir()
+		if err := os.Chmod(parentDir, ownerReadSearchOnlyMode()); err != nil {
+			t.Fatal(err)
+		}
+		_, err := BackupStateWithOptions(BackupOptions{
+			StateDir:    stateDir,
+			ArchivePath: filepath.Join(parentDir, "missing", "backup.tar"),
+		})
+		if err == nil || !strings.Contains(err.Error(), "create dashboard backup directory") {
+			t.Fatalf("archive directory error = %v", err)
+		}
+	})
+}
+
+func TestRestoreStateWithOptions_RejectsLegalHoldsWithoutConfiguredTarget(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "legal-holds.tar")
+	writeBackupArchive(t, archive, map[string][]byte{
+		LegalHoldStateFile: legalHoldStateJSON("hold-required"),
+	})
+
+	restoreDir := t.TempDir()
+	priorExemptions := []byte(`[{"id":"exm-keep","scope":"api.vendor.example","owner":"security","reason":"temporary","created":"2026-01-01T00:00:00Z","expiry":"2026-02-01T00:00:00Z"}]`)
+	exemptionPath := filepath.Join(restoreDir, ExemptionStateFile)
+	if err := os.WriteFile(exemptionPath, priorExemptions, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := RestoreStateWithOptions(RestoreOptions{
+		StateDir:    restoreDir,
+		ArchivePath: archive,
+	})
+	if err == nil || !strings.Contains(err.Error(), "target store path is not configured") {
+		t.Fatalf("restore without legal-hold target error = %v", err)
+	}
+	after, err := os.ReadFile(filepath.Clean(exemptionPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, priorExemptions) {
+		t.Fatalf("rejected restore mutated exemptions: %s", after)
+	}
+	if _, err := os.Stat(filepath.Join(restoreDir, LegalHoldStateFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legal holds were restored without configured target, stat err=%v", err)
+	}
+}
+
+func TestRestoreStateWithOptions_RejectsCorruptArchiveAndBadTargets(t *testing.T) {
+	t.Run("missing archive", func(t *testing.T) {
+		_, err := RestoreStateWithOptions(RestoreOptions{
+			StateDir:    t.TempDir(),
+			ArchivePath: filepath.Join(t.TempDir(), "missing.tar"),
+		})
+		if err == nil || !strings.Contains(err.Error(), "read dashboard backup") {
+			t.Fatalf("missing archive error = %v", err)
+		}
+	})
+
+	t.Run("corrupt tar", func(t *testing.T) {
+		archive := filepath.Join(t.TempDir(), "corrupt.tar")
+		if err := os.WriteFile(archive, []byte("not a tar archive"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := RestoreStateWithOptions(RestoreOptions{
+			StateDir:    t.TempDir(),
+			ArchivePath: archive,
+		})
+		if err == nil || !strings.Contains(err.Error(), "validate dashboard backup archive") {
+			t.Fatalf("corrupt archive error = %v", err)
+		}
+	})
+
+	t.Run("configured legal hold parent is not writable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("permission-bit failure case is not reliable as root")
+		}
+		archive := filepath.Join(t.TempDir(), "legal-holds.tar")
+		writeBackupArchive(t, archive, map[string][]byte{
+			LegalHoldStateFile: legalHoldStateJSON("hold-parent-file"),
+		})
+		parentDir := t.TempDir()
+		if err := os.Chmod(parentDir, ownerReadSearchOnlyMode()); err != nil {
+			t.Fatal(err)
+		}
+		_, err := RestoreStateWithOptions(RestoreOptions{
+			StateDir:           t.TempDir(),
+			ArchivePath:        archive,
+			LegalHoldStorePath: filepath.Join(parentDir, "missing", LegalHoldStateFile),
+		})
+		if err == nil || !strings.Contains(err.Error(), "create dashboard state directory for legal-holds.json") {
+			t.Fatalf("bad legal-hold target error = %v", err)
+		}
+	})
+}
+
 func TestBackupState_RejectsArchivePathThatOverwritesDurableState(t *testing.T) {
 	stateDir := t.TempDir()
 	statePath := filepath.Join(stateDir, ExemptionStateFile)
@@ -112,6 +438,61 @@ func TestBackupState_RejectsArchivePathThatOverwritesDurableState(t *testing.T) 
 	if !bytes.Equal(after, original) {
 		t.Fatalf("durable state changed after rejected backup: %q", after)
 	}
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func legalHoldStateJSON(id string) []byte {
+	return []byte(fmt.Sprintf(`[{"id":%q,"scope":"session:agent-a","reason":"preserve evidence","created":"2026-01-01T00:00:00Z"}]`, id))
+}
+
+func writeBackupArchive(t *testing.T, path string, files map[string][]byte) {
+	t.Helper()
+	manifest := backupManifest{Version: backupFormatVersion}
+	for _, name := range []string{ExemptionStateFile, DeliveryInboxStateFile, LegalHoldStateFile} {
+		data, ok := files[name]
+		if !ok {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		manifest.Files = append(manifest.Files, backupManifestFile{
+			Store:  storeForArchiveName(name),
+			Name:   name,
+			SHA256: hex.EncodeToString(sum[:]),
+			Size:   int64(len(data)),
+		})
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := writeTarFile(tw, backupManifestName, manifestData); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range manifest.Files {
+		if err := writeTarFile(tw, file.Name, files[file.Name]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func ownerReadSearchOnlyMode() os.FileMode {
+	return 0o500
 }
 
 func TestRestoreState_RejectsTraversalAndUnknownFiles(t *testing.T) {
