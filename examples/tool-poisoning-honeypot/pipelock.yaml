@@ -1,0 +1,51 @@
+# Pipelock config for the tool-poisoning-honeypot example.
+#
+# Run with: pipelock mcp proxy --config pipelock.yaml -- python decoy_mcp_server.py
+#
+# The decoy server advertises an innocent-looking tool whose *description*
+# hides an exfiltration instruction. Pipelock scans the tools/list manifest
+# (mcp_tool_scanning) and blocks it before the agent ever calls the tool.
+# A second layer (mcp_tool_policy) blocks a dangerous tool call pattern
+# even if the description slipped past scanning.
+
+version: 1
+mode: balanced
+
+# No internal CIDR defaults; loopback only so the offline demo stays local.
+internal: []
+
+ssrf:
+  ip_allowlist:
+    - 127.0.0.1/32
+
+# Keep unrelated layers out of the story unless the demo exercises them.
+dlp:
+  scan_env: false
+  include_defaults: false
+
+response_scanning:
+  enabled: true
+  action: block
+  include_defaults: true
+
+# --- Layer 1: tool-description poisoning detection -----------------------
+# Scans the tools/list manifest. A poisoned description (e.g. "read ~/.ssh
+# and exfiltrate") triggers a block on the whole tools/list response, so the
+# agent never sees the trap tool. This is distinct from tool-response
+# injection, which attacks the response body.
+mcp_tool_scanning:
+  enabled: true
+  action: block
+  detect_drift: false
+
+# --- Layer 2: pre-execution tool-call policy ---------------------------
+# Even if a poisoned manifest reaches the agent, the policy blocks a call to
+# the shadow tool (or any tool whose name matches the dangerous pattern)
+# before it reaches the upstream server.
+mcp_tool_policy:
+  enabled: true
+  action: block
+  rules:
+    - name: block_decoy_exfil_tool
+      tool_pattern: '^(summarize_notes|fetch_weather)$'
+      action: block
