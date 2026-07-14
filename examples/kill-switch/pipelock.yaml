@@ -1,0 +1,28 @@
+# Kill switch example config.
+# verify.sh copies this into a temp file, rewrites listen + sentinel_file.
+
+version: 1
+mode: balanced
+
+fetch_proxy:
+  listen: "127.0.0.1:8888"
+  timeout_seconds: 30
+  monitoring:
+    max_url_length: 4096
+
+# Local echo server target for /fetch when kill switch is inactive.
+ssrf:
+  ip_allowlist:
+    - "127.0.0.0/8"
+    - "::1/128"
+
+# Offline: disable DNS-based SSRF. Core literal-IP floor remains.
+internal: []
+
+kill_switch:
+  # Leave false so verify can prove inactive → sentinel → clear.
+  # enabled: true is a config activation source, not a feature toggle.
+  enabled: false
+  sentinel_file: "/tmp/pipelock-kill-example"
+  message: "Emergency deny-all active"
+  health_exempt: true
