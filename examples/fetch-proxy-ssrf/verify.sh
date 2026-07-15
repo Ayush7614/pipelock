@@ -127,7 +127,7 @@ expect_blocked() {
   local code="$2"
   local body_file="$3"
   local needle="$4"
-  if [ "$code" = "403" ] && grep -qi 'blocked.: *true\|"blocked":true' "$body_file" \
+  if [ "$code" = "403" ] && grep -qiE 'blocked.: *true|"blocked":true' "$body_file" \
     && grep -qiE "$needle" "$body_file"; then
     pass "$label"
   else
@@ -183,7 +183,7 @@ step "Test 3: clean /fetch returns echo content"
 BODY="$WORK/clean.json"
 CODE="$(fetch_url "$PROXY_PORT" "http://${ECHO_ADDR}/" "$BODY")"
 if [ "$CODE" = "200" ] && grep -q 'hello-from-echo' "$BODY" \
-  && grep -q '"blocked": *false\|"blocked":false' "$BODY"; then
+  && grep -qE '"blocked": *false|"blocked":false' "$BODY"; then
   pass "clean fetch allowed"
 else
   fail "clean fetch failed (http=$CODE)"
