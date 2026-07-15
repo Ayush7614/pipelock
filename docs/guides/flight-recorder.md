@@ -26,6 +26,7 @@ flight_recorder:
   redact: true                   # DLP redaction before commit (recommended)
   require_receipts: false        # fail closed before forwarding when allow receipts cannot be emitted
   sign_checkpoints: true         # Ed25519 signed checkpoints
+  signing_key_path: /etc/pipelock/keys/flight-recorder-signing.key   # `pipelock init` writes this next to your config
   max_entries_per_file: 10000    # rotate to a new file after this many entries
   raw_escrow: false              # encrypted raw sidecar (see below)
   escrow_public_key: ""          # X25519 hex public key for raw escrow
@@ -305,9 +306,10 @@ To enable raw escrow:
 flight_recorder:
   enabled: true
   dir: /var/lib/pipelock/evidence
+  signing_key_path: /etc/pipelock/keys/flight-recorder-signing.key   # `pipelock init` writes this next to your config
   redact: true
   raw_escrow: true
-  escrow_public_key: "a1b2c3d4e5f6..."  # 32-byte X25519 key, hex-encoded
+  escrow_public_key: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"  # 32-byte X25519 key, 64 hex chars
 ```
 
 Generate an X25519 key pair with standard Go tooling or a library of your choice. Store the private key offline (not on the pipelock host). The escrow public key is safe to include in config.
