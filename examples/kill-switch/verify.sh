@@ -189,7 +189,7 @@ step "Test 3: fetch works while kill switch is inactive"
 FETCH_BODY="$WORK/fetch-ok.json"
 CODE="$(fetch_url "$PROXY_PORT" "http://${ECHO_ADDR}/" "$FETCH_BODY")"
 if [ "$CODE" = "200" ] && grep -q 'hello-from-echo' "$FETCH_BODY" \
-  && grep -q '"blocked": *false\|"blocked":false' "$FETCH_BODY"; then
+  && grep -q '"blocked": *false' "$FETCH_BODY"; then
   pass "clean fetch returned echo content"
 else
   fail "clean fetch failed (http=$CODE)"
@@ -202,8 +202,17 @@ fi
 step "Test 4: sentinel activates kill switch"
 touch "$SENTINEL"
 BLOCK_BODY="$WORK/fetch-blocked.json"
-CODE="$(fetch_url "$PROXY_PORT" "http://${ECHO_ADDR}/" "$BLOCK_BODY")"
-if [ "$CODE" = "503" ] && grep -q 'kill_switch_active' "$BLOCK_BODY"; then
+ACTIVATED=0
+CODE=""
+for _ in $(seq 1 20); do
+  CODE="$(fetch_url "$PROXY_PORT" "http://${ECHO_ADDR}/" "$BLOCK_BODY")"
+  if [ "$CODE" = "503" ] && grep -q 'kill_switch_active' "$BLOCK_BODY"; then
+    ACTIVATED=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$ACTIVATED" -eq 1 ]; then
   pass "fetch blocked with HTTP 503 kill_switch_active"
 else
   fail "expected HTTP 503 kill_switch_active (http=$CODE)"
