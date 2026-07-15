@@ -1,0 +1,29 @@
+# Fetch proxy + SSRF / response-scan example config.
+# verify.sh copies this into a temp file and rewrites fetch_proxy.listen.
+
+version: 1
+mode: balanced
+
+fetch_proxy:
+  listen: "127.0.0.1:8888"
+  timeout_seconds: 30
+  monitoring:
+    max_url_length: 4096
+
+dlp:
+  include_defaults: true
+
+response_scanning:
+  enabled: true
+  action: block
+  include_defaults: true
+
+# Disable DNS-based SSRF for offline checks. Core literal-IP SSRF floor remains.
+internal: []
+
+# Allow the local echo server so /fetch can reach 127.0.0.1 for clean/inject demos.
+# Metadata / 10.x literals are still blocked by the core SSRF floor.
+ssrf:
+  ip_allowlist:
+    - "127.0.0.0/8"
+    - "::1/128"
