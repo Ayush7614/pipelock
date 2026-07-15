@@ -1,0 +1,67 @@
+# MCP tool-policy example config.
+# Default-allow denylist: matched rules block; unmatched calls reach the decoy.
+
+version: 1
+mode: balanced
+
+internal: []
+
+ssrf:
+  ip_allowlist:
+    - "127.0.0.1/32"
+
+dlp:
+  scan_env: false
+  include_defaults: false
+
+# Keep competing MCP layers off so allow/deny proves tool_policy only.
+# Non-empty action prevents runtime auto-enable of disabled sections.
+response_scanning:
+  enabled: false
+  action: warn
+
+mcp_input_scanning:
+  enabled: false
+  action: warn
+
+mcp_tool_scanning:
+  enabled: false
+  action: warn
+  detect_drift: false
+
+mcp_session_binding:
+  enabled: false
+
+mcp_tool_policy:
+  enabled: true
+  action: block
+  rules:
+    - name: block_shell
+      tool_pattern: '^(run_shell|bash|shell)$'
+      action: block
+
+    - name: block_secret_path_read
+      tool_pattern: '^read_file$'
+      arg_pattern: '(?i)(\.ssh/|/etc/shadow|\.aws/credentials)'
+      arg_key: '^(path|file_?path|target)$'
+      action: block
+
+    - name: block_large_transfer
+      tool_pattern: '^transfer$'
+      arg_key: '^amount$'
+      arg_type: number
+      arg_number_gt: 1000
+      action: block
+
+    - name: block_admin_role
+      tool_pattern: '^set_role$'
+      arg_key: '^role$'
+      arg_value_in: ["admin", "root"]
+      action: block
+
+    - name: block_oversized_note
+      tool_pattern: '^write_note$'
+      arg_key: '^text$'
+      arg_type: string
+      arg_len_gt: 64
+      action: block
