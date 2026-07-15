@@ -224,6 +224,35 @@ func TestDashboardOIDCAuthenticate_VerifiesTokenAndMapsPermissions(t *testing.T)
 	}
 }
 
+func TestDecodeDashboardJWTJSONRejectsDuplicateMembers(t *testing.T) {
+	tests := []string{
+		`{"alg":"none","alg":"RS256"}`,
+		`{"claims":{"iss":"first","iss":"second"}}`,
+	}
+	for _, input := range tests {
+		var decoded any
+		if err := decodeDashboardJWTJSON([]byte(input), &decoded); err == nil || !strings.Contains(err.Error(), "duplicate") {
+			t.Fatalf("decodeDashboardJWTJSON(%s) error = %v, want duplicate rejection", input, err)
+		}
+	}
+}
+
+func TestDecodeDashboardJWTJSONRejectsExcessiveNesting(t *testing.T) {
+	input := strings.Repeat("[", dashboardOIDCMaxJSONDepth+1) + "0" +
+		strings.Repeat("]", dashboardOIDCMaxJSONDepth+1)
+	var decoded any
+	err := decodeDashboardJWTJSON([]byte(input), &decoded)
+	if err == nil || !strings.Contains(err.Error(), "nesting exceeds") {
+		t.Fatalf("decodeDashboardJWTJSON excessive nesting error = %v, want depth rejection", err)
+	}
+
+	input = strings.Repeat("[", dashboardOIDCMaxJSONDepth) + "0" +
+		strings.Repeat("]", dashboardOIDCMaxJSONDepth)
+	if err := decodeDashboardJWTJSON([]byte(input), &decoded); err != nil {
+		t.Fatalf("decodeDashboardJWTJSON at depth limit: %v", err)
+	}
+}
+
 func TestDashboardOIDCAuthenticate_FailsClosed(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	p := newOIDCTestProvider(t)
