@@ -26,6 +26,7 @@ RESP_FILE=""
 PROXY_PID=""
 PROXY_PIPE=""
 PROXY_ERR=""
+PROXY_TMPDIR=""
 
 cleanup_proxy() {
   if [ -n "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -38,14 +39,15 @@ cleanup_proxy() {
   PROXY_PID=""
 }
 
-trap 'cleanup_proxy; rm -f "${RESP_FILE:-}" "${PROXY_ERR:-}" "${PROXY_PIPE:-}" 2>/dev/null || true' EXIT
+trap 'cleanup_proxy; rm -f "${RESP_FILE:-}" "${PROXY_ERR:-}" 2>/dev/null || true; rm -rf "${PROXY_TMPDIR:-}" 2>/dev/null || true' EXIT
 
 start_proxy() {
   cleanup_proxy
   RESP_FILE="$(mktemp)"
   : >"$RESP_FILE"
   PROXY_ERR="$(mktemp)"
-  PROXY_PIPE="$(mktemp -u)"
+  PROXY_TMPDIR="$(mktemp -d)"
+  PROXY_PIPE="$PROXY_TMPDIR/pipe"
   mkfifo "$PROXY_PIPE"
   "$PIPELOCK" mcp proxy --config "$CONFIG" -- python3 "$SERVER" \
     >>"$RESP_FILE" 2>"$PROXY_ERR" <"$PROXY_PIPE" &
@@ -170,10 +172,7 @@ expect_deny "set_role admin blocked" "$(call_tool 9 set_role '{"role":"admin"}' 
 step "Test 11: allow short note"
 expect_allow "short write_note allowed" "$(call_tool 10 write_note '{"text":"short"}' || true)"
 
-LONG_TEXT="$(python3 - <<'PY'
-print("x" * 65)
-PY
-)"
+LONG_TEXT="$(printf 'x%.0s' {1..65})"
 step "Test 12: deny oversized note"
 expect_deny "long write_note blocked" "$(call_tool 11 write_note "{\"text\":\"${LONG_TEXT}\"}" || true)"
 
