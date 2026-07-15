@@ -18,13 +18,16 @@ Inbound (new in v2.4): when a request arrives carrying a `pipelock-mediation` si
 
 Inbound verification is opt-in. Add `mediation_envelope.verify_inbound` to `pipelock.yaml`:
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: federation-inbound-key
 mediation_envelope:
   verify_inbound:
     enabled: true
     trust_list:
       - key_id: "partner-pipelock-2026-q2"
-        public_key: "64-char-hex-encoded-ed25519-public-key"
+        # Required deployment value. Do not enable inbound verification until
+        # this is replaced with the partner's independently verified pinned key.
+        public_key: "<64-char-hex-ed25519-public-key>"
         # Optional: a discovery / metadata URL pointing at the partner's
         # RFC 9421 directory. Validated as HTTPS at config-load. NOT used
         # by inbound verification to fetch the key — `public_key` above is

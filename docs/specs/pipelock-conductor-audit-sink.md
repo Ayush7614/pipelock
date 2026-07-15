@@ -792,6 +792,7 @@ A future `LicenseBundle` requires:
 Draft YAML shape:
 
 ```yaml
+# pipelock-enterprise-skip-id: conductor-audit-sink-follower
 conductor:
   enabled: true
   conductor_url: "https://conductor.example.internal"
@@ -799,7 +800,8 @@ conductor:
   fleet_id: "prod"
   instance_id: "pl-prod-1"
   trust_roster_path: "/etc/pipelock/conductor/trust-roster.json"
-  trust_roster_root_fingerprint: "sha256:<64 lowercase hex chars>"
+  # EXAMPLE ONLY: replace this with the deployed trust-root hash; do not deploy this value.
+  trust_roster_root_fingerprint: "sha256:e7064a5e10402f71d33b8629c63ae81e2fdf528594577a8ffa5febf0fa48c9ee"
   server_ca_file: "/etc/pipelock/conductor/boss-ca.pem"
   client_cert_path: "/etc/pipelock/conductor/client.crt"
   client_key_path: "/etc/pipelock/conductor/client.key"

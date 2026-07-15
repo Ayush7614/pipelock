@@ -1090,7 +1090,8 @@ When a new held action is admitted while another action from the same session is
 
 Pins tool inventory on the first `tools/list` response. Subsequent tool calls are validated against this baseline. Unknown tools trigger the configured action.
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: mcp-session-binding
 mcp_session_binding:
   enabled: true
   unknown_tool_action: warn
@@ -1195,7 +1196,8 @@ The baseline admin endpoints (list, show, ratify, forget) are only mounted on th
 
 Per-session threat score that accumulates across scanner hits and decays on clean requests. When the score exceeds the threshold, the session escalates through levels (elevated → high → critical). At each level, the `levels` configuration upgrades warn and ask actions to block, or denies all traffic.
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: adaptive-enforcement
 adaptive_enforcement:
   enabled: true
   escalation_threshold: 5.0
@@ -1914,7 +1916,8 @@ pipelock run --config pipelock.yaml
 
 **File path:**
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: license-path-precedence
 license_file: /etc/pipelock/license.token    # absolute path
 license_file: license.token                  # relative to config file directory
 ```
@@ -1929,7 +1932,8 @@ license_key: "pipelock_lic_v1_eyJ..."
 
 **Full example with all license fields:**
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: license-complete-reference
 license_key: "pipelock_lic_v1_eyJ..."        # inline token (lowest priority)
 license_file: "/etc/pipelock/license.token"  # file path (medium priority)
 license_crl_file: "/etc/pipelock/license.crl" # signed revocation list
@@ -1954,7 +1958,8 @@ env:
 
 Or mount the Secret as a file and reference it in config:
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: license-container-layout
 license_file: /etc/pipelock/license/token
 license_intermediate_file: /etc/pipelock/license/intermediate.json
 ```
@@ -1992,7 +1997,8 @@ pipelock license install --path /etc/pipelock/license.token <TOKEN>  # custom pa
 
 The command validates the token format, writes it atomically (temp file + rename), and prints setup instructions. Point your config at the file:
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: license-activation
 license_file: /etc/pipelock/license.token
 ```
 
@@ -2142,7 +2148,8 @@ Files larger than `max_file_bytes` are skipped to bound memory use, but the skip
 
 Optional signed rule bundles that extend built-in detection patterns. See [docs/rules.md](rules.md) for the full user guide.
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: trusted-rule-key
 rules:
   rules_dir: ~/.local/share/pipelock/rules  # default ($XDG_DATA_HOME/pipelock/rules)
   min_confidence: medium          # skip low-confidence (experimental) rules
@@ -2423,7 +2430,8 @@ learn_lock:
     id: production
     tenant: ""
     deployment_id: ""
-  pinned_root_fingerprint: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  # EXAMPLE ONLY: replace this pin with your deployed trust-root fingerprint; do not deploy this value.
+  pinned_root_fingerprint: sha256:10ce731a9825628c9d28645e43501fb4a988a6c76cc4d28318788871635ce85e
   minimum_signatures: 1
 ```
 
@@ -2476,7 +2484,8 @@ otherwise. Designed for Docker `HEALTHCHECK` directives and Compose
 
 Scanning for Google A2A (Agent-to-Agent) protocol traffic. Detects A2A messages in forward proxy and MCP HTTP proxy paths. Applies field-aware content inspection with URL/text/secret classification.
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: a2a-trusted-card-key
 a2a_scanning:
   enabled: true
   action: block
@@ -2777,7 +2786,8 @@ mediation_envelope:
 
 Signed configuration (Ed25519 HTTP Message Signatures per RFC 9421):
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: mediation-signing
 mediation_envelope:
   enabled: true
   sign: true
@@ -2970,7 +2980,8 @@ SVG (`image/svg+xml`) is never in the allowed image types list. SVG is active co
 
 Follower-side configuration for joining a [Conductor](guides/conductor.md)-managed fleet. The `conductor:` block is local control-plane plumbing, not scanner policy, and is excluded from the canonical policy hash. Any build parses the block, but `enabled: true` requires an enterprise build with the `fleet` license entitlement and fails closed otherwise.
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: conductor-follower
 conductor:
   enabled: true
   conductor_url: https://conductor.example.internal:8895
@@ -3111,7 +3122,8 @@ The live-lock runtime activates per-agent behavioural contracts only after their
 
 Runtime config uses a nested environment tuple. All three keys are required when `learn_lock.enabled` is true. Use explicit empty strings for `tenant` or `deployment_id` only when the deployment is intentionally unscoped on that axis.
 
-```yaml
+```yaml pipelock-fragment
+# pipelock-fragment-id: learn-lock
 learn_lock:
   enabled: true
   mode: shadow

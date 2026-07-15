@@ -327,6 +327,7 @@ sink cannot verify its evidence — the Conductor has no audit key registered fo
 it. Enrollment is what turns both on.
 
 ```yaml
+# pipelock-enterprise-skip-id: conductor-production-follower
 conductor:
   enabled: true
   conductor_url: https://conductor.pipelock-control.svc.cluster.local:8895
@@ -334,7 +335,8 @@ conductor:
   fleet_id: prod
   instance_id: edge-01
   trust_roster_path: /etc/pipelock/trust-roster.json
-  trust_roster_root_fingerprint: sha256:<root-fingerprint-from-step-1>
+  # EXAMPLE ONLY: replace this with the fingerprint from step 1; do not deploy this value.
+  trust_roster_root_fingerprint: sha256:e7064a5e10402f71d33b8629c63ae81e2fdf528594577a8ffa5febf0fa48c9ee
   server_ca_file: /etc/pipelock/conductor-ca.pem
   client_cert_path: /etc/pipelock/follower.crt
   client_key_path: /etc/pipelock/follower.key
@@ -346,6 +348,11 @@ conductor:
   enrollment_token_path: /etc/pipelock/conductor/enrollment-token  # single-use; auto-enroll on startup
   poll_interval: 30s
   honor_remote_kill_switch: true
+
+flight_recorder:
+  enabled: true
+  sign_checkpoints: true
+  signing_key_path: /etc/pipelock/recorder.key
 ```
 
 A follower **must produce signed evidence** to participate: config validation

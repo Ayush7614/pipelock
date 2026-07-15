@@ -218,6 +218,7 @@ parses the block in any build but **refuses to run with `conductor.enabled: true
 unless it is an enterprise build with the `fleet` entitlement**.
 
 ```yaml
+# pipelock-enterprise-skip-id: conductor-follower-guide
 conductor:
   enabled: true
   conductor_url: https://conductor.example.internal:8895
@@ -228,7 +229,8 @@ conductor:
     ring: canary
     region: us-east
   trust_roster_path: /etc/pipelock/trust-roster.json
-  trust_roster_root_fingerprint: <sha256-of-trust-root>
+  # EXAMPLE ONLY: replace this with the deployed trust-root hash; do not deploy this value.
+  trust_roster_root_fingerprint: sha256:e7064a5e10402f71d33b8629c63ae81e2fdf528594577a8ffa5febf0fa48c9ee
   server_ca_file: /etc/pipelock/conductor-ca.pem
   client_cert_path: /etc/pipelock/follower.crt
   client_key_path: /etc/pipelock/follower.key
@@ -238,6 +240,11 @@ conductor:
   recorder_key_id: edge-01-recorder
   poll_interval: 30s
   honor_remote_kill_switch: true
+
+flight_recorder:
+  enabled: true
+  sign_checkpoints: true
+  signing_key_path: /etc/pipelock/recorder.key
 ```
 
 When `conductor.enabled: true`, validation requires:
