@@ -40,6 +40,7 @@ func armAndStart(t *testing.T, w Watcher, ctx context.Context) {
 		startErr <- w.Start(ctx)
 	}()
 	t.Cleanup(func() {
+		_ = w.Close()
 		if err := <-startErr; err != nil {
 			t.Errorf("Start: %v", err)
 		}
@@ -72,7 +73,7 @@ func TestWatcher_DetectsSecretWrite(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil // no SSRF checks in tests
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -117,7 +118,7 @@ func TestWatcher_CleanFileNoFinding(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -164,7 +165,7 @@ func TestWatcher_IgnoredPatterns(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -203,7 +204,7 @@ func TestWatcher_SubdirCreation(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -260,7 +261,7 @@ func TestWatcher_ScanContentDisabled(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -299,7 +300,7 @@ func TestWatcher_CloseIdempotent(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -326,7 +327,7 @@ func TestWatcher_OversizedFileSkipped(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -381,7 +382,7 @@ func TestWatcher_OversizedSkipIsVisibleAndCapConfigurable(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	var skipErr atomic.Pointer[string]
@@ -442,7 +443,7 @@ func TestWatcher_OpenFailureIsVisible(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	var openErr atomic.Pointer[string]
@@ -479,7 +480,7 @@ func TestWatcher_FlushScanReportsSkippedFiles(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	var errs []string
@@ -558,7 +559,7 @@ func TestWatcher_ScanFileDropsWhenFindingChannelFull(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -594,7 +595,7 @@ func TestWatcher_EmptyFileSkipped(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -632,7 +633,7 @@ func TestWatcher_WithLineageAttribution(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	// Use a mock lineage that always reports the file as open by an agent process.
@@ -754,7 +755,7 @@ func TestWatcher_ErrorHandlerInvoked(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	var errorCount atomic.Int32
@@ -785,7 +786,7 @@ func TestWatcher_NilErrorHandler(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -811,7 +812,7 @@ func TestWatcher_PIDSnapshotAtEventTime(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	lin := &mockLineage{hasFileOpen: true}
@@ -854,7 +855,7 @@ func TestWatcher_NilLineageNoSnapshot(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -896,7 +897,7 @@ func TestWatcher_ScanContentNilDefaultsTrue(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -958,7 +959,7 @@ func TestWatcher_CloseFlushesLastWrite(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1005,7 +1006,7 @@ func TestWatcher_CloseFlushScanDisabled(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1050,7 +1051,7 @@ func TestWatcher_CloseFlushEmptyFile(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1062,10 +1063,13 @@ func TestWatcher_CloseFlushEmptyFile(t *testing.T) {
 	armAndStart(t, w, ctx)
 
 	emptyPath := filepath.Join(dir, "empty.txt")
-	if writeErr := os.WriteFile(emptyPath, []byte{}, 0o600); writeErr != nil {
+	if writeErr := os.WriteFile(emptyPath, []byte("trigger"), 0o600); writeErr != nil {
 		t.Fatalf("WriteFile: %v", writeErr)
 	}
 	waitForPendingTimer(t, w, emptyPath)
+	if truncateErr := os.Truncate(emptyPath, 0); truncateErr != nil {
+		t.Fatalf("Truncate: %v", truncateErr)
+	}
 
 	cancel()
 	_ = w.Close()
@@ -1092,7 +1096,7 @@ func TestWatcher_StartContextCancelled(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1133,7 +1137,7 @@ func TestWatcher_FindingsChannelFull(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1212,7 +1216,7 @@ func TestWatcher_PermissionDeniedSubdir(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1239,7 +1243,7 @@ func TestWatcher_StartReturnsOnClose(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1273,7 +1277,7 @@ func TestWatcher_ArmNonexistentPath(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1302,7 +1306,7 @@ func TestWatcher_ArmNonexistentPathSoftFail(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	var errCallbacks int
@@ -1349,7 +1353,7 @@ func TestWatcher_ArmMixedPathsArmsTheArmable(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1408,7 +1412,7 @@ func TestWatcher_ArmRejectsFilePath(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1433,7 +1437,7 @@ func TestWatcher_RenameIntoPlace(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)
@@ -1484,7 +1488,7 @@ func TestWatcher_FileRemovalNoFinding(t *testing.T) {
 	defaults := config.Defaults()
 	defaults.Internal = nil
 	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-	sc := scanner.New(defaults)
+	sc := scanner.MustNew(defaults)
 	defer sc.Close()
 
 	w, err := NewWatcher(cfg, sc, nil, nil)

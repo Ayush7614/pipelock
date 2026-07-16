@@ -41,7 +41,7 @@ func newTestScanner(t *testing.T, mutate func(*config.Config)) *scanner.Scanner 
 	if mutate != nil {
 		mutate(cfg)
 	}
-	sc := scanner.New(cfg)
+	sc := scanner.MustNew(cfg)
 	t.Cleanup(func() { sc.Close() })
 	return sc
 }
@@ -759,6 +759,26 @@ func TestLoadAndReplay(t *testing.T) {
 	}
 	if r.Result.CandidateAction != config.ActionBlock {
 		t.Fatalf("expected CandidateAction=%q, got %q", config.ActionBlock, r.Result.CandidateAction)
+	}
+}
+
+func TestLoadAndReplay_ScannerConstructionFailureIsReturned(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureSession(t, dir, CaptureSummary{
+		CaptureSchemaVersion: CaptureSchemaV1,
+		Surface:              SurfaceURL,
+		ConfigHash:           loadReplayOriginalHash,
+		EffectiveAction:      config.ActionAllow,
+		Request:              CaptureRequest{URL: "https://safe.example.com/page"},
+	})
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.DLP.ScanEnv = false
+	cfg.DLP.SecretsFile = filepath.Join(t.TempDir(), "missing-secrets.txt")
+
+	_, _, _, _, err := LoadAndReplay(cfg, dir)
+	if err == nil || !strings.Contains(err.Error(), "session test-session scanner") {
+		t.Fatalf("error = %v, want session scanner failure", err)
 	}
 }
 

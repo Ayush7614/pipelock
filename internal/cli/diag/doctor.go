@@ -16,9 +16,11 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/luckyPipewrench/pipelock/internal/certgen"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
 const (
@@ -66,6 +68,7 @@ func DoctorCmd() *cobra.Command {
 	var jsonOutput bool
 	var noColor bool
 	var checkPorts bool
+	var startup bool
 
 	cmd := &cobra.Command{
 		Use:   "doctor",
@@ -88,25 +91,17 @@ this" report.`,
 				return cliutil.ExitCodeError(2, err)
 			}
 			report := buildDoctorReport(cfg, cfgLabel)
+			if startup {
+				report.Checks = append(report.Checks, checkDoctorStartup(cfg)...)
+				report.Summary = retallyDoctorSummary(report.Checks)
+			}
 			if checkPorts {
 				report.Checks = append(report.Checks, checkPortsReport(cfg)...)
 				// Rebuild summary tallies so the appended port checks count
 				// against pass/warn/fail exit codes alongside the built-in
 				// checks. Re-tally rather than incremental-add so the same
 				// code path produces summary either way.
-				report.Summary = doctorSummary{}
-				for _, check := range report.Checks {
-					switch check.Status {
-					case doctorStatusOK:
-						report.Summary.OK++
-					case doctorStatusWarn:
-						report.Summary.Warnings++
-					case doctorStatusFail:
-						report.Summary.Failures++
-					default:
-						report.Summary.Info++
-					}
-				}
+				report.Summary = retallyDoctorSummary(report.Checks)
 			}
 			if jsonOutput {
 				report.RootRunBanner = doctorRootBannerMessage()
@@ -132,6 +127,7 @@ this" report.`,
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output report as JSON")
 	cmd.Flags().BoolVar(&noColor, "no-color", false, "disable color output")
 	cmd.Flags().BoolVar(&checkPorts, "check-ports", false, "report which process holds each configured listener port (Linux /proc; run as root for cross-user visibility)")
+	cmd.Flags().BoolVar(&startup, "startup", false, "check read-only startup preconditions for this host")
 
 	return cmd
 }
@@ -158,19 +154,25 @@ func buildDoctorReport(cfg *config.Config, cfgLabel string) doctorReport {
 	}
 	report.Checks = append(report.Checks, checkDoctorConfigSemantics(cfg)...)
 	report.Checks = append(report.Checks, checkDoctorAvailableKnobs(cfg)...)
-	for _, check := range report.Checks {
+	report.Summary = retallyDoctorSummary(report.Checks)
+	return report
+}
+
+func retallyDoctorSummary(checks []doctorReportCheck) doctorSummary {
+	var summary doctorSummary
+	for _, check := range checks {
 		switch check.Status {
 		case doctorStatusOK:
-			report.Summary.OK++
+			summary.OK++
 		case doctorStatusWarn:
-			report.Summary.Warnings++
+			summary.Warnings++
 		case doctorStatusFail:
-			report.Summary.Failures++
+			summary.Failures++
 		default:
-			report.Summary.Info++
+			summary.Info++
 		}
 	}
-	return report
+	return summary
 }
 
 func checkDoctorLicense(cfg *config.Config) doctorReportCheck {
@@ -627,6 +629,16 @@ func checkDoctorFlightRecorder(cfg *config.Config) doctorReportCheck {
 			Next:       "set flight_recorder.dir to a writable directory so receipts are persisted",
 		}
 	}
+	if _, err := os.Stat(filepath.Clean(cfg.FlightRecorder.Dir)); errors.Is(err, os.ErrNotExist) && pathProbablyCreatableDir(cfg.FlightRecorder.Dir) {
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Detail:     "flight_recorder.dir does not exist; parent permission bits suggest it may be creatable, but persistence is not verified",
+			Next:       "create the directory as the service user, then rerun doctor to verify receipt persistence",
+		}
+	}
 	readable := pathReadable(cfg.FlightRecorder.Dir)
 	writable := pathWritableDir(cfg.FlightRecorder.Dir)
 	if !readable || !writable {
@@ -700,6 +712,78 @@ func checkDoctorSentry(cfg *config.Config) doctorReportCheck {
 	}
 }
 
+func checkDoctorStartup(cfg *config.Config) []doctorReportCheck {
+	return []doctorReportCheck{
+		checkDoctorStartupDLPSecretsFile(cfg),
+		checkDoctorStartupTLSCA(cfg),
+	}
+}
+
+func checkDoctorStartupDLPSecretsFile(cfg *config.Config) doctorReportCheck {
+	if cfg.DLP.SecretsFile == "" {
+		return doctorReportCheck{
+			Name:    "startup_dlp_secrets_file",
+			Surface: doctorSurfaceHost,
+			Status:  doctorStatusInfo,
+			Detail:  "dlp.secrets_file is not configured",
+		}
+	}
+	minLen := cfg.DLP.MinEnvSecretLength
+	if minLen <= 0 {
+		minLen = 16
+	}
+	_, err := scanner.LoadSecretsFile(filepath.Clean(cfg.DLP.SecretsFile), minLen)
+	if err != nil {
+		return doctorReportCheck{
+			Name:       "startup_dlp_secrets_file",
+			Surface:    doctorSurfaceHost,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Detail:     "configured secrets file cannot be loaded: " + err.Error(),
+			Next:       "fix dlp.secrets_file ownership, path, or mode for the service user",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "startup_dlp_secrets_file",
+		Surface:    doctorSurfaceHost,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "configured secrets file is loadable",
+	}
+}
+
+func checkDoctorStartupTLSCA(cfg *config.Config) doctorReportCheck {
+	if !cfg.TLSInterception.Enabled {
+		return doctorReportCheck{
+			Name:    "startup_tls_ca",
+			Surface: doctorSurfaceHost,
+			Status:  doctorStatusInfo,
+			Detail:  "TLS interception is disabled",
+		}
+	}
+	if _, _, err := certgen.LoadCA(cfg.TLSInterception.CACertPath, cfg.TLSInterception.CAKeyPath); err != nil {
+		return doctorReportCheck{
+			Name:       "startup_tls_ca",
+			Surface:    doctorSurfaceHost,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Detail:     "configured TLS CA material cannot be parsed: " + err.Error(),
+			Next:       "fix tls_interception.ca_cert and ca_key or regenerate the CA",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "startup_tls_ca",
+		Surface:    doctorSurfaceHost,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "configured TLS CA material parses successfully",
+	}
+}
+
 func checkDoctorDeploymentBoundary(_ *config.Config) doctorReportCheck {
 	return doctorReportCheck{
 		Name:    "direct_egress_boundary",
@@ -752,7 +836,7 @@ func pathReadable(path string) bool {
 }
 
 func pathWritableDir(path string) bool {
-	info, err := os.Stat(path)
+	info, err := os.Stat(filepath.Clean(path))
 	if err != nil || !info.IsDir() {
 		return false
 	}
@@ -764,6 +848,21 @@ func pathWritableDir(path string) bool {
 	_ = probe.Close()
 	_ = os.Remove(probePath)
 	return true
+}
+
+func pathProbablyCreatableDir(path string) bool {
+	for candidate := filepath.Clean(path); ; candidate = filepath.Dir(candidate) {
+		info, err := os.Stat(candidate)
+		if err == nil {
+			return info.IsDir() && dirWritableExecutableByCurrentUser(info)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		if parent := filepath.Dir(candidate); parent == candidate {
+			return false
+		}
+	}
 }
 
 func openReadable(path string) bool {

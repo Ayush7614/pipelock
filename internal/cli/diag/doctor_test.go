@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/certgen"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/license"
@@ -42,6 +43,29 @@ func TestDoctorJSONReportsWarningsForDefaultTopology(t *testing.T) {
 	}
 	if !doctorReportHasCheck(report, "direct_egress_boundary", doctorStatusInfo) {
 		t.Fatalf("missing direct egress info: %+v", report.Checks)
+	}
+}
+
+func TestDoctorStartupFlagAddsHostChecksAndRetallies(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := DoctorCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"--startup", "--check-ports", "--json"})
+	_ = cmd.Execute()
+
+	var report doctorReport
+	if err := json.Unmarshal(buf.Bytes(), &report); err != nil {
+		t.Fatalf("invalid JSON output: %v\n%s", err, buf.String())
+	}
+	if !doctorReportHasCheck(report, "startup_dlp_secrets_file", doctorStatusInfo) {
+		t.Fatalf("missing startup DLP check: %+v", report.Checks)
+	}
+	if !doctorReportHasCheck(report, "startup_tls_ca", doctorStatusInfo) {
+		t.Fatalf("missing startup TLS check: %+v", report.Checks)
+	}
+	want := retallyDoctorSummary(report.Checks)
+	if report.Summary != want {
+		t.Fatalf("summary = %+v, want %+v", report.Summary, want)
 	}
 }
 
@@ -109,6 +133,152 @@ func TestBuildDoctorReportRejectsStatOnlyMCPManifest(t *testing.T) {
 	report := buildDoctorReport(cfg, configLabelDefaults)
 	if !doctorReportHasCheck(report, "mcp_binary_integrity", doctorStatusFail) {
 		t.Fatalf("expected unreadable mcp_binary_integrity failure: %+v", report.Checks)
+	}
+}
+
+func TestCheckDoctorStartupDLPSecretsFile(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		setup  func(t *testing.T, cfg *config.Config)
+		status string
+		detail string
+	}{
+		{
+			name:   "not_configured",
+			setup:  func(t *testing.T, cfg *config.Config) {},
+			status: doctorStatusInfo,
+			detail: "not configured",
+		},
+		{
+			name: "loadable",
+			setup: func(t *testing.T, cfg *config.Config) {
+				path := filepath.Join(t.TempDir(), "secrets.txt")
+				if err := os.WriteFile(path, []byte("secret-value-for-doctor\n"), 0o600); err != nil {
+					t.Fatalf("write secrets file: %v", err)
+				}
+				cfg.DLP.SecretsFile = path
+			},
+			status: doctorStatusOK,
+			detail: "loadable",
+		},
+		{
+			name: "directory",
+			setup: func(t *testing.T, cfg *config.Config) {
+				cfg.DLP.SecretsFile = t.TempDir()
+			},
+			status: doctorStatusFail,
+			detail: "cannot be loaded",
+		},
+		{
+			name: "missing",
+			setup: func(t *testing.T, cfg *config.Config) {
+				cfg.DLP.SecretsFile = filepath.Join(t.TempDir(), "missing.txt")
+			},
+			status: doctorStatusFail,
+			detail: "cannot be loaded",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.Defaults()
+			tt.setup(t, cfg)
+			check := checkDoctorStartupDLPSecretsFile(cfg)
+			if check.Status != tt.status {
+				t.Fatalf("status = %q, want %q; check=%+v", check.Status, tt.status, check)
+			}
+			if !strings.Contains(check.Detail, tt.detail) {
+				t.Fatalf("detail = %q, want substring %q", check.Detail, tt.detail)
+			}
+		})
+	}
+}
+
+func TestCheckDoctorStartupTLSCA(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	caCert := filepath.Join(dir, "ca.pem")
+	caKey := filepath.Join(dir, "ca.key")
+	cert, key, _, err := certgen.GenerateCA("Doctor Test", time.Hour)
+	if err != nil {
+		t.Fatalf("generate CA: %v", err)
+	}
+	if err := certgen.SaveCA(caCert, caKey, cert, key); err != nil {
+		t.Fatalf("save CA: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		setup  func(cfg *config.Config)
+		status string
+		detail string
+	}{
+		{
+			name:   "disabled",
+			setup:  func(cfg *config.Config) {},
+			status: doctorStatusInfo,
+			detail: "disabled",
+		},
+		{
+			name: "valid_ca",
+			setup: func(cfg *config.Config) {
+				cfg.TLSInterception.Enabled = true
+				cfg.TLSInterception.CACertPath = caCert
+				cfg.TLSInterception.CAKeyPath = caKey
+			},
+			status: doctorStatusOK,
+			detail: "parses successfully",
+		},
+		{
+			name: "invalid_ca",
+			setup: func(cfg *config.Config) {
+				cfg.TLSInterception.Enabled = true
+				cfg.TLSInterception.CACertPath = filepath.Join(dir, "invalid-ca.pem")
+				cfg.TLSInterception.CAKeyPath = caKey
+				if err := os.WriteFile(cfg.TLSInterception.CACertPath, []byte("not pem\n"), 0o600); err != nil {
+					t.Fatalf("write invalid CA: %v", err)
+				}
+			},
+			status: doctorStatusFail,
+			detail: "cannot be parsed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Defaults()
+			tt.setup(cfg)
+			check := checkDoctorStartupTLSCA(cfg)
+			if check.Status != tt.status {
+				t.Fatalf("status = %q, want %q; check=%+v", check.Status, tt.status, check)
+			}
+			if !strings.Contains(check.Detail, tt.detail) {
+				t.Fatalf("detail = %q, want substring %q", check.Detail, tt.detail)
+			}
+		})
+	}
+}
+
+func TestCheckDoctorFlightRecorderWarnsForUnverifiedMissingDir(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.FlightRecorder.Enabled = true
+	cfg.FlightRecorder.Dir = filepath.Join(t.TempDir(), "runtime-created")
+
+	check := checkDoctorFlightRecorder(cfg)
+	if check.Status != doctorStatusWarn {
+		t.Fatalf("status = %q, want warn; check=%+v", check.Status, check)
+	}
+	if check.Reachable || check.Enforcing {
+		t.Fatalf("missing directory must not claim reachable/enforcing: %+v", check)
+	}
+	if !strings.Contains(check.Detail, "not verified") {
+		t.Fatalf("detail = %q, want unverified warning", check.Detail)
 	}
 }
 
