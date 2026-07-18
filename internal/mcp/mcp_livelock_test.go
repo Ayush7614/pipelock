@@ -381,6 +381,35 @@ func TestMCPContractGateFallbacks(t *testing.T) {
 	}
 }
 
+func TestMCPUpstreamGateForMethodRejectsGETWithPOSTOnlyContract(t *testing.T) {
+	opts := mcpLiveLockOpts(t, contractruntime.ModeLive,
+		contractruntimetest.HTTPEnforceRule("r-post-only", "api.example.com", "/", http.MethodPost))
+
+	postGate, err := evaluateMCPUpstreamGateForMethod(context.Background(), "https://api.example.com/", http.MethodPost, opts)
+	if err != nil {
+		t.Fatalf("POST upstream gate err = %v", err)
+	}
+	if postGate.Verdict != config.ActionAllow || postGate.RuleID != "r-post-only" {
+		t.Fatalf("POST upstream gate = %+v, want contract allow", postGate)
+	}
+
+	defaultGate, err := evaluateMCPUpstreamGateForMethod(context.Background(), "https://api.example.com/", "", opts)
+	if err != nil {
+		t.Fatalf("default upstream gate err = %v", err)
+	}
+	if defaultGate.Verdict != config.ActionAllow || defaultGate.RuleID != "r-post-only" {
+		t.Fatalf("default upstream gate = %+v, want POST contract allow", defaultGate)
+	}
+
+	getGate, err := evaluateMCPUpstreamGateForMethod(context.Background(), "https://api.example.com/", http.MethodGet, opts)
+	if err != nil {
+		t.Fatalf("GET upstream gate err = %v", err)
+	}
+	if getGate.Verdict != config.ActionBlock || getGate.Reason != string(blockreason.ContractEnforceDefault) {
+		t.Fatalf("GET upstream gate = %+v, want method-specific contract block", getGate)
+	}
+}
+
 func TestMCPContractGateA2AUsesNamespacedMethodIdentity(t *testing.T) {
 	opts := mcpLiveLockOpts(t, contractruntime.ModeLive,
 		mcpCallableRule("r-a2a", a2aBaselineIdentity(testA2AMethod), nil))

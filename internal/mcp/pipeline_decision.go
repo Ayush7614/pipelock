@@ -98,6 +98,7 @@ func EmitMCPDecision(
 	outbound = d.InboundMsg
 
 	v1Emitted := false
+	v2Emitted := false
 	receiptRequired := d.RequireReceipt
 	escalateReceiptError := func() (bool, error) {
 		if !receiptRequired || err == nil {
@@ -132,14 +133,16 @@ func EmitMCPDecision(
 	// DecisionPhaseResolution with a final allow verdict) keeps its phase instead
 	// of being overwritten to intent.
 	markIntent := receiptRequired && verdict == config.ActionAllow && d.Receipt.DecisionPhase == ""
+	// The intent phase is a property of the decision itself, so mark it before
+	// either emitter is attempted rather than only on the v1 path. This keeps the
+	// v1 and v2 emitters (which both consume d.Receipt) consistent even when v1 is
+	// absent.
+	if markIntent && d.Receipt.ActionID != "" {
+		d.Receipt.DecisionPhase = receipt.DecisionPhaseIntent
+	}
 	if receiptRequired && d.Receipt.ActionID == "" {
 		err = fmt.Errorf("empty action id: %w", ErrReceiptRequired)
-	} else if receiptRequired && receiptEmitter == nil {
-		err = fmt.Errorf("%w: emitter unavailable", ErrReceiptRequired)
 	} else if receiptEmitter != nil && d.Receipt.ActionID != "" {
-		if markIntent {
-			d.Receipt.DecisionPhase = receipt.DecisionPhaseIntent
-		}
 		if durableReceipt {
 			err = receiptEmitter.EmitDurable(d.Receipt)
 		} else {
@@ -150,13 +153,20 @@ func EmitMCPDecision(
 		// RequireReceipt gate below upgrades errors to fail-closed before
 		// envelope mutation.
 	}
-	if done, escalateErr := escalateReceiptError(); done {
-		return outbound, escalateErr
-	}
-	if v1Emitted && v2Emitter != nil {
-		if v2Err := emitMCPV2Decision(v2Emitter, d.Receipt, receiptRequired); v2Err != nil && err == nil {
-			err = v2Err
+	if d.Receipt.ActionID != "" && v2Emitter != nil {
+		if v2Err := emitMCPV2Decision(v2Emitter, d.Receipt, receiptRequired); v2Err != nil {
+			if err == nil {
+				err = v2Err
+			}
+		} else {
+			v2Emitted = true
 		}
+	}
+	if receiptRequired && (v1Emitted || v2Emitted) {
+		err = nil
+	}
+	if receiptRequired && !v1Emitted && !v2Emitted && err == nil {
+		err = fmt.Errorf("%w: emitter unavailable", ErrReceiptRequired)
 	}
 	if done, escalateErr := escalateReceiptError(); done {
 		return outbound, escalateErr

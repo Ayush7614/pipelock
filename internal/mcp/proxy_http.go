@@ -21,6 +21,7 @@ import (
 var defaultMCPListenerSensitiveHeaders = []string{
 	"Authorization",
 	"Cookie",
+	listenerLastEventID,
 	"X-Api-Key",
 	"X-Token",
 	"Proxy-Authorization",
@@ -83,7 +84,7 @@ func scanMCPListenerHeadersForDLP(
 
 func mcpListenerHeadersToScan(headers http.Header, cfg *config.RequestBodyScanning) map[string][]string {
 	if cfg == nil || !cfg.Enabled || !cfg.ScanHeaders {
-		return mcpListenerExplicitHeaders(headers, []string{"Authorization"})
+		return mcpListenerExplicitHeaders(headers, []string{listenerAuthorization, listenerLastEventID})
 	}
 	if cfg.HeaderMode == config.HeaderModeAll {
 		ignored := make(map[string]struct{}, len(cfg.IgnoreHeaders))
@@ -98,12 +99,21 @@ func mcpListenerHeadersToScan(headers http.Header, cfg *config.RequestBodyScanni
 			}
 			out[canonical] = values
 		}
+		// Last-Event-ID is a credential-bearing SSE resume cursor and is scanned
+		// unconditionally in every other header-selection path; reinsert it here so
+		// IgnoreHeaders cannot exempt it in all-header mode (fail closed).
+		if values := headers.Values(listenerLastEventID); len(values) > 0 {
+			out[http.CanonicalHeaderKey(listenerLastEventID)] = values
+		}
 		return out
 	}
 
 	sensitiveHeaders := cfg.SensitiveHeaders
 	if len(sensitiveHeaders) == 0 {
 		sensitiveHeaders = defaultMCPListenerSensitiveHeaders
+	} else {
+		sensitiveHeaders = append([]string{}, sensitiveHeaders...)
+		sensitiveHeaders = append(sensitiveHeaders, listenerLastEventID)
 	}
 	return mcpListenerExplicitHeaders(headers, sensitiveHeaders)
 }

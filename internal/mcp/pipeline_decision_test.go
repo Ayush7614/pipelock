@@ -515,7 +515,7 @@ func TestEmitMCPDecision_V2EmitErrorSurfacesAfterV1(t *testing.T) {
 	}
 }
 
-func TestEmitMCPDecision_RequiredV2EmitErrorFailsClosed(t *testing.T) {
+func TestEmitMCPDecision_RequiredV1SuccessSatisfiesV2EmitError(t *testing.T) {
 	h := newMCPDecisionReceiptHarness(t)
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -541,11 +541,8 @@ func TestEmitMCPDecision_RequiredV2EmitErrorFailsClosed(t *testing.T) {
 		},
 		RequireReceipt: true,
 	})
-	if !errors.Is(err, ErrReceiptRequired) {
-		t.Fatalf("EmitMCPDecision error = %v, want ErrReceiptRequired", err)
-	}
-	if !strings.Contains(err.Error(), "v2 record failed") {
-		t.Fatalf("EmitMCPDecision error = %v, want v2 record failure", err)
+	if err != nil {
+		t.Fatalf("EmitMCPDecision error = %v, want nil because v1 emitted", err)
 	}
 	receipts := decisionReceiptLogFor(t, h.dir)
 	if len(receipts) != 1 {
@@ -553,6 +550,75 @@ func TestEmitMCPDecision_RequiredV2EmitErrorFailsClosed(t *testing.T) {
 	}
 	if receipts[0].ActionRecord.DecisionPhase != receipt.DecisionPhaseIntent {
 		t.Fatalf("decision_phase = %q, want %q", receipts[0].ActionRecord.DecisionPhase, receipt.DecisionPhaseIntent)
+	}
+}
+
+func TestEmitMCPDecision_RequiredV2SuccessSatisfiesV1EmitError(t *testing.T) {
+	h := newMCPDecisionReceiptHarness(t)
+	h.v1.MarkUnhealthy(errors.New("v1 unavailable"))
+
+	_, err := EmitMCPDecision(h.v1, h.v2, nil, MCPDecision{
+		Receipt: receipt.EmitOpts{
+			ActionID:   "mcp-v1-required-error",
+			Verdict:    config.ActionAllow,
+			Transport:  transportMCPStdio,
+			Target:     "fetch",
+			MCPMethod:  methodToolsCall,
+			ToolName:   "fetch",
+			PolicyHash: mcpTestPolicyHash,
+		},
+		RequireReceipt: true,
+	})
+	if err != nil {
+		t.Fatalf("EmitMCPDecision error = %v, want nil because v2 emitted", err)
+	}
+	if receipts := mcpV2Receipts(t, h); len(receipts) != 1 {
+		t.Fatalf("v2 receipts = %d, want 1", len(receipts))
+	}
+}
+
+func TestEmitMCPDecision_RequiredV2OnlyAllowSucceeds(t *testing.T) {
+	// Exercise the v2-only path with a nil v1 emitter (the receiptEmitter == nil
+	// branch): a required allow with only the v2 emitter present must succeed and
+	// record exactly one v2 receipt. The v2 receipt carries no decision phase, so
+	// only emission is asserted.
+	h := newMCPDecisionReceiptHarness(t)
+
+	_, err := EmitMCPDecision(nil, h.v2, nil, MCPDecision{
+		Receipt: receipt.EmitOpts{
+			ActionID:   "mcp-v2-only-allow",
+			Verdict:    config.ActionAllow,
+			Transport:  transportMCPStdio,
+			Target:     "fetch",
+			MCPMethod:  methodToolsCall,
+			ToolName:   "fetch",
+			PolicyHash: mcpTestPolicyHash,
+		},
+		RequireReceipt: true,
+	})
+	if err != nil {
+		t.Fatalf("EmitMCPDecision error = %v, want nil (v2-only allow)", err)
+	}
+	if receipts := mcpV2Receipts(t, h); len(receipts) != 1 {
+		t.Fatalf("v2 receipts = %d, want 1", len(receipts))
+	}
+}
+
+func TestEmitMCPDecision_RequiredNeitherEmitterEmitsFailsClosed(t *testing.T) {
+	_, err := EmitMCPDecision(nil, nil, nil, MCPDecision{
+		Receipt: receipt.EmitOpts{
+			ActionID:  "mcp-required-no-emitter",
+			Verdict:   config.ActionBlock,
+			Transport: transportMCPStdio,
+			Target:    "response:2",
+		},
+		RequireReceipt: true,
+	})
+	if !errors.Is(err, ErrReceiptRequired) {
+		t.Fatalf("EmitMCPDecision error = %v, want ErrReceiptRequired", err)
+	}
+	if !strings.Contains(err.Error(), "emitter unavailable") {
+		t.Fatalf("EmitMCPDecision error = %v, want emitter unavailable detail", err)
 	}
 }
 

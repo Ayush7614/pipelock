@@ -134,16 +134,32 @@ func TestListenerProtocolValidatorsRejectAmbiguousBoundaries(t *testing.T) {
 	})
 
 	t.Run("preflight", func(t *testing.T) {
-		req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "http://listener.example/", nil)
-		req.Header.Set("Access-Control-Request-Method", http.MethodGet)
-		if listenerCORSPreflightAllowed(req) {
-			t.Fatal("non-POST preflight was accepted")
+		for _, tc := range []struct {
+			method    string
+			wantAllow bool
+		}{
+			{http.MethodPost, true},
+			{http.MethodGet, true},
+			{http.MethodDelete, true},
+			{http.MethodPut, false},
+			{http.MethodPatch, false},
+		} {
+			t.Run(tc.method, func(t *testing.T) {
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "http://listener.example/", nil)
+				req.Header.Set("Access-Control-Request-Method", tc.method)
+				if got := listenerCORSPreflightAllowed(req); got != tc.wantAllow {
+					t.Fatalf("%s preflight allowed = %v, want %v", tc.method, got, tc.wantAllow)
+				}
+			})
 		}
-		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
-		req.Header.Set("Access-Control-Request-Headers", " , Authorization")
-		if !listenerCORSPreflightAllowed(req) {
-			t.Fatal("empty requested-header element invalidated an otherwise valid preflight")
-		}
+		t.Run("empty requested-header element", func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "http://listener.example/", nil)
+			req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+			req.Header.Set("Access-Control-Request-Headers", " , Authorization")
+			if !listenerCORSPreflightAllowed(req) {
+				t.Fatal("empty requested-header element invalidated an otherwise valid preflight")
+			}
+		})
 	})
 
 	t.Run("visible singleton", func(t *testing.T) {
