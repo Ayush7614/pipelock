@@ -53,7 +53,10 @@ func testInterceptSetup(t *testing.T) (*certgen.CertCache, *x509.CertPool, *conf
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache := certgen.NewCertCache(ca, caKey, time.Hour, 100)
+	cache, err := certgen.NewCertCache(ca, caKey, time.Hour, 100)
+	if err != nil {
+		t.Fatalf("NewCertCache: %v", err)
+	}
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
 
@@ -2608,28 +2611,6 @@ func TestInterceptTunnel_CompressedResponseBlockedViaRoundTripper(t *testing.T) 
 	if !strings.Contains(string(body), "compressed response cannot be scanned") {
 		t.Errorf("body = %q, want to contain compressed response block message", body)
 	}
-}
-
-func TestNewCertCache_PanicsOnNilCA(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic for nil CA")
-		}
-	}()
-	certgen.NewCertCache(nil, nil, time.Hour, 100)
-}
-
-func TestNewCertCache_PanicsOnZeroMaxSize(t *testing.T) {
-	ca, caKey, _, err := certgen.GenerateCA("Test", 24*time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic for zero maxSize")
-		}
-	}()
-	certgen.NewCertCache(ca, caKey, time.Hour, 0)
 }
 
 func TestNewTLSInterceptTransport_Config(t *testing.T) {
