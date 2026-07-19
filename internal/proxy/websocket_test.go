@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,8 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/blockreason"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
@@ -155,6 +158,10 @@ func setupWSProxy(t *testing.T, cfgMod func(*config.Config)) (string, func()) {
 }
 
 func setupWSProxyDefaultWithProxy(t *testing.T, cfgMod func(*config.Config)) (string, *Proxy, func()) {
+	return setupWSProxyDefaultWithCaptureAndProxy(t, cfgMod, nil)
+}
+
+func setupWSProxyDefaultWithCaptureAndProxy(t *testing.T, cfgMod func(*config.Config), obs capture.CaptureObserver) (string, *Proxy, func()) {
 	t.Helper()
 
 	cfg := config.Defaults()
@@ -175,7 +182,11 @@ func setupWSProxyDefaultWithProxy(t *testing.T, cfgMod func(*config.Config)) (st
 	logger := audit.NewNop()
 	sc := scanner.MustNew(cfg)
 	m := metrics.New()
-	p, err := New(cfg, logger, sc, m)
+	var opts []Option
+	if obs != nil {
+		opts = append(opts, WithCaptureObserver(obs))
+	}
+	p, err := New(cfg, logger, sc, m, opts...)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
@@ -257,20 +268,7 @@ func dialWS(t *testing.T, proxyAddr, backendAddr string) net.Conn {
 func assertWSHandshakeStatus(t *testing.T, proxyAddr, backendAddr string, want int) {
 	t.Helper()
 
-	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp4", proxyAddr)
-	if err != nil {
-		t.Fatalf("dial proxy: %v", err)
-	}
-	defer func() {
-		if closeErr := conn.Close(); closeErr != nil {
-			t.Errorf("proxy connection close: %v", closeErr)
-		}
-	}()
-	_, _ = fmt.Fprintf(conn, "GET /ws?url=ws://%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", backendAddr, proxyAddr)
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		t.Fatalf("read websocket handshake response: %v", err)
-	}
+	resp := requestWSHandshake(t, proxyAddr, backendAddr, nil)
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			t.Errorf("response body close: %v", closeErr)
@@ -278,6 +276,58 @@ func assertWSHandshakeStatus(t *testing.T, proxyAddr, backendAddr string, want i
 	}()
 	if resp.StatusCode != want {
 		t.Fatalf("websocket handshake status = %d, want %d", resp.StatusCode, want)
+	}
+}
+
+func requestWSHandshake(t *testing.T, proxyAddr, backendAddr string, headers http.Header) *http.Response {
+	t.Helper()
+
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp4", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set handshake deadline: %v", err)
+	}
+	_, _ = fmt.Fprintf(conn, "GET /ws?url=ws://%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", backendAddr, proxyAddr)
+	for name, values := range headers {
+		for _, value := range values {
+			_, _ = fmt.Fprintf(conn, "%s: %s\r\n", name, value)
+		}
+	}
+	_, _ = fmt.Fprint(conn, "\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read websocket handshake response: %v", err)
+	}
+	return resp
+}
+
+type wsDLPRecordObserver struct {
+	capture.NopObserver
+	ch chan capture.DLPVerdictRecord
+}
+
+func newWSDLPRecordObserver() *wsDLPRecordObserver {
+	return &wsDLPRecordObserver{ch: make(chan capture.DLPVerdictRecord, 4)}
+}
+
+func (o *wsDLPRecordObserver) ObserveDLPVerdict(_ context.Context, rec *capture.DLPVerdictRecord) {
+	if rec == nil || rec.Subsurface != "dlp_ws_header" {
+		return
+	}
+	o.ch <- *rec
+}
+
+func waitWSDLPRecord(t *testing.T, obs *wsDLPRecordObserver) capture.DLPVerdictRecord {
+	t.Helper()
+	select {
+	case rec := <-obs.ch:
+		return rec
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for websocket header DLP capture record")
+		return capture.DLPVerdictRecord{}
 	}
 }
 
@@ -784,6 +834,83 @@ func TestWSProxyRequireReceipts_UpstreamDialFailureEmitsOutcome(t *testing.T) {
 		if !strings.Contains(outcome.ActionRecord.Pattern, want) {
 			t.Fatalf("outcome pattern = %q, want %s", outcome.ActionRecord.Pattern, want)
 		}
+	}
+}
+
+func TestWSProxySSRFDialBlockWritesPolicyClose(t *testing.T) {
+	const rebindHost = "rebind.test"
+
+	cfg := config.Defaults()
+	cfg.WebSocketProxy.Enabled = true
+	cfg.DNS.HostOverrides = map[string][]string{rebindHost: {"8.8.8.8"}}
+	logger := audit.NewNop()
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+
+	dialCfg := config.Defaults()
+	dialCfg.DNS.HostOverrides = map[string][]string{rebindHost: {"127.0.0.1"}}
+	dialSc := scanner.MustNew(dialCfg)
+	t.Cleanup(dialSc.Close)
+
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), ctxKeyAgentScanner, dialSc))
+	t.Cleanup(cancel)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p.handleWebSocket(w, r)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		BaseContext: func(_ net.Listener) context.Context {
+			return ctx
+		},
+	}
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		_ = srv.Shutdown(shutdownCtx)
+	})
+	go func() {
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Errorf("serve websocket proxy: %v", serveErr)
+		}
+	}()
+
+	conn, err := dialWSConn(ln.Addr().String(), net.JoinHostPort(rebindHost, "443"))
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if deadlineErr := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); deadlineErr != nil {
+		t.Fatalf("set read deadline: %v", deadlineErr)
+	}
+
+	hdr, err := ws.ReadHeader(conn)
+	if err != nil {
+		t.Fatalf("read close frame header: %v", err)
+	}
+	if hdr.OpCode != ws.OpClose {
+		t.Fatalf("opcode = %v, want OpClose", hdr.OpCode)
+	}
+	payload := make([]byte, hdr.Length)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		t.Fatalf("read close frame payload: %v", err)
+	}
+	if len(payload) < 2 {
+		t.Fatalf("close frame payload length = %d, want status code", len(payload))
+	}
+	if got := ws.StatusCode(binary.BigEndian.Uint16(payload[:2])); got != ws.StatusPolicyViolation {
+		t.Fatalf("close code = %v, want %v", got, ws.StatusPolicyViolation)
+	}
+	if !strings.Contains(string(payload[2:]), string(blockreason.SSRFDNSRebind)) {
+		t.Fatalf("close payload = %q, want %s", string(payload[2:]), blockreason.SSRFDNSRebind)
 	}
 }
 
@@ -1777,6 +1904,188 @@ func TestWSProxyHeaderDLPBlock(t *testing.T) {
 	// The proxy writes an HTTP 403 before upgrade, so Dial returns an error.
 	if err == nil {
 		t.Fatal("expected dial to fail due to DLP in auth header")
+	}
+}
+
+func TestWSProxyHeaderDLPDisablePatternAllowsNonCore(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
+
+	blockingProxyAddr, blockingProxyCleanup := setupWSProxy(t, func(cfg *config.Config) {
+		addBodyDLPTestPattern(cfg)
+	})
+	defer blockingProxyCleanup()
+
+	blockedResp := requestWSHandshake(t, blockingProxyAddr, backendAddr, http.Header{
+		"Authorization": []string{"Bearer " + fakeBodyDLPSecret()},
+	})
+	defer func() { _ = blockedResp.Body.Close() }()
+	if blockedResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("control status = %d, want %d", blockedResp.StatusCode, http.StatusForbidden)
+	}
+	if got := blockedResp.Header.Get("X-Pipelock-Block-Reason"); got != string(blockreason.DLPMatch) {
+		t.Fatalf("control X-Pipelock-Block-Reason = %q, want %q", got, blockreason.DLPMatch)
+	}
+
+	proxyAddr, proxyCleanup := setupWSProxy(t, func(cfg *config.Config) {
+		addBodyDLPTestPattern(cfg)
+		cfg.RequestBodyScanning.DisablePatterns = []string{testBodyDLPPatternName}
+	})
+	defer proxyCleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wsURL := fmt.Sprintf("ws://%s/ws?url=ws://%s", proxyAddr, backendAddr)
+	dialer := ws.Dialer{
+		Header: ws.HandshakeHeaderHTTP(http.Header{
+			"Authorization": []string{"Bearer " + fakeBodyDLPSecret()},
+		}),
+		Timeout: 5 * time.Second,
+	}
+
+	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	if err != nil {
+		t.Fatalf("disabled non-core header DLP should allow websocket dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+}
+
+func TestWSProxyHeaderDLPAdaptiveWarnUpgradeBlocks(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
+
+	cfg := adaptiveConfig()
+	cfg.WebSocketProxy.Enabled = true
+	addBodyDLPTestPattern(cfg)
+	cfg.RequestBodyScanning.PatternActions = map[string]string{testBodyDLPPatternName: config.ActionWarn}
+
+	logger := audit.NewNop()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+	m := metrics.New()
+	p, err := New(cfg, logger, sc, m)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	defer p.Close()
+
+	sm := p.sessionMgrPtr.Load()
+	rec := sm.GetOrCreate(adaptiveSessionKeyHTTPTest)
+	escalateRec(rec, 1)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/ws?url=ws://"+backendAddr, nil)
+	req.Header.Set("Authorization", "Bearer "+fakeBodyDLPSecret())
+	w := httptest.NewRecorder()
+
+	p.handleWebSocket(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "escalated") {
+		t.Fatalf("body = %q, want escalated DLP block", w.Body.String())
+	}
+}
+
+func TestWSProxyHeaderDLPSessionAnomalyBlocksHandshake(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
+
+	obs := newWSDLPRecordObserver()
+	proxyAddr, p, proxyCleanup := setupWSProxyDefaultWithCaptureAndProxy(t, func(cfg *config.Config) {
+		addBodyDLPTestPattern(cfg)
+		cfg.RequestBodyScanning.PatternActions = map[string]string{testBodyDLPPatternName: config.ActionWarn}
+		cfg.SessionProfiling.Enabled = true
+		cfg.SessionProfiling.AnomalyAction = config.ActionWarn
+		cfg.SessionProfiling.DomainBurst = 100
+		cfg.BehavioralBaseline = *testBaselineBlockConfig(t)
+		cfg.BehavioralBaseline.LockDimensions = []string{"requests"}
+	}, obs)
+	defer proxyCleanup()
+
+	sm := p.sessionMgrPtr.Load()
+	lockHTTPBaseline(t, sm, "agent-a")
+
+	resp := requestWSHandshake(t, proxyAddr, backendAddr, http.Header{
+		"Authorization": []string{"Bearer " + fakeBodyDLPSecret()},
+		AgentHeader:     []string{"agent-a"},
+	})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if got := resp.Header.Get("X-Pipelock-Block-Reason"); got != string(blockreason.SessionAnomaly) {
+		t.Fatalf("X-Pipelock-Block-Reason = %q, want %q", got, blockreason.SessionAnomaly)
+	}
+
+	rec := waitWSDLPRecord(t, obs)
+	if rec.EffectiveAction != config.ActionWarn {
+		t.Fatalf("EffectiveAction = %q, want %q", rec.EffectiveAction, config.ActionWarn)
+	}
+	if !strings.Contains(rec.SkipReason, testBodyDLPPatternName) {
+		t.Fatalf("SkipReason = %q, want pattern %q", rec.SkipReason, testBodyDLPPatternName)
+	}
+}
+
+func TestWSProxyHeaderDLPPatternWarnOverrideAllowsNonCore(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
+
+	obs := newWSDLPRecordObserver()
+	proxyAddr, _, proxyCleanup := setupWSProxyDefaultWithCaptureAndProxy(t, func(cfg *config.Config) {
+		addBodyDLPTestPattern(cfg)
+		cfg.RequestBodyScanning.PatternActions = map[string]string{testBodyDLPPatternName: config.ActionWarn}
+	}, obs)
+	defer proxyCleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wsURL := fmt.Sprintf("ws://%s/ws?url=ws://%s", proxyAddr, backendAddr)
+	dialer := ws.Dialer{
+		Header: ws.HandshakeHeaderHTTP(http.Header{
+			"Authorization": []string{"Bearer " + fakeBodyDLPSecret()},
+		}),
+		Timeout: 5 * time.Second,
+	}
+
+	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	if err != nil {
+		t.Fatalf("warn-only non-core header DLP should allow websocket dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	rec := waitWSDLPRecord(t, obs)
+	if rec.EffectiveAction != config.ActionWarn {
+		t.Fatalf("EffectiveAction = %q, want %q", rec.EffectiveAction, config.ActionWarn)
+	}
+	if rec.Outcome != capture.OutcomeWarned {
+		t.Fatalf("Outcome = %q, want %q", rec.Outcome, capture.OutcomeWarned)
+	}
+	if !strings.Contains(rec.SkipReason, testBodyDLPPatternName) {
+		t.Fatalf("SkipReason = %q, want pattern %q", rec.SkipReason, testBodyDLPPatternName)
+	}
+}
+
+func TestWSProxyHeaderDLPDisabledPatternDoesNotMaskCoreMatch(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
+
+	proxyAddr, proxyCleanup := setupWSProxy(t, func(cfg *config.Config) {
+		addBodyDLPTestPattern(cfg)
+		cfg.RequestBodyScanning.DisablePatterns = []string{testBodyDLPPatternName}
+	})
+	defer proxyCleanup()
+
+	resp := requestWSHandshake(t, proxyAddr, backendAddr, http.Header{
+		"Authorization": []string{"Bearer " + fakeBodyDLPSecret()},
+		"X-Api-Key":     []string{fakeAPIKey()},
+	})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if got := resp.Header.Get("X-Pipelock-Block-Reason"); got != string(blockreason.DLPMatch) {
+		t.Fatalf("X-Pipelock-Block-Reason = %q, want %q", got, blockreason.DLPMatch)
 	}
 }
 

@@ -7,16 +7,22 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -49,6 +55,20 @@ func fakeAPIKey() string {
 
 func fakeGitHubToken() string {
 	return "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl"
+}
+
+const testBodyDLPPatternName = "Request Body Test Secret"
+
+func fakeBodyDLPSecret() string {
+	return "REQDLPTEST-" + "ABCDEF123456"
+}
+
+func addBodyDLPTestPattern(cfg *config.Config) {
+	cfg.DLP.Patterns = append(cfg.DLP.Patterns, config.DLPPattern{
+		Name:     testBodyDLPPatternName,
+		Regex:    `REQDLPTEST-[A-Z0-9]{12}`,
+		Severity: config.SeverityCritical,
+	})
 }
 
 func stackedBodyDLPFixture(secret string, layers int) string {
@@ -87,6 +107,490 @@ func TestScanRequestBody_JSONWithSecret(t *testing.T) {
 	if got := result.DLPMatches[0].PatternName; got != "AWS Access ID" {
 		t.Fatalf("pattern = %q, want AWS Access ID", got)
 	}
+}
+
+func TestScanRequestBody_DisablePatternsAndPatternActions(t *testing.T) {
+	cases := []struct {
+		name            string
+		body            string
+		defaultAction   string
+		disablePatterns []string
+		patternActions  map[string]string
+		wantClean       bool
+		wantAction      string
+		wantPatterns    []string
+	}{
+		{
+			name:            "disabled pattern allows body",
+			body:            `{"key":"` + fakeBodyDLPSecret() + `"}`,
+			disablePatterns: []string{testBodyDLPPatternName},
+			wantClean:       true,
+		},
+		{
+			name:            "non-disabled pattern still blocks same body",
+			body:            `{"custom":"` + fakeBodyDLPSecret() + `","aws":"` + fakeAPIKey() + `"}`,
+			disablePatterns: []string{testBodyDLPPatternName},
+			wantAction:      config.ActionBlock,
+			wantPatterns:    []string{"AWS Access ID"},
+		},
+		{
+			name:           "pattern action block overrides global warn",
+			body:           `{"key":"` + fakeBodyDLPSecret() + `"}`,
+			defaultAction:  config.ActionWarn,
+			patternActions: map[string]string{testBodyDLPPatternName: config.ActionBlock},
+			wantAction:     config.ActionBlock,
+			wantPatterns:   []string{testBodyDLPPatternName},
+		},
+		{
+			name:           "pattern action warn overrides global block",
+			body:           `{"key":"` + fakeBodyDLPSecret() + `"}`,
+			patternActions: map[string]string{testBodyDLPPatternName: config.ActionWarn},
+			wantAction:     config.ActionWarn,
+			wantPatterns:   []string{testBodyDLPPatternName},
+		},
+		{
+			name:           "warn override does not mask later core match",
+			body:           `{"custom":"` + fakeBodyDLPSecret() + `","aws":"` + fakeAPIKey() + `"}`,
+			patternActions: map[string]string{testBodyDLPPatternName: config.ActionWarn},
+			wantAction:     config.ActionBlock,
+			wantPatterns:   []string{testBodyDLPPatternName, "AWS Access ID"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testScannerConfig()
+			addBodyDLPTestPattern(cfg)
+			if tc.defaultAction != "" {
+				cfg.RequestBodyScanning.Action = tc.defaultAction
+			}
+			cfg.RequestBodyScanning.DisablePatterns = tc.disablePatterns
+			cfg.RequestBodyScanning.PatternActions = tc.patternActions
+			sc := scanner.MustNew(cfg)
+			defer sc.Close()
+
+			_, result := scanRequestBody(context.Background(), BodyScanRequest{
+				Body:            strings.NewReader(tc.body),
+				ContentType:     contentTypeJSON,
+				MaxBytes:        cfg.RequestBodyScanning.MaxBodyBytes,
+				Scanner:         sc,
+				Action:          cfg.RequestBodyScanning.Action,
+				DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
+				PatternActions:  cfg.RequestBodyScanning.PatternActions,
+			})
+
+			if result.Clean != tc.wantClean {
+				t.Fatalf("Clean = %v, want %v; matches=%v", result.Clean, tc.wantClean, dlpMatchNames(result.DLPMatches))
+			}
+			if tc.wantClean {
+				if len(result.DLPMatches) != 0 {
+					t.Fatalf("DLPMatches = %v, want none", dlpMatchNames(result.DLPMatches))
+				}
+				return
+			}
+			if result.Action != tc.wantAction {
+				t.Fatalf("Action = %q, want %q", result.Action, tc.wantAction)
+			}
+			for _, want := range tc.wantPatterns {
+				if !hasDLPMatchName(result.DLPMatches, want) {
+					t.Fatalf("DLPMatches = %v, missing %q", dlpMatchNames(result.DLPMatches), want)
+				}
+			}
+			for _, disabled := range tc.disablePatterns {
+				if hasDLPMatchName(result.DLPMatches, disabled) {
+					t.Fatalf("disabled pattern %q still present in matches %v", disabled, dlpMatchNames(result.DLPMatches))
+				}
+			}
+		})
+	}
+}
+
+func TestRequestDLPPatternControlsAcrossTransports(t *testing.T) {
+	t.Run("forward HTTP", func(t *testing.T) {
+		runForwardHTTPHeaderDLPPatternControls(t)
+	})
+	t.Run("intercepted CONNECT", func(t *testing.T) {
+		runInterceptHeaderDLPPatternControls(t)
+	})
+	t.Run("reverse", func(t *testing.T) {
+		runReverseHeaderDLPPatternControls(t)
+	})
+}
+
+func requestDLPPatternControlCases() []struct {
+	name            string
+	configure       func(*config.Config)
+	wantStatus      int
+	wantUpstreamHit bool
+} {
+	return []struct {
+		name            string
+		configure       func(*config.Config)
+		wantStatus      int
+		wantUpstreamHit bool
+	}{
+		{
+			name: "disabled pattern omitted and forwarded",
+			configure: func(cfg *config.Config) {
+				cfg.RequestBodyScanning.Action = config.ActionBlock
+				cfg.RequestBodyScanning.DisablePatterns = []string{testBodyDLPPatternName}
+			},
+			wantStatus:      http.StatusOK,
+			wantUpstreamHit: true,
+		},
+		{
+			name: "pattern block overrides global warn",
+			configure: func(cfg *config.Config) {
+				cfg.RequestBodyScanning.Action = config.ActionWarn
+				cfg.RequestBodyScanning.PatternActions = map[string]string{testBodyDLPPatternName: config.ActionBlock}
+			},
+			wantStatus:      http.StatusForbidden,
+			wantUpstreamHit: false,
+		},
+	}
+}
+
+func runForwardHTTPHeaderDLPPatternControls(t *testing.T) {
+	t.Helper()
+
+	for _, tc := range requestDLPPatternControlCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamHit atomic.Bool
+			backend := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHit.Store(true)
+				if got := r.Header.Get("Authorization"); !strings.Contains(got, fakeBodyDLPSecret()) {
+					t.Fatalf("Authorization header = %q, want test secret", got)
+				}
+				_, _ = fmt.Fprint(w, "ok")
+			}))
+			t.Cleanup(backend.Close)
+
+			proxyAddr, p, cleanup := setupForwardProxyWithInstance(t, func(cfg *config.Config) {
+				cfg.Mode = config.ModeStrict
+				cfg.RequestBodyScanning.Enabled = true
+				cfg.RequestBodyScanning.ScanHeaders = true
+				cfg.RequestBodyScanning.HeaderMode = config.HeaderModeSensitive
+				cfg.RequestBodyScanning.SensitiveHeaders = []string{"Authorization"}
+				addBodyDLPTestPattern(cfg)
+				tc.configure(cfg)
+			})
+			t.Cleanup(cleanup)
+			installForwardTestDialer(p, backend.Listener.Addr().String())
+
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://api.example.com/v1/chat", nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+fakeBodyDLPSecret())
+
+			resp, err := forwardHTTPClient(t, proxyAddr).Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			t.Cleanup(func() { _ = resp.Body.Close() })
+
+			if resp.StatusCode != tc.wantStatus {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if upstreamHit.Load() != tc.wantUpstreamHit {
+				t.Fatalf("upstream hit = %v, want %v", upstreamHit.Load(), tc.wantUpstreamHit)
+			}
+		})
+	}
+}
+
+func runInterceptHeaderDLPPatternControls(t *testing.T) {
+	t.Helper()
+
+	for _, tc := range requestDLPPatternControlCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamHit atomic.Bool
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHit.Store(true)
+				if got := r.Header.Get("Authorization"); !strings.Contains(got, fakeBodyDLPSecret()) {
+					t.Fatalf("Authorization header = %q, want test secret", got)
+				}
+				_, _ = fmt.Fprint(w, "ok")
+			}))
+			t.Cleanup(upstream.Close)
+
+			cache, pool, cfg, _, logger, m := testInterceptSetup(t)
+			cfg.Mode = config.ModeStrict
+			host := upstream.Listener.Addr().(*net.TCPAddr).IP.String()
+			cfg.APIAllowlist = []string{host}
+			cfg.RequestBodyScanning.Enabled = true
+			cfg.RequestBodyScanning.ScanHeaders = true
+			cfg.RequestBodyScanning.HeaderMode = config.HeaderModeSensitive
+			cfg.RequestBodyScanning.SensitiveHeaders = []string{"Authorization"}
+			addBodyDLPTestPattern(cfg)
+			tc.configure(cfg)
+			sc := scanner.MustNew(cfg)
+			t.Cleanup(sc.Close)
+
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+upstream.Listener.Addr().String()+"/api", nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+fakeBodyDLPSecret())
+
+			resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.wantStatus {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if upstreamHit.Load() != tc.wantUpstreamHit {
+				t.Fatalf("upstream hit = %v, want %v", upstreamHit.Load(), tc.wantUpstreamHit)
+			}
+		})
+	}
+}
+
+func runReverseHeaderDLPPatternControls(t *testing.T) {
+	t.Helper()
+
+	for _, tc := range requestDLPPatternControlCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := reverseTestConfig()
+			cfg.Mode = config.ModeStrict
+			cfg.RequestBodyScanning.ScanHeaders = true
+			cfg.RequestBodyScanning.HeaderMode = "all"
+			addBodyDLPTestPattern(cfg)
+			tc.configure(cfg)
+
+			var upstreamHit atomic.Bool
+			upstream := func(w http.ResponseWriter, r *http.Request) {
+				upstreamHit.Store(true)
+				if got := r.Header.Get("Authorization"); !strings.Contains(got, fakeBodyDLPSecret()) {
+					t.Fatalf("Authorization header = %q, want test secret", got)
+				}
+				_, _ = fmt.Fprint(w, "ok")
+			}
+			proxy := reverseTestSetup(t, cfg, upstream)
+
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, proxy.URL+"/api/data", nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+fakeBodyDLPSecret())
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			t.Cleanup(func() { _ = resp.Body.Close() })
+
+			if resp.StatusCode != tc.wantStatus {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if upstreamHit.Load() != tc.wantUpstreamHit {
+				t.Fatalf("upstream hit = %v, want %v", upstreamHit.Load(), tc.wantUpstreamHit)
+			}
+		})
+	}
+}
+
+func TestScanRequestBody_DisablePatternsMatchDynamicRuntimeNames(t *testing.T) {
+	const (
+		fileSecret = "file-secret-value-5qP8mZr2TnY7"
+		seedPhrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+		hexHost    = "4a6f686e446f65.53656372657431.313233343536.exfil.evil.example.com"
+	)
+	envSecret := "envLeakValue" + "5qP8mZr2TnY7"
+
+	cases := []struct {
+		name        string
+		body        string
+		patternName string
+		setup       func(t *testing.T, cfg *config.Config)
+	}{
+		{
+			name:        "configured pattern",
+			body:        `{"key":"` + fakeBodyDLPSecret() + `"}`,
+			patternName: testBodyDLPPatternName,
+			setup: func(_ *testing.T, cfg *config.Config) {
+				addBodyDLPTestPattern(cfg)
+			},
+		},
+		{
+			name:        "canary token",
+			body:        `{"token":"canary-token-value-12345"}`,
+			patternName: "Canary Token (body-canary)",
+			setup: func(_ *testing.T, cfg *config.Config) {
+				cfg.CanaryTokens.Enabled = true
+				cfg.CanaryTokens.Tokens = []config.CanaryToken{{
+					Name:  "body-canary",
+					Value: "canary-token-value-12345",
+				}}
+			},
+		},
+		{
+			name:        "environment leak",
+			body:        `{"value":"` + envSecret + `"}`,
+			patternName: "Environment Variable Leak",
+			setup: func(t *testing.T, cfg *config.Config) {
+				t.Setenv("PIPELOCK_BODY_DLP_TEST_SECRET", envSecret)
+				cfg.DLP.ScanEnv = true
+			},
+		},
+		{
+			name:        "known secret file leak",
+			body:        `{"value":"` + fileSecret + `"}`,
+			patternName: "Known Secret Leak",
+			setup: func(t *testing.T, cfg *config.Config) {
+				path := filepath.Join(t.TempDir(), "secrets.txt")
+				if err := os.WriteFile(path, []byte(fileSecret+"\n"), 0o600); err != nil {
+					t.Fatalf("write secrets file: %v", err)
+				}
+				cfg.DLP.SecretsFile = path
+			},
+		},
+		{
+			name:        "seed phrase",
+			body:        `{"phrase":"` + seedPhrase + `"}`,
+			patternName: "BIP-39 Seed Phrase",
+			setup:       func(_ *testing.T, _ *config.Config) {},
+		},
+		{
+			name:        "hostname exfiltration",
+			body:        `{"url":"https://` + hexHost + `/ping"}`,
+			patternName: "Hostname Exfiltration",
+			setup:       func(_ *testing.T, _ *config.Config) {},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testScannerConfig()
+			tc.setup(t, cfg)
+			sc := scanner.MustNew(cfg)
+			defer sc.Close()
+
+			_, detected := scanRequestBody(context.Background(), BodyScanRequest{
+				Body:        strings.NewReader(tc.body),
+				ContentType: contentTypeJSON,
+				MaxBytes:    cfg.RequestBodyScanning.MaxBodyBytes,
+				Scanner:     sc,
+				Action:      cfg.RequestBodyScanning.Action,
+			})
+			if detected.Clean || !hasDLPMatchName(detected.DLPMatches, tc.patternName) {
+				t.Fatalf("baseline DLPMatches = %v, want %q", dlpMatchNames(detected.DLPMatches), tc.patternName)
+			}
+
+			cfg = testScannerConfig()
+			tc.setup(t, cfg)
+			cfg.RequestBodyScanning.DisablePatterns = []string{tc.patternName}
+			sc = scanner.MustNew(cfg)
+			defer sc.Close()
+
+			_, disabled := scanRequestBody(context.Background(), BodyScanRequest{
+				Body:            strings.NewReader(tc.body),
+				ContentType:     contentTypeJSON,
+				MaxBytes:        cfg.RequestBodyScanning.MaxBodyBytes,
+				Scanner:         sc,
+				Action:          cfg.RequestBodyScanning.Action,
+				DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
+			})
+			if !disabled.Clean {
+				t.Fatalf("disabled DLPMatches = %v, want clean", dlpMatchNames(disabled.DLPMatches))
+			}
+		})
+	}
+}
+
+func TestScanRequestBody_NonCorePatternWarnOverrideSkipsCriticalHardBlock(t *testing.T) {
+	cfg := testScannerConfig()
+	addBodyDLPTestPattern(cfg)
+	cfg.RequestBodyScanning.PatternActions = map[string]string{testBodyDLPPatternName: config.ActionWarn}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:            strings.NewReader(`{"key":"` + fakeBodyDLPSecret() + `"}`),
+		ContentType:     contentTypeJSON,
+		MaxBytes:        cfg.RequestBodyScanning.MaxBodyBytes,
+		Scanner:         sc,
+		Action:          cfg.RequestBodyScanning.Action,
+		PatternActions:  cfg.RequestBodyScanning.PatternActions,
+		DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
+	})
+	if result.Clean {
+		t.Fatal("expected DLP finding")
+	}
+	if result.Action != config.ActionWarn {
+		t.Fatalf("Action = %q, want %q", result.Action, config.ActionWarn)
+	}
+	if shouldHardBlockBodyCriticalDLP(result, "api.vendor.example", cfg) {
+		t.Fatal("per-pattern warn override must not be erased by critical body-DLP hard block")
+	}
+}
+
+func TestScanRequestBody_CorePatternKnobsCannotWeakenCriticalFloor(t *testing.T) {
+	cfg := testScannerConfig()
+	cfg.RequestBodyScanning.DisablePatterns = []string{"AWS Access ID"}
+	cfg.RequestBodyScanning.PatternActions = map[string]string{"AWS Access ID": config.ActionWarn}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:            strings.NewReader(`{"key":"` + fakeAPIKey() + `"}`),
+		ContentType:     contentTypeJSON,
+		MaxBytes:        cfg.RequestBodyScanning.MaxBodyBytes,
+		Scanner:         sc,
+		Action:          cfg.RequestBodyScanning.Action,
+		PatternActions:  cfg.RequestBodyScanning.PatternActions,
+		DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
+	})
+	if result.Clean {
+		t.Fatal("core DLP finding was disabled")
+	}
+	if !hasDLPMatchName(result.DLPMatches, "AWS Access ID") {
+		t.Fatalf("DLPMatches = %v, want AWS Access ID", dlpMatchNames(result.DLPMatches))
+	}
+	if result.Action != config.ActionBlock {
+		t.Fatalf("Action = %q, want %q", result.Action, config.ActionBlock)
+	}
+	if !shouldHardBlockBodyCriticalDLP(result, "api.vendor.example", cfg) {
+		t.Fatal("core DLP warn override skipped critical hard block")
+	}
+}
+
+func TestScanRequestBody_PatternWarnOverrideStillFeedsAdaptiveUpgrade(t *testing.T) {
+	cfg := testScannerConfig()
+	addBodyDLPTestPattern(cfg)
+	cfg.RequestBodyScanning.PatternActions = map[string]string{testBodyDLPPatternName: config.ActionWarn}
+	cfg.AdaptiveEnforcement.Enabled = true
+	upgradeWarn := config.ActionBlock
+	cfg.AdaptiveEnforcement.Levels.Elevated.UpgradeWarn = &upgradeWarn
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:            strings.NewReader(`{"key":"` + fakeBodyDLPSecret() + `"}`),
+		ContentType:     contentTypeJSON,
+		MaxBytes:        cfg.RequestBodyScanning.MaxBodyBytes,
+		Scanner:         sc,
+		Action:          cfg.RequestBodyScanning.Action,
+		PatternActions:  cfg.RequestBodyScanning.PatternActions,
+		DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
+	})
+	if result.Action != config.ActionWarn {
+		t.Fatalf("Action = %q, want %q", result.Action, config.ActionWarn)
+	}
+	if got := decide.UpgradeAction(result.Action, 1, &cfg.AdaptiveEnforcement); got != config.ActionBlock {
+		t.Fatalf("UpgradeAction(per-pattern warn, elevated) = %q, want %q", got, config.ActionBlock)
+	}
+}
+
+func hasDLPMatchName(matches []scanner.TextDLPMatch, name string) bool {
+	for _, match := range matches {
+		if match.PatternName == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestScanRequestBody_StackedDecodeFixpoint(t *testing.T) {
@@ -865,6 +1369,51 @@ func TestScanRequestHeaders_XApiKey(t *testing.T) {
 	result := scanRequestHeaders(context.Background(), headers, cfg, sc)
 	if result == nil || result.Clean {
 		t.Fatal("expected DLP match in X-Api-Key header")
+	}
+}
+
+func TestScanRequestHeaders_DisabledPatternDoesNotMaskCoreMatch(t *testing.T) {
+	cfg := testScannerConfig()
+	addBodyDLPTestPattern(cfg)
+	cfg.RequestBodyScanning.DisablePatterns = []string{testBodyDLPPatternName}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+fakeBodyDLPSecret())
+	headers.Set("X-Api-Key", fakeAPIKey())
+
+	result := scanRequestHeaders(context.Background(), headers, cfg, sc)
+	if result == nil || result.Clean {
+		t.Fatal("expected non-disabled DLP match after disabled header match")
+	}
+	if !hasDLPMatchName(result.DLPMatches, "AWS Access ID") {
+		t.Fatalf("DLPMatches = %v, want AWS Access ID", dlpMatchNames(result.DLPMatches))
+	}
+}
+
+func TestScanRequestHeaders_WarnPatternDoesNotMaskCoreMatch(t *testing.T) {
+	cfg := testScannerConfig()
+	addBodyDLPTestPattern(cfg)
+	cfg.RequestBodyScanning.PatternActions = map[string]string{testBodyDLPPatternName: config.ActionWarn}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+fakeBodyDLPSecret())
+	headers.Set("X-Api-Key", fakeAPIKey())
+
+	result := scanRequestHeaders(context.Background(), headers, cfg, sc)
+	if result == nil || result.Clean {
+		t.Fatal("expected core DLP match after warn-only header match")
+	}
+	if result.Action != config.ActionBlock {
+		t.Fatalf("Action = %q, want %q", result.Action, config.ActionBlock)
+	}
+	for _, want := range []string{testBodyDLPPatternName, "AWS Access ID"} {
+		if !hasDLPMatchName(result.DLPMatches, want) {
+			t.Fatalf("DLPMatches = %v, missing %q", dlpMatchNames(result.DLPMatches), want)
+		}
 	}
 }
 

@@ -686,6 +686,7 @@ func newInterceptHandler(
 		})
 		r = r.WithContext(interceptScanCtx)
 		urlResult := ic.Scanner.Scan(interceptScanCtx, targetURL)
+		r = r.WithContext(withAllowedSSRFDialScanSnapshot(r.Context(), ic.Scanner, r.URL.Hostname(), urlResult))
 
 		// Capture observer: record intercept URL verdict for policy replay.
 		if ic.Proxy != nil {
@@ -914,6 +915,9 @@ func newInterceptHandler(
 				Path:            r.URL.Path,
 				Target:          targetURL,
 				Suppress:        ic.Config.Suppress,
+				Action:          ic.Config.RequestBodyScanning.Action,
+				DisablePatterns: ic.Config.RequestBodyScanning.DisablePatterns,
+				PatternActions:  ic.Config.RequestBodyScanning.PatternActions,
 			}
 			applyBodyScanRedaction(&bodyReq, redaction)
 			bodyBytes, result := scanRequestBody(r.Context(), bodyReq)
@@ -1163,10 +1167,14 @@ func newInterceptHandler(
 				hdrHasFinding := headerResult != nil && !headerResult.Clean
 				hdrAction := config.ActionAllow
 				if hdrHasFinding {
-					hdrAction = ic.Config.RequestBodyScanning.Action
-					if shouldHardBlockCriticalDLP(headerResult.DLPMatches, ic.Config.EnforceEnabled()) {
+					hdrAction = headerResult.Action
+					if hdrAction == "" {
+						hdrAction = ic.Config.RequestBodyScanning.Action
+					}
+					if shouldHardBlockRequestDLP(headerResult.DLPMatches, ic.Config) {
 						hdrAction = config.ActionBlock
 					}
+					hdrAction = decide.UpgradeAction(hdrAction, interceptEscalationLevel(ic), &ic.Config.AdaptiveEnforcement)
 				}
 				ic.Proxy.captureObs.ObserveDLPVerdict(r.Context(), &capture.DLPVerdictRecord{
 					Subsurface:        "dlp_header_intercept",
@@ -1187,21 +1195,48 @@ func newInterceptHandler(
 
 			if headerResult != nil && !headerResult.Clean {
 				hasFinding = true
-				action := ic.Config.RequestBodyScanning.Action
-				headerHardBlock := shouldHardBlockCriticalDLP(headerResult.DLPMatches, ic.Config.EnforceEnabled())
+				action := headerResult.Action
+				if action == "" {
+					action = ic.Config.RequestBodyScanning.Action
+				}
+				headerHardBlock := shouldHardBlockRequestDLP(headerResult.DLPMatches, ic.Config)
 				if headerHardBlock {
 					action = config.ActionBlock
 				}
+				originalAction := action
+				level := interceptEscalationLevel(ic)
+				action = decide.UpgradeAction(action, level, &ic.Config.AdaptiveEnforcement)
+				escalatedBlock := action == config.ActionBlock && originalAction != config.ActionBlock
+				if action != originalAction {
+					sessionKey := sessionKeyFor(ic.Agent, ic.ClientIP)
+					var metricSet *metrics.Metrics
+					if ic.Proxy != nil {
+						metricSet = ic.Proxy.metrics
+					}
+					recordAdaptiveUpgrade(ic.Logger, metricSet, adaptiveUpgrade{
+						SessionKey: sessionKey,
+						Level:      session.EscalationLabel(level),
+						FromAction: originalAction,
+						ToAction:   action,
+						Scanner:    scanner.ScannerDLP,
+						ClientIP:   ic.ClientIP,
+						RequestID:  ic.RequestID,
+					})
+				}
+				reason := "request header contains secret"
+				if escalatedBlock && !ic.Config.EnforceEnabled() {
+					reason += " (escalated)"
+				}
 				// ActionAsk: no HITL terminal in intercepted tunnels, fail closed.
-				if headerHardBlock || action == config.ActionAsk || (action == config.ActionBlock && ic.Config.EnforceEnabled()) {
+				if headerHardBlock || action == config.ActionAsk || (action == config.ActionBlock && (ic.Config.EnforceEnabled() || escalatedBlock)) {
 					interceptRecordSignal(ic, session.SignalBlock)
-					ic.Logger.LogBlocked(actx, "header_dlp", "request header contains secret")
+					ic.Logger.LogBlocked(actx, "header_dlp", reason)
 					ic.Metrics.RecordTLSRequestBlocked("header_dlp")
 					_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
 						ActionID:  actionID,
 						Verdict:   config.ActionBlock,
 						Layer:     "header_dlp",
-						Pattern:   "request header contains secret",
+						Pattern:   reason,
 						Transport: "intercept",
 						Method:    r.Method,
 						Target:    targetURL,
@@ -1210,11 +1245,11 @@ func newInterceptHandler(
 					}))
 					writeBlockedError(w,
 						blockInfoFor(blockreason.DLPMatch, "header_dlp"),
-						"blocked: request header contains secret", http.StatusForbidden)
+						"blocked: "+reason, http.StatusForbidden)
 					return
 				}
 				// Audit mode: log but forward.
-				ic.Logger.LogAnomaly(actx, "header_dlp", "request header contains secret", 0.8) // 0.8: high confidence DLP match
+				ic.Logger.LogAnomaly(actx, "header_dlp", reason, 0.8) // 0.8: high confidence DLP match
 			}
 		}
 
@@ -1510,6 +1545,25 @@ func newInterceptHandler(
 		// Forward to upstream.
 		resp, err := upstream.RoundTrip(r)
 		if err != nil {
+			var ssrfErr *ssrfDialBlockError
+			if errors.As(err, &ssrfErr) {
+				ic.Logger.LogBlocked(actx, scanner.ScannerSSRF, ssrfErr.logDetail())
+				ic.Metrics.RecordTLSRequestBlocked("url_scan")
+				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
+					ActionID:  actionID,
+					Verdict:   config.ActionBlock,
+					Layer:     scanner.ScannerSSRF,
+					Pattern:   string(ssrfErr.reason),
+					Transport: "intercept",
+					Method:    r.Method,
+					Target:    targetURL,
+					RequestID: ic.RequestID,
+					Agent:     ic.Agent,
+				}))
+				writeBlockedError(w, ssrfErr.blockInfo(), "blocked: "+ssrfErr.detail, http.StatusForbidden)
+				emitBlockedPostRoundTripOutcome(http.StatusForbidden, string(ssrfErr.reason))
+				return
+			}
 			ic.Logger.LogError(actx, err)
 			http.Error(w, "upstream error", http.StatusBadGateway)
 			emitBlockedPostRoundTripOutcome(http.StatusBadGateway, "upstream_error")

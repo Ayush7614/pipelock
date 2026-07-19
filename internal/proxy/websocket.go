@@ -262,6 +262,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 	r = r.WithContext(wsScanCtx)
 	result := sc.Scan(wsScanCtx, scanURL)
+	r = r.WithContext(withAllowedSSRFDialScanSnapshot(r.Context(), sc, parsed.Hostname(), result))
 
 	// Capture observer: record WebSocket URL verdict for policy replay.
 	{
@@ -442,26 +443,36 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// DLP-scan forwarded header values regardless of destination or enforce mode.
 	// In audit mode, findings are logged as anomalies but traffic is allowed.
-	if blocked, hardBlock, reason := p.dlpScanWSHeaders(r.Context(), fwdHeaders, sc, cfg, targetURL); blocked {
-		// Capture observer: record WS header DLP verdict for policy replay.
-		p.captureObs.ObserveDLPVerdict(r.Context(), &capture.DLPVerdictRecord{
-			Subsurface:        "dlp_ws_header",
-			Transport:         TransportWS,
-			SessionID:         captureSessionKey(agent, clientIP),
-			SessionIDOriginal: captureSessionKeyOriginal(agent, clientIP),
-			RequestID:         requestID,
-			ConfigHash:        cfg.CanonicalPolicyHash(),
-			Agent:             agent,
-			Profile:           id.Profile,
-			// Header DLP captures describe the HTTP upgrade handshake, not
-			// later bidirectional frame semantics.
-			ActionClass:     captureHTTPActionClass(r.Method),
-			Request:         capture.CaptureRequest{Method: r.Method, URL: targetURL},
-			TransformKind:   capture.TransformHeaderValue,
-			EffectiveAction: config.ActionBlock,
-			Outcome:         capture.OutcomeBlocked,
-			SkipReason:      reason,
-		})
+	if blocked, hardBlock, action, reason := p.dlpScanWSHeaders(r.Context(), fwdHeaders, sc, cfg, targetURL); blocked {
+		captureHeaderDLP := func(effectiveAction, skipReason string) {
+			p.captureObs.ObserveDLPVerdict(r.Context(), &capture.DLPVerdictRecord{
+				Subsurface:        "dlp_ws_header",
+				Transport:         TransportWS,
+				SessionID:         captureSessionKey(agent, clientIP),
+				SessionIDOriginal: captureSessionKeyOriginal(agent, clientIP),
+				RequestID:         requestID,
+				ConfigHash:        cfg.CanonicalPolicyHash(),
+				Agent:             agent,
+				Profile:           id.Profile,
+				// Header DLP captures describe the HTTP upgrade handshake, not
+				// later bidirectional frame semantics.
+				ActionClass:     captureHTTPActionClass(r.Method),
+				Request:         capture.CaptureRequest{Method: r.Method, URL: targetURL},
+				TransformKind:   capture.TransformHeaderValue,
+				EffectiveAction: effectiveAction,
+				Outcome:         captureOutcome(effectiveAction, false),
+				SkipReason:      skipReason,
+			})
+		}
+		if action == "" {
+			action = cfg.RequestBodyScanning.Action
+		}
+		wsHeaderBlocked := hardBlock || (action == config.ActionBlock && cfg.EnforceEnabled())
+		if wsHeaderBlocked {
+			action = config.ActionBlock
+		} else {
+			action = config.ActionWarn
+		}
 		wsHasFinding = true
 		// Record session activity so adaptive enforcement sees header-DLP hits.
 		headerSR := p.recordSessionActivityWithUserAgent(sessionActivityOptions{
@@ -470,12 +481,41 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Hostname:   parsed.Hostname(),
 			RequestID:  requestID,
 			UserAgent:  r.UserAgent(),
-			Result:     scanner.Result{Allowed: false, Score: 0.9},
+			Result:     scanner.Result{Allowed: !wsHeaderBlocked, Score: 0.9},
 			Config:     cfg,
 			Logger:     log,
 			DeferClean: false,
 		})
-		if hardBlock || cfg.EnforceEnabled() {
+		if !wsHeaderBlocked && cfg.AdaptiveEnforcement.Enabled && headerSR.Level > 0 {
+			effectiveAction := decide.UpgradeAction(action, headerSR.Level, &cfg.AdaptiveEnforcement)
+			if effectiveAction == config.ActionBlock {
+				sessionKey := sessionKeyFor(agent, clientIP)
+				recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(headerSR.Level), FromAction: action, ToAction: effectiveAction, Scanner: audit.ScannerDLP, ClientIP: clientIP, RequestID: requestID})
+				action = effectiveAction
+				reason += " (escalated)"
+				wsHeaderBlocked = true
+			}
+		}
+		captureHeaderDLP(action, reason)
+		if !wsHeaderBlocked && headerSR.Blocked {
+			p.metrics.RecordWSBlocked()
+			emitWebSocketReceipt(receipt.EmitOpts{
+				ActionID:  receipt.NewActionID(),
+				Verdict:   config.ActionBlock,
+				Layer:     "session_profiling",
+				Pattern:   headerSR.Detail,
+				Transport: TransportWS,
+				Method:    "WS",
+				Target:    targetURL,
+				RequestID: requestID,
+				Agent:     agent,
+			})
+			writeBlockedError(w,
+				blockInfoFor(blockreason.SessionAnomaly, "session_profiling"),
+				headerSR.Detail, http.StatusForbidden)
+			return
+		}
+		if wsHeaderBlocked {
 			log.LogWSBlocked(targetURL, audit.DirectionClientToServer, audit.ScannerDLP, reason, clientIP, requestID)
 			p.metrics.RecordWSBlocked()
 			emitWebSocketReceipt(receipt.EmitOpts{
@@ -795,6 +835,27 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Dial upstream via SSRF-safe dialer.
 	upstreamConn, dialErr := p.wsDialUpstream(r.Context(), targetURL, fwdHeaders, cfg)
 	if dialErr != nil {
+		var ssrfErr *ssrfDialBlockError
+		if errors.As(dialErr, &ssrfErr) {
+			log.LogBlocked(actx, scanner.ScannerSSRF, ssrfErr.logDetail())
+			p.metrics.RecordWSBlocked()
+			emitWebSocketReceipt(receipt.EmitOpts{
+				ActionID:  actionID,
+				Verdict:   config.ActionBlock,
+				Layer:     scanner.ScannerSSRF,
+				Pattern:   string(ssrfErr.reason),
+				Transport: TransportWS,
+				Method:    "WS",
+				Target:    targetURL,
+				RequestID: requestID,
+				Agent:     agent,
+			})
+			plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation, ssrfErr.blockInfo().CloseFramePayload())
+			outcomeStatus = strconv.Itoa(int(ws.StatusPolicyViolation))
+			outcomeBytes = 0
+			outcomeReason = string(ssrfErr.reason)
+			return
+		}
 		log.LogError(actx, fmt.Errorf("upstream dial: %w", dialErr))
 		plwsutil.WriteCloseFrame(clientConn, ws.StatusInternalServerError, "upstream dial failed")
 		outcomeStatus = strconv.Itoa(int(ws.StatusInternalServerError))
@@ -975,10 +1036,13 @@ func (p *Proxy) buildWSForwardHeaders(r *http.Request, parsed *url.URL, cfg *con
 // dlpScanWSHeaders runs DLP scanning on all forwarded header values before the
 // upstream handshake. Headers are scanned regardless of destination (no
 // allowlist skip) because agents can exfiltrate secrets in any header value.
-func (p *Proxy) dlpScanWSHeaders(ctx context.Context, headers http.Header, sc *scanner.Scanner, cfg *config.Config, targetURL string) (blocked bool, hardBlock bool, reason string) {
+func (p *Proxy) dlpScanWSHeaders(ctx context.Context, headers http.Header, sc *scanner.Scanner, cfg *config.Config, targetURL string) (blocked bool, hardBlock bool, action string, reason string) {
+	disabled := bodyDLPDisabledSet(cfg.RequestBodyScanning.DisablePatterns)
 	// Scan all headers that buildWSForwardHeaders may forward. This covers
 	// auth headers, cookies, origin, subprotocol, and user-agent. An agent
 	// can exfiltrate data in any of these values.
+	var allMatches []scanner.TextDLPMatch
+	matchedHeaders := make([]string, 0, 2)
 	for _, key := range []string{
 		"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Cookie",
 		"Origin", "Sec-WebSocket-Protocol", "User-Agent",
@@ -989,18 +1053,34 @@ func (p *Proxy) dlpScanWSHeaders(ctx context.Context, headers http.Header, sc *s
 		}
 		result := sc.ScanTextForDLP(ctx, val)
 		if !result.Clean {
-			matches := unsuppressedDLPMatches(result.Matches, targetURL, cfg.Suppress)
+			matches := filterBodyDLPMatches(result.Matches, targetURL, cfg.Suppress, disabled)
 			if len(matches) == 0 {
 				continue
 			}
-			names := make([]string, len(matches))
-			for i, m := range matches {
-				names[i] = m.PatternName
-			}
-			return true, shouldHardBlockCriticalDLP(matches, cfg.EnforceEnabled()), fmt.Sprintf("DLP match in %s header: %s", key, strings.Join(names, ", "))
+			allMatches = append(allMatches, matches...)
+			matchedHeaders = append(matchedHeaders, key)
 		}
 	}
-	return false, false, ""
+	allMatches = uniqueBodyDLPMatches(allMatches)
+	if len(allMatches) > 0 {
+		names := make([]string, len(allMatches))
+		for i, m := range allMatches {
+			names[i] = m.PatternName
+		}
+		action := requestBodyDLPAction(allMatches, cfg.RequestBodyScanning.Action, cfg.RequestBodyScanning.PatternActions)
+		return true, shouldHardBlockRequestDLP(allMatches, cfg), action, fmt.Sprintf("DLP match in %s header: %s", wsHeaderDLPSource(matchedHeaders), strings.Join(names, ", "))
+	}
+	return false, false, "", ""
+}
+
+func wsHeaderDLPSource(headers []string) string {
+	switch len(headers) {
+	case 0:
+		return ""
+	case 1:
+		return headers[0]
+	}
+	return "multiple"
 }
 
 // isHostAllowlisted checks if a hostname matches any pattern in the allowlist.
@@ -1130,16 +1210,19 @@ func (r *wsRelay) scanClientMessageBody(ctx context.Context, msg []byte) ([]byte
 	}
 
 	bodyReq := BodyScanRequest{
-		Body:        bytes.NewReader(msg),
-		Method:      http.MethodGet,
-		ContentType: contentType,
-		MaxBytes:    maxBytes,
-		Scanner:     r.scanner,
-		AgentID:     r.agent,
-		Host:        r.hostname,
-		Path:        r.path,
-		Target:      r.targetURL,
-		Suppress:    r.cfg.Suppress,
+		Body:            bytes.NewReader(msg),
+		Method:          http.MethodGet,
+		ContentType:     contentType,
+		MaxBytes:        maxBytes,
+		Scanner:         r.scanner,
+		AgentID:         r.agent,
+		Host:            r.hostname,
+		Path:            r.path,
+		Target:          r.targetURL,
+		Suppress:        r.cfg.Suppress,
+		Action:          r.cfg.RequestBodyScanning.Action,
+		DisablePatterns: r.cfg.RequestBodyScanning.DisablePatterns,
+		PatternActions:  r.cfg.RequestBodyScanning.PatternActions,
 	}
 	applyBodyScanRedaction(&bodyReq, r.redaction)
 	return scanRequestBody(ctx, bodyReq)

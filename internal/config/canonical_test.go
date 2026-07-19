@@ -360,6 +360,18 @@ func TestCanonicalPolicyHash_PolicyFieldsDoAffect(t *testing.T) {
 			},
 		},
 		{
+			name: "request_body_scanning.disable_patterns changed",
+			mut: func(c *Config) {
+				c.RequestBodyScanning.DisablePatterns = []string{"Google API Key"}
+			},
+		},
+		{
+			name: "request_body_scanning.pattern_actions changed",
+			mut: func(c *Config) {
+				c.RequestBodyScanning.PatternActions = map[string]string{"Google API Key": ActionWarn}
+			},
+		},
+		{
 			// Transport timeouts are enforcement-relevant (DoS
 			// exposure bound, tunnel lifetime) so they must flip ph.
 			// Listen / Upstream addresses are separately excluded as

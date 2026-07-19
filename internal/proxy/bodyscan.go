@@ -407,9 +407,28 @@ func shouldHardBlockCriticalDLP(matches []scanner.TextDLPMatch, enforceEnabled b
 	return false
 }
 
+func shouldHardBlockRequestDLP(matches []scanner.TextDLPMatch, cfg *config.Config) bool {
+	if cfg == nil || !cfg.EnforceEnabled() {
+		return false
+	}
+	for _, match := range matches {
+		if match.Warn {
+			continue
+		}
+		if !strings.EqualFold(match.Severity, config.SeverityCritical) {
+			continue
+		}
+		if cfg.RequestBodyScanning.PatternActions[match.PatternName] == config.ActionWarn &&
+			!config.IsCoreDLPPatternName(match.PatternName) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func shouldHardBlockBodyCriticalDLP(result BodyScanResult, hostname string, cfg *config.Config) bool {
-	enforceEnabled := cfg != nil && cfg.EnforceEnabled()
-	if !shouldHardBlockCriticalDLP(result.DLPMatches, enforceEnabled) {
+	if !shouldHardBlockRequestDLP(result.DLPMatches, cfg) {
 		return false
 	}
 	if result.RedactedDLPOnly &&
@@ -490,6 +509,12 @@ type BodyScanRequest struct {
 	Target string
 	// Suppress contains config-level finding suppressions.
 	Suppress []config.SuppressEntry
+	// Action is the global request_body_scanning.action for DLP matches.
+	Action string
+	// DisablePatterns lists DLP pattern names skipped by body/header scanning.
+	DisablePatterns []string
+	// PatternActions maps DLP pattern names to body/header-specific actions.
+	PatternActions map[string]string
 }
 
 // scanRequestBody reads, buffers, and scans an HTTP request body for
@@ -535,7 +560,7 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	if req.RedactMatcher != nil {
 		texts, parseErr := extractBodyText(buf, req)
 		if parseErr == "" {
-			preRedactionDLP = scanBodyTextsForDLP(ctx, req.Scanner, texts, req.suppressTarget(), req.Suppress)
+			preRedactionDLP = scanBodyTextsForDLP(ctx, req.Scanner, texts, req.suppressTarget(), req.Suppress, bodyDLPDisabledSet(req.DisablePatterns))
 		}
 	}
 
@@ -599,6 +624,7 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 		if len(preRedactionDLP) > 0 {
 			return buf, BodyScanResult{
 				Clean:           false,
+				Action:          requestBodyDLPAction(preRedactionDLP, req.Action, req.PatternActions),
 				DLPMatches:      preRedactionDLP,
 				RedactedDLPOnly: redactReport != nil && redactReport.Applied,
 				RedactionReport: redactReport,
@@ -608,9 +634,10 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	}
 
 	// Scan each extracted string individually (catches per-field encoded secrets).
-	if matches := scanBodyTextsForDLP(ctx, req.Scanner, texts, req.suppressTarget(), req.Suppress); len(matches) > 0 {
+	if matches := scanBodyTextsForDLP(ctx, req.Scanner, texts, req.suppressTarget(), req.Suppress, bodyDLPDisabledSet(req.DisablePatterns)); len(matches) > 0 {
 		return buf, BodyScanResult{
 			Clean:           false,
+			Action:          requestBodyDLPAction(matches, req.Action, req.PatternActions),
 			DLPMatches:      matches,
 			RedactionReport: redactReport,
 		}
@@ -618,6 +645,7 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	if len(preRedactionDLP) > 0 {
 		return buf, BodyScanResult{
 			Clean:           false,
+			Action:          requestBodyDLPAction(preRedactionDLP, req.Action, req.PatternActions),
 			DLPMatches:      preRedactionDLP,
 			RedactedDLPOnly: redactReport != nil && redactReport.Applied,
 			RedactionReport: redactReport,
@@ -681,23 +709,24 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	return buf, BodyScanResult{Clean: true, RedactionReport: redactReport}
 }
 
-func scanBodyTextsForDLP(ctx context.Context, sc *scanner.Scanner, texts []string, target string, suppress []config.SuppressEntry) []scanner.TextDLPMatch {
+func scanBodyTextsForDLP(ctx context.Context, sc *scanner.Scanner, texts []string, target string, suppress []config.SuppressEntry, disabled map[string]struct{}) []scanner.TextDLPMatch {
+	var allMatches []scanner.TextDLPMatch
 	for _, text := range texts {
 		result := sc.ScanTextForDLP(ctx, text)
 		if !result.Clean {
-			if matches := unsuppressedDLPMatches(result.Matches, target, suppress); len(matches) > 0 {
-				return matches
+			if matches := filterBodyDLPMatches(result.Matches, target, suppress, disabled); len(matches) > 0 {
+				allMatches = append(allMatches, matches...)
 			}
 		}
 	}
 	joined := strings.Join(sortedBodyTexts(texts), bodyDLPJoinSeparator)
 	result := sc.ScanTextForDLP(ctx, joined)
 	if !result.Clean {
-		if matches := unsuppressedDLPMatches(result.Matches, target, suppress); len(matches) > 0 {
-			return matches
+		if matches := filterBodyDLPMatches(result.Matches, target, suppress, disabled); len(matches) > 0 {
+			allMatches = append(allMatches, matches...)
 		}
 	}
-	return nil
+	return uniqueBodyDLPMatches(allMatches)
 }
 
 func (req BodyScanRequest) suppressTarget() string {
@@ -713,18 +742,68 @@ func (req BodyScanRequest) suppressTarget() string {
 	return req.Host + req.Path
 }
 
-func unsuppressedDLPMatches(matches []scanner.TextDLPMatch, target string, suppress []config.SuppressEntry) []scanner.TextDLPMatch {
+func filterBodyDLPMatches(matches []scanner.TextDLPMatch, target string, suppress []config.SuppressEntry, disabled map[string]struct{}) []scanner.TextDLPMatch {
 	if len(matches) == 0 || len(suppress) == 0 || target == "" {
-		return matches
+		if len(matches) == 0 || len(disabled) == 0 {
+			return matches
+		}
 	}
 	filtered := matches[:0]
 	for _, match := range matches {
+		if _, skip := disabled[match.PatternName]; skip && !config.IsCoreDLPPatternName(match.PatternName) {
+			continue
+		}
 		if config.IsSuppressed(match.PatternName, target, suppress) {
 			continue
 		}
 		filtered = append(filtered, match)
 	}
 	return filtered
+}
+
+func bodyDLPDisabledSet(patterns []string) map[string]struct{} {
+	if len(patterns) == 0 {
+		return nil
+	}
+	disabled := make(map[string]struct{}, len(patterns))
+	for _, pattern := range patterns {
+		disabled[pattern] = struct{}{}
+	}
+	return disabled
+}
+
+func uniqueBodyDLPMatches(matches []scanner.TextDLPMatch) []scanner.TextDLPMatch {
+	if len(matches) <= 1 {
+		return matches
+	}
+	seen := make(map[string]struct{}, len(matches))
+	unique := make([]scanner.TextDLPMatch, 0, len(matches))
+	for _, match := range matches {
+		key := match.PatternName + "\x00" + match.Encoded
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, match)
+	}
+	return unique
+}
+
+func requestBodyDLPAction(matches []scanner.TextDLPMatch, defaultAction string, patternActions map[string]string) string {
+	action := ""
+	for _, match := range matches {
+		matchAction := defaultAction
+		if override := patternActions[match.PatternName]; override != "" && !config.IsCoreDLPPatternName(match.PatternName) {
+			matchAction = override
+		}
+		if matchAction == config.ActionBlock {
+			return config.ActionBlock
+		}
+		if matchAction == config.ActionWarn {
+			action = config.ActionWarn
+		}
+	}
+	return action
 }
 
 func sortedBodyTexts(texts []string) []string {
@@ -1225,18 +1304,16 @@ func scanRequestHeadersForTarget(ctx context.Context, headers http.Header, cfg *
 
 func scanRequestHeadersWithSuppress(ctx context.Context, headers http.Header, cfg *config.Config, sc *scanner.Scanner, target string, suppress []config.SuppressEntry) *BodyScanResult {
 	bodyCfg := cfg.RequestBodyScanning
-	resultForMatches := func(headerName string, matches []scanner.TextDLPMatch) *BodyScanResult {
-		if len(suppress) > 0 {
-			matches = unsuppressedDLPMatches(matches, target, suppress)
-			if len(matches) == 0 {
-				return nil
-			}
+	disabled := bodyDLPDisabledSet(bodyCfg.DisablePatterns)
+	var allMatches []scanner.TextDLPMatch
+	matchedHeaders := map[string]struct{}{}
+	addMatches := func(headerName string, matches []scanner.TextDLPMatch) {
+		filtered := filterBodyDLPMatches(matches, target, suppress, disabled)
+		if len(filtered) == 0 {
+			return
 		}
-		return &BodyScanResult{
-			Clean:      false,
-			DLPMatches: matches,
-			HeaderName: headerName,
-		}
+		allMatches = append(allMatches, filtered...)
+		matchedHeaders[headerName] = struct{}{}
 	}
 
 	// Build the set of headers to scan based on mode.
@@ -1273,17 +1350,22 @@ func scanRequestHeadersWithSuppress(ctx context.Context, headers http.Header, cf
 	}
 
 	// Per-value scanning: catches per-header encoded secrets.
+	headerNames := make([]string, 0, len(headersToScan))
+	for name := range headersToScan {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+
 	var allValues []string
-	for name, values := range headersToScan {
+	for _, name := range headerNames {
+		values := headersToScan[name]
 		// In "all" mode, scan header names too (catches exfil via custom
 		// header names like X-AKIA1234). No noisy prefix skip: agents
 		// (unlike browsers) control all header names, including Sec-*.
 		if bodyCfg.HeaderMode == config.HeaderModeAll {
 			result := sc.ScanTextForDLP(ctx, name)
 			if !result.Clean {
-				if headerResult := resultForMatches(name, result.Matches); headerResult != nil {
-					return headerResult
-				}
+				addMatches(name, result.Matches)
 			}
 			// Include header name in joined scan to catch secrets split
 			// across the name:value boundary (e.g., X-AKIA1234: EXAMPLE).
@@ -1294,9 +1376,7 @@ func scanRequestHeadersWithSuppress(ctx context.Context, headers http.Header, cf
 			allValues = append(allValues, v)
 			result := sc.ScanTextForDLP(ctx, v)
 			if !result.Clean {
-				if headerResult := resultForMatches(name, result.Matches); headerResult != nil {
-					return headerResult
-				}
+				addMatches(name, result.Matches)
 			}
 			// In "all" mode, scan name+value concatenation to catch secrets
 			// split across the header name:value boundary.
@@ -1304,9 +1384,7 @@ func scanRequestHeadersWithSuppress(ctx context.Context, headers http.Header, cf
 				combined := name + v
 				combinedResult := sc.ScanTextForDLP(ctx, combined)
 				if !combinedResult.Clean {
-					if headerResult := resultForMatches(name, combinedResult.Matches); headerResult != nil {
-						return headerResult
-					}
+					addMatches(name, combinedResult.Matches)
 				}
 			}
 		}
@@ -1320,13 +1398,32 @@ func scanRequestHeadersWithSuppress(ctx context.Context, headers http.Header, cf
 		joined := strings.Join(allValues, "\n")
 		result := sc.ScanTextForDLP(ctx, joined)
 		if !result.Clean {
-			if headerResult := resultForMatches("(joined)", result.Matches); headerResult != nil {
-				return headerResult
-			}
+			addMatches("(joined)", result.Matches)
 		}
 	}
 
-	return nil
+	allMatches = uniqueBodyDLPMatches(allMatches)
+	if len(allMatches) == 0 {
+		return nil
+	}
+	return &BodyScanResult{
+		Clean:      false,
+		Action:     requestBodyDLPAction(allMatches, bodyCfg.Action, bodyCfg.PatternActions),
+		DLPMatches: allMatches,
+		HeaderName: headerDLPMatchSource(matchedHeaders),
+	}
+}
+
+func headerDLPMatchSource(headers map[string]struct{}) string {
+	switch len(headers) {
+	case 0:
+		return ""
+	case 1:
+		for header := range headers {
+			return header
+		}
+	}
+	return "(multiple)"
 }
 
 // evalHeaderDLP scans request headers, logs matches, and records metrics.
@@ -1362,8 +1459,11 @@ func (p *Proxy) evalHeaderDLP(ctx context.Context, e headerDLPParams) (blocked b
 	if headerResult == nil {
 		return false, false
 	}
-	action := e.cfg.RequestBodyScanning.Action
-	headerHardBlock := shouldHardBlockCriticalDLP(headerResult.DLPMatches, e.cfg.EnforceEnabled())
+	action := headerResult.Action
+	if action == "" {
+		action = e.cfg.RequestBodyScanning.Action
+	}
+	headerHardBlock := shouldHardBlockRequestDLP(headerResult.DLPMatches, e.cfg)
 	if headerHardBlock {
 		action = config.ActionBlock
 	}

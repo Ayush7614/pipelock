@@ -724,8 +724,8 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			if action == "" {
 				action = config.ActionBlock
 			}
-			requestEffectiveAction = action
-			requestScannerVerdict = scannerVerdictForContinuingAction(action, cfg.EnforceEnabled())
+			requestEffectiveAction = strongestRequestAction(requestEffectiveAction, action)
+			requestScannerVerdict = scannerVerdictForContinuingAction(requestEffectiveAction, cfg.EnforceEnabled())
 			patternNames := dlpMatchNames(pathDLP.Matches)
 			rp.logger.LogBodyDLP(newHTTPAuditContext(rp.logger, r.Method, r.URL.String(), clientIP, requestID, ""),
 				action,
@@ -755,16 +755,19 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		headerResult := scanRequestHeadersForTarget(r.Context(), r.Header, cfg, sc, dlpTarget.String())
 		if headerResult != nil {
 			hasFinding = true
-			action := cfg.RequestBodyScanning.Action
+			action := headerResult.Action
+			if action == "" {
+				action = cfg.RequestBodyScanning.Action
+			}
 			if action == "" {
 				action = config.ActionBlock
 			}
-			headerHardBlock := shouldHardBlockCriticalDLP(headerResult.DLPMatches, cfg.EnforceEnabled())
+			headerHardBlock := shouldHardBlockRequestDLP(headerResult.DLPMatches, cfg)
 			if headerHardBlock {
 				action = config.ActionBlock
 			}
-			requestEffectiveAction = action
-			requestScannerVerdict = scannerVerdictForContinuingAction(action, cfg.EnforceEnabled())
+			requestEffectiveAction = strongestRequestAction(requestEffectiveAction, action)
+			requestScannerVerdict = scannerVerdictForContinuingAction(requestEffectiveAction, cfg.EnforceEnabled())
 			patternNames := dlpMatchNames(headerResult.DLPMatches)
 			rp.logger.LogHeaderDLP(newHTTPAuditContext(rp.logger, r.Method, r.URL.String(), clientIP, requestID, ""), headerResult.HeaderName,
 				action, patternNames, nil)
@@ -801,8 +804,8 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			forwardedVerdict = verdict
 		}
 		if bodyFinding && verdict != "" {
-			requestEffectiveAction = verdict
-			requestScannerVerdict = scannerVerdictForContinuingAction(verdict, cfg.EnforceEnabled())
+			requestEffectiveAction = strongestRequestAction(requestEffectiveAction, verdict)
+			requestScannerVerdict = scannerVerdictForContinuingAction(requestEffectiveAction, cfg.EnforceEnabled())
 		}
 		reverseBodyBytes = bodyBytes
 	}
@@ -1137,6 +1140,9 @@ func (rp *ReverseProxyHandler) scanRequest(w http.ResponseWriter, r *http.Reques
 		Path:            r.URL.Path,
 		Target:          receiptInput.Target,
 		Suppress:        cfg.Suppress,
+		Action:          cfg.RequestBodyScanning.Action,
+		DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
+		PatternActions:  cfg.RequestBodyScanning.PatternActions,
 	}
 	applyBodyScanRedaction(&bodyReq, redaction)
 	bodyBytes, result := scanRequestBody(r.Context(), bodyReq)
@@ -2003,6 +2009,35 @@ func (rp *ReverseProxyHandler) errorHandler(w http.ResponseWriter, r *http.Reque
 		recordErrorOutcome(http.StatusForbidden, written, blockedErr.layer)
 		return
 	}
+	var ssrfErr *ssrfDialBlockError
+	if errors.As(err, &ssrfErr) {
+		rp.metrics.RecordReverseProxyRequest(r.Method, "403")
+		rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, scanner.ScannerSSRF)
+		rp.logger.LogBlocked(actx, scanner.ScannerSSRF, ssrfErr.logDetail())
+		actionID, _ := r.Context().Value(ctxKeyReverseActionID).(string)
+		if actionID == "" {
+			actionID = receipt.NewActionID()
+		}
+		agent, _ := r.Context().Value(ctxKeyAgent).(string)
+		opts := receipt.EmitOpts{
+			ActionID:  actionID,
+			Verdict:   config.ActionBlock,
+			Layer:     scanner.ScannerSSRF,
+			Pattern:   string(ssrfErr.reason),
+			Transport: TransportReverse,
+			Method:    r.Method,
+			Target:    r.URL.String(),
+			RequestID: requestID,
+			Agent:     agent,
+		}
+		if cfg, _ := r.Context().Value(ctxKeyReverseEnvelopeCfg).(*config.Config); cfg != nil {
+			opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		}
+		_ = rp.emitReceipt(opts)
+		written := writeReverseProxyBlock(w, http.StatusForbidden, ssrfErr.blockInfo(), string(ssrfErr.reason))
+		recordErrorOutcome(http.StatusForbidden, written, string(ssrfErr.reason))
+		return
+	}
 
 	rp.metrics.RecordReverseProxyRequest(r.Method, "502")
 	rp.logger.LogError(actx, err)
@@ -2119,4 +2154,24 @@ func reverseCaptureAgent(r *http.Request) string {
 		return agentAnonymous
 	}
 	return agent
+}
+
+func strongestRequestAction(current, next string) string {
+	if requestActionRank(next) > requestActionRank(current) {
+		return next
+	}
+	return current
+}
+
+func requestActionRank(action string) int {
+	switch action {
+	case config.ActionBlock:
+		return 3
+	case config.ActionAsk:
+		return 2
+	case config.ActionWarn:
+		return 1
+	default:
+		return 0
+	}
 }

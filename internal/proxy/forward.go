@@ -6,6 +6,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -178,6 +179,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	})
 	r = r.WithContext(connectScanCtx)
 	result := sc.Scan(connectScanCtx, syntheticURL)
+	r = r.WithContext(withAllowedSSRFDialScanSnapshot(r.Context(), sc, host, result))
 
 	// Capture observer: record CONNECT URL verdict for policy replay.
 	{
@@ -570,6 +572,26 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	targetConn, err := p.ssrfSafeDialContext(dialCtx, "tcp", target)
 	if err != nil {
+		var ssrfErr *ssrfDialBlockError
+		if errors.As(err, &ssrfErr) {
+			p.logger.LogBlocked(targetCtx, scanner.ScannerSSRF, ssrfErr.logDetail())
+			p.metrics.RecordTunnelBlocked(agentLabel)
+			_ = p.emitReceipt(withReceiptPolicyHash(receipt.EmitOpts{
+				ActionID:  actionID,
+				Verdict:   config.ActionBlock,
+				Layer:     scanner.ScannerSSRF,
+				Pattern:   string(ssrfErr.reason),
+				Transport: TransportConnect,
+				Method:    http.MethodConnect,
+				Target:    connectReceiptTarget,
+				RequestID: requestID,
+				Agent:     agent,
+			}, cfg.CanonicalPolicyHash()))
+			writeBlockedError(w, ssrfErr.blockInfo(), "CONNECT blocked: "+ssrfErr.detail, http.StatusForbidden)
+			outcomeStatus = strconv.Itoa(http.StatusForbidden)
+			outcomeReason = string(ssrfErr.reason)
+			return
+		}
 		p.logger.LogError(targetCtx, err)
 		http.Error(w, "tunnel dial failed", http.StatusBadGateway)
 		outcomeStatus = strconv.Itoa(http.StatusBadGateway)
@@ -1230,6 +1252,9 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			Path:            r.URL.Path,
 			Target:          targetURL,
 			Suppress:        cfg.Suppress,
+			Action:          cfg.RequestBodyScanning.Action,
+			DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
+			PatternActions:  cfg.RequestBodyScanning.PatternActions,
 		}
 		applyBodyScanRedaction(&bodyReq, p.currentRedactionRuntimeFor(cfg))
 		buf, bodyResult := scanRequestBody(r.Context(), bodyReq)
@@ -1702,6 +1727,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportForward)
+	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, r.URL.Hostname(), result)
 	outReq := r.Clone(ctx)
 	outReq.RequestURI = "" // required for http.Client
 	outReq = outReq.WithContext(context.WithValue(outReq.Context(), ctxKeyEnvelopeEmitter, envelopeEmitterSnapshot{emitter: envEmitter}))
@@ -1811,6 +1837,35 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(outReq)
 	if err != nil {
+		var ssrfErr *ssrfDialBlockError
+		if errors.As(err, &ssrfErr) {
+			p.logger.LogBlocked(actx, scanner.ScannerSSRF, ssrfErr.logDetail())
+			emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{
+				ActionID:            actionID,
+				Verdict:             config.ActionBlock,
+				Layer:               scanner.ScannerSSRF,
+				Pattern:             string(ssrfErr.reason),
+				Transport:           "forward",
+				Method:              r.Method,
+				Target:              targetURL,
+				RequestID:           requestID,
+				Agent:               agent,
+				SessionTaintLevel:   forwardTaint.Risk.Level.String(),
+				SessionContaminated: forwardTaint.Risk.Contaminated,
+				RecentTaintSources:  forwardTaint.Risk.Sources,
+				SessionTaskID:       forwardTaint.Task.CurrentTaskID,
+				SessionTaskLabel:    forwardTaint.Task.CurrentTaskLabel,
+				AuthorityKind:       forwardTaint.Authority.String(),
+				TaintDecision:       forwardTaint.Result.Decision.String(),
+				TaintDecisionReason: forwardTaint.Result.Reason,
+				TaskOverrideApplied: forwardTaint.TaskOverrideApplied,
+			}))
+			p.metrics.RecordBlocked(r.URL.Hostname(), scanner.ScannerSSRF, time.Since(start), agentLabel)
+			writeBlockedError(w, ssrfErr.blockInfo(), "blocked: "+ssrfErr.detail, http.StatusForbidden)
+			outcomeStatus = strconv.Itoa(http.StatusForbidden)
+			outcomeReason = string(ssrfErr.reason)
+			return
+		}
 		if blockedErr, ok := blockedRequestErrorFrom(err); ok {
 			p.logger.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 			emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{
@@ -2648,9 +2703,14 @@ func copyResponseHeaders(dst, src http.Header) {
 
 // dlpMatchNames extracts pattern names from a slice of DLP matches.
 func dlpMatchNames(matches []scanner.TextDLPMatch) []string {
-	names := make([]string, len(matches))
-	for i, m := range matches {
-		names[i] = m.PatternName
+	names := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, m := range matches {
+		if _, ok := seen[m.PatternName]; ok {
+			continue
+		}
+		seen[m.PatternName] = struct{}{}
+		names = append(names, m.PatternName)
 	}
 	return names
 }
