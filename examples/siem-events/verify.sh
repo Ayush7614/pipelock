@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Pipelock contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # SIEM event emission verification for examples/siem-events/
 #
 # Starts a local webhook collector + pipelock, proves a clean fetch emits no
@@ -65,13 +68,19 @@ from pathlib import Path
 
 src, dst, proxy_port, webhook_port = sys.argv[1:5]
 out = []
+listen_replaced = False
+url_replaced = False
 for line in Path(src).read_text().splitlines():
     if line.startswith("  listen:"):
         out.append(f'  listen: "127.0.0.1:{proxy_port}"')
+        listen_replaced = True
     elif line.strip().startswith("url:") and "events" in line:
         out.append(f'    url: "http://127.0.0.1:{webhook_port}/events"')
+        url_replaced = True
     else:
         out.append(line)
+if not (listen_replaced and url_replaced):
+    sys.exit("write_config: failed to locate listen: and/or webhook url: lines in pipelock.yaml")
 Path(dst).write_text("\n".join(out) + "\n")
 PY
   chmod 600 "$CONFIG"
@@ -193,10 +202,6 @@ fetch_url() {
     "http://127.0.0.1:${port}/fetch"
 }
 
-event_count() {
-  curl -sf "http://${WEBHOOK_ADDR}/events/count"
-}
-
 wait_for_blocked_event() {
   local deadline=$(( $(date +%s) + 8 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -273,7 +278,6 @@ fi
 
 # -- Test 3 -------------------------------------------------------------------
 step "Test 3: clean fetch does not emit blocked event"
-BEFORE="$(event_count || echo 0)"
 BODY="$WORK/clean.json"
 CODE="$(fetch_url "$PROXY_PORT" "http://${ECHO_ADDR}/" "$BODY")"
 if [ "$CODE" = "200" ] && grep -q 'hello-from-echo' "$BODY"; then
@@ -285,7 +289,6 @@ else
   exit 1
 fi
 sleep 0.3
-AFTER="$(event_count || echo 0)"
 BLOCKED_AFTER_CLEAN="$(curl -sf "http://${WEBHOOK_ADDR}/events" | python3 -c 'import json,sys; print(sum(1 for e in json.load(sys.stdin) if e.get("type")=="blocked"))')"
 if [ "$BLOCKED_AFTER_CLEAN" = "0" ]; then
   pass "no blocked webhook events after clean fetch"

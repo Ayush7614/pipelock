@@ -28,9 +28,13 @@ export PIPELOCK_BIN="$PWD/pipelock"
 
 ## Quick Verify
 
+From the repository root:
+
 ```bash
-./verify.sh
+./examples/siem-events/verify.sh
 ```
+
+Or from this directory: `./verify.sh` (with `PIPELOCK_BIN` set if needed).
 
 ## Manual Try
 
@@ -38,10 +42,12 @@ Start a collector that accepts `POST /events`, point `emit.webhook.url` at it,
 then:
 
 ```bash
-pipelock run --config examples/siem-events/pipelock.yaml
+"$PIPELOCK_BIN" run --config examples/siem-events/pipelock.yaml
 curl -sS -G --data-urlencode "url=http://169.254.169.254/latest/meta-data/" \
   "http://127.0.0.1:8888/fetch"
 ```
+
+If `pipelock` is already on your `PATH`, you can use `pipelock` instead of `"$PIPELOCK_BIN"`.
 
 ## Config Notes
 
