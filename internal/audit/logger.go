@@ -328,12 +328,13 @@ const (
 	EventResponseScanExempt EventType = "response_scan_exempt"
 	EventTaintDecision      EventType = "taint_decision"
 
-	EventAirlockEnter      EventType = "airlock_enter"
-	EventAirlockDeny       EventType = "airlock_deny"
-	EventAirlockDeescalate EventType = "airlock_deescalate"
-	EventShieldRewrite     EventType = "shield_rewrite"
-	EventMediaExposure     EventType = "media_exposure"
-	EventLicenseExpiry     EventType = "license_expiry"
+	EventAirlockEnter       EventType = "airlock_enter"
+	EventAirlockDeny        EventType = "airlock_deny"
+	EventAirlockDeescalate  EventType = "airlock_deescalate"
+	EventShieldRewrite      EventType = "shield_rewrite"
+	EventMediaExposure      EventType = "media_exposure"
+	EventLicenseExpiry      EventType = "license_expiry"
+	EventRuleBundleDegraded EventType = "rule_bundle_degraded"
 )
 
 const responseScanExemptFullTrustEffect = "response_scanning.exempt_domains is a full-trust valve: injection scanning is disabled for ALL responses from this host, including oversized over-cap responses that stream unscanned"
@@ -1169,6 +1170,45 @@ func (l *Logger) LogConfigReload(status, detail, configHash string) {
 
 	if l.emitter != nil {
 		l.emitter.Emit(context.Background(), string(EventConfigReload), e.fields)
+	}
+}
+
+// RuleBundleDegradedEvent bundles the fields emitted for rule-bundle coverage
+// degradation or rejection events.
+type RuleBundleDegradedEvent struct {
+	Bundle          string
+	FailureClass    string
+	Reason          string
+	Phase           string
+	Outcome         string
+	Severity        string
+	AllowDegraded   bool
+	DroppedPatterns int
+}
+
+// LogRuleBundleDegraded logs a rule-bundle coverage degradation or rejection.
+func (l *Logger) LogRuleBundleDegraded(ev RuleBundleDegradedEvent) {
+	level := l.zl.Warn()
+	emitSeverity := emit.SeverityWarn
+	if ev.Severity == severityCritical || ev.Severity == "error" {
+		level = l.zl.Error()
+		emitSeverity = emit.SeverityCritical
+	}
+	e := newLogEntry(level, EventRuleBundleDegraded).
+		str("bundle", ev.Bundle).
+		str("failure_class", ev.FailureClass).
+		str("reason", ev.Reason).
+		str("phase", ev.Phase).
+		str("outcome", ev.Outcome)
+	e.event = e.event.Bool("allow_degraded", ev.AllowDegraded)
+	e.fields["allow_degraded"] = ev.AllowDegraded
+	if ev.DroppedPatterns > 0 {
+		e.intField("dropped_patterns", ev.DroppedPatterns)
+	}
+	e.msg("rule bundle coverage degraded")
+
+	if l.emitter != nil {
+		l.emitter.EmitWithSeverity(context.Background(), emitSeverity, string(EventRuleBundleDegraded), e.fields)
 	}
 }
 
