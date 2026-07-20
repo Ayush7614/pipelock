@@ -1,0 +1,30 @@
+# SIEM event emission example config.
+# verify.sh rewrites listen + emit.webhook.url into a temp copy.
+
+version: 1
+mode: balanced
+
+fetch_proxy:
+  listen: "127.0.0.1:8888"
+  timeout_seconds: 30
+  monitoring:
+    max_url_length: 4096
+
+dlp:
+  include_defaults: true
+
+# Offline: disable DNS SSRF. Core literal-IP floor still blocks metadata IPs.
+internal: []
+
+ssrf:
+  ip_allowlist:
+    - "127.0.0.0/8"
+    - "::1/128"
+
+emit:
+  instance_id: "siem-events-example"
+  webhook:
+    url: "http://127.0.0.1:9999/events"
+    min_severity: warn
+    timeout_seconds: 5
+    queue_size: 64
