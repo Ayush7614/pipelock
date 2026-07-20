@@ -1,0 +1,58 @@
+# OpenCode Integration Example
+
+Runnable walkthrough for `pipelock opencode install`: wrap OpenCode MCP servers
+so every tool call runs through `pipelock mcp proxy`.
+
+OpenCode is MCP-native (not hook-based). This example does **not** require the
+OpenCode IDE — `verify.sh` uses a temp `opencode.json` and `--path`.
+
+## What This Demonstrates
+
+| Check | What it proves |
+|-------|----------------|
+| Dry-run install | Shows wrap plan without writing |
+| Local MCP wrap | `command` becomes `[pipelock, mcp, proxy, …]` |
+| Remote MCP wrap | Remote URL becomes `--upstream` + header sidecar |
+| Idempotence | Second install leaves config unchanged |
+| Remove | Restores original entries from `_pipelock` metadata |
+
+## Prerequisites
+
+- `pipelock` on `PATH`, or set `PIPELOCK_BIN`
+- Bash 3.2+, Python 3
+
+```bash
+make build
+export PIPELOCK_BIN="$PWD/pipelock"
+```
+
+## Quick Verify
+
+```bash
+./verify.sh
+```
+
+## Manual Try
+
+```bash
+pipelock opencode install --path /path/to/opencode.json \
+  --config examples/opencode-integration/pipelock.yaml
+```
+
+Restart OpenCode after install so it picks up the wrapped MCP entries.
+
+```bash
+pipelock opencode remove --path /path/to/opencode.json
+```
+
+## Config Notes
+
+Pass `--config` so the wrapped proxy embeds a real Pipelock config. Without it,
+install warns and MCP scanning defaults may leave layers off.
+
+See `../../docs/guides/opencode.md`.
+
+## Contributing
+
+Improvements welcome: OAuth-skip case, live decoy MCP round-trip, or CI wiring.
+Open a PR against `main`.
