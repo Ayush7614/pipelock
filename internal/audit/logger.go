@@ -306,6 +306,7 @@ const (
 	EventWSScan              EventType = "ws_scan"
 	EventSessionAnomaly      EventType = "session_anomaly"
 	EventAdaptiveEscalation  EventType = "adaptive_escalation"
+	EventAdaptiveRecovery    EventType = "adaptive_recovery"
 	EventMCPUnknownTool      EventType = "mcp_unknown_tool"
 	EventKillSwitchDeny      EventType = "kill_switch_deny"
 	EventSNIMismatch         EventType = "sni_mismatch"
@@ -1409,6 +1410,34 @@ func (l *Logger) LogAdaptiveEscalation(sessionKey, from, to, clientIP, requestID
 			fields["request_id"] = requestID
 		}
 		l.emitter.EmitWithSeverity(context.Background(), emit.EscalationSeverity(to), string(EventAdaptiveEscalation), fields)
+	}
+}
+
+// LogAdaptiveRecoveryOptions contains the fields for an adaptive recovery event.
+type LogAdaptiveRecoveryOptions struct {
+	SessionKey string
+	Scope      string
+	From       string
+	To         string
+	Reason     string
+	ClientIP   string
+	RequestID  string
+}
+
+// LogAdaptiveRecovery logs an adaptive enforcement de-escalation.
+func (l *Logger) LogAdaptiveRecovery(opts LogAdaptiveRecoveryOptions) {
+	e := newLogEntry(l.zl.Info(), EventAdaptiveRecovery).
+		str("session", opts.SessionKey).
+		optStr("scope", opts.Scope).
+		str("from", opts.From).
+		str("to", opts.To).
+		str("reason", opts.Reason).
+		optStr("client_ip", opts.ClientIP).
+		optStr("request_id", opts.RequestID)
+	e.msg("adaptive enforcement recovered")
+
+	if l.emitter != nil {
+		l.emitter.Emit(context.Background(), string(EventAdaptiveRecovery), e.fields)
 	}
 }
 

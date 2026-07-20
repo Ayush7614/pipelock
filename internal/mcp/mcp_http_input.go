@@ -244,7 +244,12 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 	// Runs before any per-message action so both clean and non-clean
 	// messages benefit from recovery.
 	if rec != nil {
-		tryRecoverSession(rec, adaptiveCfg, m)
+		tryRecoverSession(rec, adaptiveCfg, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+			sessionKey: auditSessionKey,
+			reason:     adaptiveRecoveryTimer,
+			logger:     auditLogger,
+			metrics:    m,
+		}, opts.warnContext()))
 	}
 
 	// Reject JSON-RPC batch requests unconditionally. MCP does not use
@@ -595,7 +600,7 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 				IsNotification: isRPCNotification(verdict.ID),
 				LogMessage:     "blocked (session deny)",
 				ErrorCode:      -32001,
-				ErrorMessage:   "pipelock: session escalation level critical",
+				ErrorMessage:   adaptiveBlockedReason,
 			}
 			return result
 		}
@@ -665,9 +670,13 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			receiptVerdict = config.ActionAllow
 			receiptContractGate = &contractGate
 		}
-		if rec != nil && adaptiveCfg != nil && adaptiveCfg.Enabled {
-			rec.RecordClean(adaptiveCfg.DecayPerCleanRequest)
-		}
+		recordCleanSession(rec, adaptiveCfg, true, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+			sessionKey: auditSessionKey,
+			reason:     adaptiveRecoveryClean,
+			requestID:  canonicalID(verdict.ID),
+			logger:     auditLogger,
+			metrics:    m,
+		}, opts.warnContext()))
 		return result
 	}
 
