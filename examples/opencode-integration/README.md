@@ -28,21 +28,27 @@ export PIPELOCK_BIN="$PWD/pipelock"
 
 ## Quick Verify
 
+From the repository root:
+
 ```bash
-./verify.sh
+./examples/opencode-integration/verify.sh
 ```
+
+Or from this directory: `./verify.sh` (with `PIPELOCK_BIN` set if needed).
 
 ## Manual Try
 
 ```bash
-pipelock opencode install --path /path/to/opencode.json \
+"$PIPELOCK_BIN" opencode install --path /path/to/opencode.json \
   --config examples/opencode-integration/pipelock.yaml
 ```
+
+If `pipelock` is already on your `PATH`, you can use `pipelock` instead of `"$PIPELOCK_BIN"`.
 
 Restart OpenCode after install so it picks up the wrapped MCP entries.
 
 ```bash
-pipelock opencode remove --path /path/to/opencode.json
+"$PIPELOCK_BIN" opencode remove --path /path/to/opencode.json
 ```
 
 ## Config Notes
