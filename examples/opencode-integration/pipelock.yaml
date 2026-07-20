@@ -1,0 +1,25 @@
+# Minimal config embedded into wrapped OpenCode MCP servers via --config.
+
+version: 1
+mode: balanced
+
+dlp:
+  include_defaults: true
+
+mcp_input_scanning:
+  enabled: true
+  action: block
+
+response_scanning:
+  enabled: true
+  action: block
+  include_defaults: true
+
+mcp_tool_policy:
+  enabled: true
+  action: block
+  rules:
+    - name: "Destructive File Delete"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)\brm\s+(--\s+)?(-[a-z]*[rf]\b|--(?:recursive|force)\b)'
+      action: block
