@@ -57,9 +57,13 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
 
     if method == "tools/call":
-        params = request.get("params") or {}
+        params = request.get("params")
+        if not isinstance(params, dict):
+            params = {}
         name = params.get("name", "")
-        args = params.get("arguments") or {}
+        args = params.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
         text = f"baseline-decoy ok: {name} args={json.dumps(args, sort_keys=True)}"
         return {
             "jsonrpc": "2.0",
@@ -78,12 +82,14 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def run_stdio() -> None:
-    for line in sys.stdin:
-        line = line.strip()
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
         if not line:
             continue
         try:
             req = json.loads(line)
+            if not isinstance(req, dict):
+                continue
         except json.JSONDecodeError:
             continue
         resp = handle(req)
