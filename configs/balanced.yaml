@@ -424,6 +424,10 @@ mcp_tool_scanning:
   action: warn
   detect_drift: true
 
+mcp_data_class_labels:
+  enabled: false
+  unknown_class: secret  # foundation only; no runtime effect until derivation wiring lands
+
 mcp_tool_policy:
   enabled: true
   action: warn
@@ -543,6 +547,7 @@ mcp_session_binding:
 #     min_severity: warn
 #     facility: local0
 #     tag: pipelock
+#     format: json             # json, cef, or ocsf
 #   # Enterprise durable HTTP forwarding. Exact-host allowlist; no wildcards.
 #   forwarder:
 #     url: "https://api.vendor.example/events"
@@ -582,6 +587,11 @@ internal:
   - "fe80::/10"
   - "224.0.0.0/4"
   - "ff00::/8"
+
+# Narrowest SSRF exception: allow one trusted internal IP, not the whole range.
+# ssrf:
+#   ip_allowlist:
+#     - "10.0.0.42/32"
 
 # Domains exempt from SSRF internal-IP checks. Wildcards supported.
 # All other scanners (DLP, blocklist, entropy) still apply.
