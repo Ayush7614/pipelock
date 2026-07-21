@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/datalabel"
 	"github.com/luckyPipewrench/pipelock/internal/license"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"gopkg.in/yaml.v3"
@@ -5022,6 +5023,74 @@ func TestValidateReload_MCPToolScanningDisabled(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected warning for MCP tool scanning disabled")
+	}
+}
+
+// --- MCPDataClassLabels Tests ---
+
+func TestMCPDataClassLabelsDefaults(t *testing.T) {
+	cfg := Defaults()
+	cfg.ApplyDefaults()
+
+	if cfg.MCPDataClassLabels.Enabled {
+		t.Fatal("mcp_data_class_labels.enabled default = true, want false until derivation is wired")
+	}
+	if cfg.MCPDataClassLabels.UnknownClass != string(datalabel.DataClassSecret) {
+		t.Fatalf("unknown_class = %q, want %q", cfg.MCPDataClassLabels.UnknownClass, datalabel.DataClassSecret)
+	}
+}
+
+func TestLoad_MCPDataClassLabelsEnabledRejectedUntilWired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pipelock.yaml")
+	write := func(t *testing.T, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	// Disabled states load and resolve to the reserved fail-closed defaults.
+	for _, tt := range []struct{ name, body string }{
+		{"omitted", "mode: balanced\n"},
+		{"yaml null blank", "mode: balanced\nmcp_data_class_labels:\n  enabled:\n"},
+		{"explicit false", "mode: balanced\nmcp_data_class_labels:\n  enabled: false\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			write(t, tt.body)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.MCPDataClassLabels.Enabled {
+				t.Fatal("enabled should resolve to false")
+			}
+			if cfg.MCPDataClassLabels.UnknownClass != string(datalabel.DataClassSecret) {
+				t.Fatalf("unknown_class = %q, want %q", cfg.MCPDataClassLabels.UnknownClass, datalabel.DataClassSecret)
+			}
+		})
+	}
+
+	// enabled: true is rejected. The feature has no runtime effect yet, so the
+	// knob fails closed at load rather than advertising protection it cannot
+	// provide. reload-with/without-change states do not apply while the field
+	// cannot be enabled.
+	t.Run("explicit true rejected", func(t *testing.T) {
+		write(t, "mode: balanced\nmcp_data_class_labels:\n  enabled: true\n")
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("Load() should reject mcp_data_class_labels.enabled: true")
+		}
+		if !strings.Contains(err.Error(), "not supported yet") {
+			t.Fatalf("error = %v, want it to mention 'not supported yet'", err)
+		}
+	})
+}
+
+func TestValidate_MCPDataClassLabelsRejectsBadUnknownClass(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPDataClassLabels.UnknownClass = string(datalabel.DataClassBenign)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "mcp_data_class_labels.unknown_class") {
+		t.Fatalf("Validate() error = %v, want mcp_data_class_labels.unknown_class rejection", err)
 	}
 }
 
